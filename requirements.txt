@@ -1,0 +1,17 @@
+# =============================================================================
+# requirements.txt — SRE Health Checker v3
+# =============================================================================
+# Install: pip install -r requirements.txt
+# Requires: Python 3.11+
+
+# Async HTTP client — replaces requests; drives all probe and webhook calls
+aiohttp==3.9.5
+
+# YAML parser — loads targets.yaml at startup
+PyYAML==6.0.1
+
+# Loads secrets from .env into os.environ at runtime (zero-trust secret mgmt)
+python-dotenv==1.0.1
+
+# tenacity is no longer required — retry logic is now a hand-rolled async loop.
+# Removing it keeps the dependency surface minimal.

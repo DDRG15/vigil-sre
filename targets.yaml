@@ -1,0 +1,30 @@
+# =============================================================================
+# targets.yaml — SRE Health Checker v3 target configuration
+# =============================================================================
+#
+# Add, remove, or comment out URLs here without touching any Python code.
+# The script loads this file at startup; just restart it to pick up changes.
+#
+# Rules:
+#   • Every entry must be a fully-qualified URL (include https:// or http://).
+#   • Indentation must be consistent (2 spaces recommended).
+#   • Lines beginning with # are comments and are ignored.
+# =============================================================================
+
+targets:
+  # ── Reliable public endpoints (sanity baselines) ──────────────────────────
+  - https://www.google.com
+  - https://www.github.com
+  - https://www.cloudflare.com
+
+  # ── httpbin.org test suite ────────────────────────────────────────────────
+  - https://httpbin.org/status/200   # always 200 — confirms the probe path works
+
+  # ── Deliberate failure cases (used to validate alerting pipeline) ─────────
+  - https://httpbin.org/status/503                  # non-200 → triggers DOWN alert
+  - https://this-domain-does-not-exist-xyz.io       # DNS failure → ConnectionError
+
+  # ── Your own services (uncomment and replace) ─────────────────────────────
+  # - https://api.yourcompany.com/health
+  # - https://app.yourcompany.com
+  # - https://status.yourcompany.com
