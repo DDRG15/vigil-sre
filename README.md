@@ -207,6 +207,33 @@ infrastructure.
 
 ---
 
+## Testing
+
+We do not ship what we cannot prove works.
+
+Thirty automated tests cover every component in isolation: target loading, state
+transitions, probe logic, retry backoff intervals, Discord payload construction,
+and the complete orchestration pipeline — including all four paths through the
+alert decision logic.
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
+The retry tests are worth noting specifically. Every test that touches
+`_probe_with_backoff()` asserts the exact number of sleep calls and their precise
+values — not just the final outcome. A retry function that sleeps for the wrong
+intervals is a bug even if it eventually returns the correct answer. "Eventually
+correct" is not a property we optimize for.
+
+CI runs on every push and pull request to `main` via GitHub Actions: `pytest`
+against Python 3.11 and `docker build` to verify the image builds cleanly.
+Neither is optional. A monitoring service that cannot guarantee its own test
+suite passes on every change has a credibility problem.
+
+---
+
 ## Observability
 
 Every probe result is written to both stdout and `health_checker.log` in a structured
