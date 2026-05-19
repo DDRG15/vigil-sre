@@ -1,7 +1,31 @@
-.venv/ 
-__pycache__/ 
-*.pyc 
-health_checker.log 
-state.json 
-.env 
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Runtime artifacts
+*.log
+state.json
+
+# Secrets
+.env
+
+# Tests & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Personal
+PRIVATE_NOTES.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
 *.zip

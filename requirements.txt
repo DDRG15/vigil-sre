@@ -5,13 +5,13 @@
 # Requires: Python 3.11+
 
 # Async HTTP client — replaces requests; drives all probe and webhook calls
-aiohttp==3.9.5
+aiohttp==3.13.5
 
 # YAML parser — loads targets.yaml at startup
-PyYAML==6.0.1
+PyYAML==6.0.3
 
 # Loads secrets from .env into os.environ at runtime (zero-trust secret mgmt)
-python-dotenv==1.0.1
+python-dotenv==1.2.2
 
 # tenacity is no longer required — retry logic is now a hand-rolled async loop.
 # Removing it keeps the dependency surface minimal.
