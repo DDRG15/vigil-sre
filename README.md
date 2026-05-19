@@ -221,16 +221,20 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-The retry tests are worth noting specifically. Every test that touches
-`_probe_with_backoff()` asserts the exact number of sleep calls and their precise
-values — not just the final outcome. A retry function that sleeps for the wrong
-intervals is a bug even if it eventually returns the correct answer. "Eventually
-correct" is not a property we optimize for.
+The retry tests are worth noting specifically. A retry function that sleeps two
+seconds instead of four passes every outcome-based test you write for it. It
+also means your checker hammers a struggling server twice as fast as intended
+during an outage — which is exactly the behavior that turns a recoverable
+incident into a cascade. Every test that touches `_probe_with_backoff()` asserts
+the exact sleep call count and precise interval values. We verify the intervals,
+not just the results.
 
 CI runs on every push and pull request to `main` via GitHub Actions: `pytest`
-against Python 3.11 and `docker build` to verify the image builds cleanly.
-Neither is optional. A monitoring service that cannot guarantee its own test
-suite passes on every change has a credibility problem.
+against Python 3.11 and `docker build` to verify the image builds cleanly. The
+last thing you want to discover is that the tool watching your production
+services broke three commits ago and nobody noticed. CI is not ceremony. It is
+the check that prevents you from being the engineer who explains to stakeholders
+why the monitor was down while the monitored service was also down.
 
 ---
 
