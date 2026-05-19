@@ -193,7 +193,12 @@ infrastructure.
 ├── targets.yaml         URL configuration — edit freely, no restarts required
 ├── Dockerfile           Multi-stage, non-root, health-checked production image
 ├── docker-compose.yml   Standard deployment manifest
+├── .dockerignore        Build context exclusion list — image contains no dev artifacts
 ├── requirements.txt     Three direct dependencies, nothing extraneous
+├── requirements-dev.txt Development dependencies — test runner and mocking layer
+├── pytest.ini           Test runner configuration
+├── tests/               30-test suite covering every probe, state, and alert path
+├── .github/             CI: pytest + docker build on every push and pull request
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
 ├── state.json           Runtime artifact — auto-created, bind-mounted
