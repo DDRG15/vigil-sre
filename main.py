@@ -591,7 +591,7 @@ async def run_health_checks(targets: list[str] | None = None) -> None:
     logger.info("=" * 64)
 
     # One shared session for the whole run — efficient TCP reuse.
-    connector = aiohttp.TCPConnector(ssl=True, limit=100)
+    connector = aiohttp.TCPConnector(limit=100)
     async with aiohttp.ClientSession(connector=connector) as session:
         # Build one coroutine per target, then gather concurrently.
         tasks = [check_url(url, session, state) for url in urls]
