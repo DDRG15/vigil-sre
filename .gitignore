@@ -23,6 +23,7 @@ coverage.xml
 # Personal
 PRIVATE_NOTES.md
 PRIVATE_README.md
+PRIVATE_CHANGELOG.md
 
 # OS
 .DS_Store
