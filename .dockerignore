@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+tests/
+*.log
+state.json
+.env
+.git/
+.github/
+.claude/
+PRIVATE_NOTES.md
+PRIVATE_README.md
+requirements-dev.txt
