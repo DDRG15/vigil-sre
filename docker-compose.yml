@@ -1,0 +1,10 @@
+services:
+  health-checker:
+    build: .
+    env_file: .env
+    volumes:
+      - ./targets.yaml:/app/targets.yaml:ro
+      - ./state.json:/app/state.json
+    restart: unless-stopped
+    command: >
+      sh -c "while true; do python main.py; sleep 60; done"
