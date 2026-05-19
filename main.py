@@ -58,6 +58,13 @@ load_dotenv()
 LOG_FORMAT  = "[%(asctime)s] [%(levelname)-8s] [%(name)s] %(message)s"
 DATE_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
 
+# On Windows the default console codec (cp1252) cannot encode the emoji
+# characters used in log messages. Reconfigure stdout to UTF-8 so the
+# StreamHandler never raises UnicodeEncodeError; fall back gracefully if the
+# stream doesn't support reconfiguration (e.g. redirected pipes).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+
 logging.basicConfig(
     level=logging.INFO,
     format=LOG_FORMAT,
