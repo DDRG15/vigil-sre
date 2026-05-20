@@ -24,7 +24,8 @@ targets:
   - https://httpbin.org/status/503                  # non-200 → triggers DOWN alert
   - https://this-domain-does-not-exist-xyz.io       # DNS failure → ConnectionError
 
-  # ── Your own services (uncomment and replace) ─────────────────────────────
+  # ── PLACEHOLDER: your own services ───────────────────────────────────────
+  # These are placeholders. Uncomment and replace with your actual URLs.
   # - https://api.yourcompany.com/health
   # - https://app.yourcompany.com
   # - https://status.yourcompany.com
