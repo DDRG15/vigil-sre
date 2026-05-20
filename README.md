@@ -138,8 +138,12 @@ commit this file. It is in `.gitignore` for a reason.
 ```bash
 # Edit targets.yaml — add or remove URLs under the targets: key.
 # No code changes required. The service reads this file at startup.
-nano targets.yaml
+nano targets.yaml   # macOS / Linux
+notepad targets.yaml   # Windows
+code targets.yaml      # VS Code (any platform)
 ```
+
+The file is plain text. Any editor works.
 
 ### 3. Deploy
 
