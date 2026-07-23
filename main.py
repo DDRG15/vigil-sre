@@ -40,6 +40,7 @@ import os
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict
@@ -139,23 +140,46 @@ WEBHOOK_RETRY_BASE_S  : float = 1.0   # linear backoff: 1 s, then 2 s between at
 # YAML target loader
 # ---------------------------------------------------------------------------
 
-def load_targets(path: Path = TARGETS_FILE) -> list[str]:
+@dataclass(frozen=True)
+class Target:
     """
-    Parse *path* as YAML and return the flat list of target URL strings.
+    One monitored endpoint as configured in targets.yaml.
 
-    Expected structure::
+    ``expect_substring`` is the content assertion: when set, a 200 response
+    whose body does not contain it counts as a probe failure. A status-code
+    check alone cannot tell a real response from a server returning 200 with
+    an error page or an empty JSON body — the substring is how the probe
+    tells "answered" from "answered correctly". The body is already read in
+    full for the goodput measurement, so this assertion costs nothing extra.
+
+    This dict-based YAML schema (string OR object per entry) is also the
+    extension point for future per-target settings — expected status,
+    timeout, auth headers — without another schema migration.
+    """
+
+    url             : str
+    expect_substring: str | None = None
+
+
+def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
+    """
+    Parse *path* as YAML and return the list of Targets.
+
+    Expected structure — plain URL strings and objects can be mixed::
 
         targets:
           - https://www.example.com
-          - https://api.example.com/health
+          - url: https://api.example.com/health
+            expect_substring: '"status":"ok"'
 
-    Exits with a clear message if the file is missing, malformed, or empty.
+    Exits with a clear message if the file is missing, malformed, empty, or
+    contains an object entry without a ``url`` key.
 
     Args:
         path: Path to the YAML targets file.
 
     Returns:
-        Non-empty list of URL strings.
+        Non-empty list of Target records.
     """
     if not path.exists():
         logger.critical(
@@ -170,7 +194,23 @@ def load_targets(path: Path = TARGETS_FILE) -> list[str]:
         logger.critical("Failed to parse '%s': %s", path, exc)
         sys.exit(1)
 
-    targets: list[str] = raw.get("targets", []) if isinstance(raw, dict) else []
+    entries: list = raw.get("targets", []) if isinstance(raw, dict) else []
+
+    targets: list[Target] = []
+    for entry in entries:
+        if isinstance(entry, str):
+            targets.append(Target(url=entry))
+        elif isinstance(entry, dict) and entry.get("url"):
+            targets.append(Target(
+                url=str(entry["url"]),
+                expect_substring=entry.get("expect_substring"),
+            ))
+        else:
+            logger.critical(
+                "'%s' contains an invalid target entry (%r). Each entry must "
+                "be a URL string or an object with a 'url' key.", path, entry
+            )
+            sys.exit(1)
 
     if not targets:
         logger.critical(
@@ -639,6 +679,7 @@ async def _probe_once(
     session: aiohttp.ClientSession,
     url: str,
     sample: ConnectionSample | None = None,
+    expect_substring: str | None = None,
 ) -> ProbePhases:
     """
     Fire a single async HTTP GET against *url* and measure its phases.
@@ -651,16 +692,23 @@ async def _probe_once(
     control, which aiohttp's own timings cannot provide cleanly.
 
     Args:
-        session: Shared aiohttp.ClientSession (must carry the diagnostics
-                 TraceConfig for DNS/connect timings to populate).
-        url:     Target URL.
-        sample:  Pre-taken out-of-band connection sample, or None if it failed.
+        session:          Shared aiohttp.ClientSession (must carry the
+                          diagnostics TraceConfig for DNS/connect timings).
+        url:              Target URL.
+        sample:           Pre-taken out-of-band connection sample, or None if
+                          it failed.
+        expect_substring: Optional content assertion. A 200 whose body does
+                          not contain this string counts as a probe failure —
+                          a status code alone cannot tell "answered" from
+                          "answered correctly" (error page, empty JSON, etc).
 
     Returns:
-        A fully-populated ProbePhases on a 200 response.
+        A fully-populated ProbePhases on a 200 response that also passes the
+        content assertion (when one is configured).
 
     Raises:
-        _ProbeFailure: On timeout, connection error, or non-200 response.
+        _ProbeFailure: On timeout, connection error, non-200 response, or a
+                       failed content assertion.
     """
     rtt_ms = sample.rtt_ms if sample is not None else None
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S)
@@ -684,6 +732,11 @@ async def _probe_once(
             body = await resp.read()
             transfer_ms = (time.monotonic() - transfer_start) * 1000.0
             body_bytes = len(body)
+
+            if expect_substring is not None and expect_substring.encode("utf-8") not in body:
+                raise _ProbeFailure(
+                    f"Content check failed: {expect_substring!r} not found in body"
+                )
 
             logger.info(
                 "  attempt OK — HTTP %s ← %s (%d bytes)", resp.status, url, body_bytes
@@ -747,6 +800,7 @@ async def _probe_with_backoff(
     session: aiohttp.ClientSession,
     url: str,
     sample: ConnectionSample | None = None,
+    expect_substring: str | None = None,
 ) -> ProbePhases:
     """
     Attempt *url* up to RETRY_ATTEMPTS times with exponential backoff.
@@ -765,9 +819,10 @@ async def _probe_with_backoff(
       Attempt 3 fails → raise _ProbeFailure (no more sleep)
 
     Args:
-        session: Shared aiohttp.ClientSession.
-        url:     Target URL.
-        sample:  Out-of-band connection sample forwarded to _probe_once.
+        session:          Shared aiohttp.ClientSession.
+        url:              Target URL.
+        sample:           Out-of-band connection sample forwarded to _probe_once.
+        expect_substring: Optional content assertion forwarded to _probe_once.
 
     Returns:
         The ProbePhases of the first successful attempt.
@@ -779,7 +834,7 @@ async def _probe_with_backoff(
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            return await _probe_once(session, url, sample)  # success — exit immediately
+            return await _probe_once(session, url, sample, expect_substring)  # success
         except _ProbeFailure as exc:
             last_exc = exc
             if attempt < RETRY_ATTEMPTS:
@@ -849,9 +904,10 @@ def _log_diagnostics(url: str, phases: ProbePhases, findings: list) -> None:
 # ---------------------------------------------------------------------------
 
 async def check_url(
-    url    : str,
-    session: aiohttp.ClientSession,
-    state  : StateManager,
+    url             : str,
+    session         : aiohttp.ClientSession,
+    state           : StateManager,
+    expect_substring: str | None = None,
 ) -> None:
     """
     Run the full health-check pipeline for one URL.
@@ -859,7 +915,8 @@ async def check_url(
     Pipeline
     --------
     1. sample_connection()    →  out-of-band RTT + TLS + ALPN/h2 sample.
-    2. _probe_with_backoff()  →  fires up to RETRY_ATTEMPTS async GETs.
+    2. _probe_with_backoff()  →  fires up to RETRY_ATTEMPTS async GETs, each
+       one asserting expect_substring in the body when configured.
     3. analyze()              →  turn phase timings into findings.
     4. set_up / set_degraded / set_down  →  persist, detect transition.
     5. If transition detected →  send the matching Discord alert.
@@ -867,15 +924,18 @@ async def check_url(
     A 200 does not always mean UP. If the probe succeeds but a performance
     finding fired (or TTFB crossed the degraded threshold), the target is
     DEGRADED — up and hurting — and gets an amber alert, distinct from the
-    red DOWN alert, so triage is carried by the colour.
+    red DOWN alert, so triage is carried by the colour. And a 200 whose body
+    fails the content assertion is not a success at all — it counts as a
+    probe failure, same as a timeout or a 503.
 
     This coroutine is designed to be gathered concurrently with all others;
     it never touches shared mutable state outside the StateManager lock.
 
     Args:
-        url:     Target URL to probe.
-        session: Shared aiohttp.ClientSession for HTTP I/O.
-        state:   Shared StateManager for transition detection and persistence.
+        url:              Target URL to probe.
+        session:          Shared aiohttp.ClientSession for HTTP I/O.
+        state:            Shared StateManager for transition detection and persistence.
+        expect_substring: Optional content assertion (see Target.expect_substring).
     """
     logger.info("─── Checking: %s", url)
 
@@ -892,7 +952,7 @@ async def check_url(
         sample = await sample_connection(host, port, use_tls=url.lower().startswith("https"))
 
     try:
-        phases = await _probe_with_backoff(session, url, sample)
+        phases = await _probe_with_backoff(session, url, sample, expect_substring)
 
         findings = analyze(phases)
         _log_diagnostics(url, phases, findings)
@@ -971,7 +1031,7 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown_event: as
 # Main async entry point
 # ---------------------------------------------------------------------------
 
-async def run_health_checks(targets: list[str] | None = None) -> None:
+async def run_health_checks(targets: list[str | Target] | None = None) -> None:
     """
     Orchestrate concurrent health checks across all configured targets.
 
@@ -990,9 +1050,16 @@ async def run_health_checks(targets: list[str] | None = None) -> None:
     closed and the loop exits.
 
     Args:
-        targets: Optional URL list override; defaults to loading targets.yaml.
+        targets: Optional override; defaults to loading targets.yaml. Plain
+                 URL strings are normalised to Target(url=..., expect_substring=None)
+                 — this keeps direct calls and existing tests working without
+                 an expect_substring, exactly as load_targets would for a
+                 targets.yaml entry with no object form.
     """
-    urls  = targets or load_targets()
+    raw_targets: list[str | Target] = targets or load_targets()
+    resolved: list[Target] = [
+        t if isinstance(t, Target) else Target(url=t) for t in raw_targets
+    ]
     state = StateManager()
 
     loop           = asyncio.get_running_loop()
@@ -1002,7 +1069,7 @@ async def run_health_checks(targets: list[str] | None = None) -> None:
     logger.info("=" * 64)
     logger.info(
         "SRE Health Checker v3 | targets=%d | concurrency=ALL | attempts=%d | backoff=%.0f–%.0fs",
-        len(urls), RETRY_ATTEMPTS, RETRY_BACKOFF_BASE, RETRY_BACKOFF_MAX,
+        len(resolved), RETRY_ATTEMPTS, RETRY_BACKOFF_BASE, RETRY_BACKOFF_MAX,
     )
     logger.info("=" * 64)
 
@@ -1016,15 +1083,18 @@ async def run_health_checks(targets: list[str] | None = None) -> None:
         connector=connector, trace_configs=[trace_config]
     ) as session:
         # Build one coroutine per target, then gather concurrently.
-        tasks = [check_url(url, session, state) for url in urls]
+        tasks = [
+            check_url(t.url, session, state, expect_substring=t.expect_substring)
+            for t in resolved
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Log any unexpected exceptions that leaked past check_url's own handlers.
-        for url, result in zip(urls, results):
+        for target, result in zip(resolved, results):
             if isinstance(result, Exception):
                 logger.critical(
                     "Unhandled exception for %s: %r — this is a bug, please report it.",
-                    url, result,
+                    target.url, result,
                 )
 
     if shutdown_event.is_set():

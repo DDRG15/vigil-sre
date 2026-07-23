@@ -38,6 +38,7 @@ from diagnostics import ConnectionSample
 
 from main import (
     StateManager,
+    Target,
     _ProbeFailure,
     _build_discord_payload,
     _probe_once,
@@ -60,10 +61,38 @@ TARGET_URL = "https://example.com"
 
 
 def test_load_targets_valid(tmp_path: Path) -> None:
+    """Plain string entries load as Target with expect_substring=None."""
     f = tmp_path / "targets.yaml"
     f.write_text("targets:\n  - https://a.com\n  - https://b.com\n", encoding="utf-8")
     result = load_targets(f)
-    assert result == ["https://a.com", "https://b.com"]
+    assert result == [Target(url="https://a.com"), Target(url="https://b.com")]
+
+
+def test_load_targets_mixed_string_and_object(tmp_path: Path) -> None:
+    """String and object entries can coexist; only the object form carries
+    expect_substring — this is the an earlier release content-assertion schema."""
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        "targets:\n"
+        "  - https://plain.com\n"
+        '  - url: https://api.com/health\n'
+        '    expect_substring: \'"status":"ok"\'\n',
+        encoding="utf-8",
+    )
+    result = load_targets(f)
+    assert result == [
+        Target(url="https://plain.com"),
+        Target(url="https://api.com/health", expect_substring='"status":"ok"'),
+    ]
+
+
+def test_load_targets_object_without_url_exits(tmp_path: Path) -> None:
+    """An object entry missing the required 'url' key must exit, not crash
+    downstream with a confusing AttributeError."""
+    f = tmp_path / "targets.yaml"
+    f.write_text("targets:\n  - expect_substring: 'ok'\n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        load_targets(f)
 
 
 def test_load_targets_missing_file(tmp_path: Path) -> None:
@@ -323,6 +352,30 @@ async def test_probe_once_connection_error() -> None:
     assert "ConnectionError" in exc_info.value.detail
 
 
+async def test_probe_once_content_check_passes() -> None:
+    """A 200 whose body contains expect_substring is a real success."""
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b'{"status":"ok"}')
+        async with aiohttp.ClientSession() as session:
+            phases = await _probe_once(
+                session, TARGET_URL, expect_substring='"status":"ok"'
+            )
+    assert phases.http_status == 200
+
+
+async def test_probe_once_content_check_fails() -> None:
+    """A 200 with a body missing expect_substring must count as a probe
+    failure — a status code alone cannot tell an error page from a real one."""
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"<html>error page</html>")
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(_ProbeFailure) as exc_info:
+                await _probe_once(
+                    session, TARGET_URL, expect_substring='"status":"ok"'
+                )
+    assert "Content check failed" in exc_info.value.detail
+
+
 # =============================================================================
 # D. _probe_with_backoff()
 #
@@ -569,6 +622,35 @@ async def test_check_url_down_no_transition_suppresses_alert(tmp_path: Path) -> 
                         await check_url(TARGET_URL, session, sm)
 
     mock_alert.assert_not_called()
+
+
+async def test_check_url_content_check_failure_routes_to_down(tmp_path: Path) -> None:
+    """A 200 that fails the content assertion must be treated exactly like
+    any other probe failure: DOWN (confirmed immediately — no prior history),
+    with a failure alert carrying the content-check detail."""
+    state_file = tmp_path / "state.json"
+    sm = StateManager(state_file)
+
+    with aioresponses() as mock:
+        # All RETRY_ATTEMPTS responses are 200 with the wrong body — the
+        # content check must fail on every attempt, not just the first.
+        mock.get(TARGET_URL, status=200, body=b"<html>down for maintenance</html>")
+        mock.get(TARGET_URL, status=200, body=b"<html>down for maintenance</html>")
+        mock.get(TARGET_URL, status=200, body=b"<html>down for maintenance</html>")
+        with patch("main.asyncio.sleep", new_callable=AsyncMock):
+            async with aiohttp.ClientSession() as session:
+                with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                    with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                        await check_url(
+                            TARGET_URL, session, sm, expect_substring='"status":"ok"'
+                        )
+
+    mock_alert.assert_called_once()
+    assert mock_alert.call_args.kwargs["is_recovery"] is False
+
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    assert data["targets"][TARGET_URL]["status"] == "DOWN"
+    assert "Content check failed" in data["targets"][TARGET_URL]["last_error"]
 
 
 async def test_check_url_up_persists_diagnostics(tmp_path: Path) -> None:

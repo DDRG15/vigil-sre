@@ -9,6 +9,17 @@
 #   • Every entry must be a fully-qualified URL (include https:// or http://).
 #   • Indentation must be consistent (2 spaces recommended).
 #   • Lines beginning with # are comments and are ignored.
+#
+# Content assertion (optional): a plain string entry is a URL with no content
+# check — any 200 counts as healthy. To also assert the body, use the object
+# form instead of a bare string:
+#
+#   - url: https://api.yourcompany.com/health
+#     expect_substring: '"status":"ok"'
+#
+# A 200 whose body does NOT contain expect_substring counts as a probe
+# failure, same as a timeout or a 503 — a status code alone cannot tell a
+# real response from a server returning 200 with an error page.
 # =============================================================================
 
 targets:
