@@ -39,6 +39,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict
@@ -46,6 +47,18 @@ from typing import TypedDict
 import aiohttp
 import yaml
 from dotenv import load_dotenv
+
+from diagnostics import (
+    ConnectionSample,
+    ProbePhases,
+    analyze,
+    build_trace_config,
+    cert_days_left,
+    degraded_reason,
+    host_port_from_url,
+    phases_to_dict,
+    sample_connection,
+)
 
 # ---------------------------------------------------------------------------
 # Bootstrap — load .env before anything reads os.getenv()
@@ -99,8 +112,9 @@ REQUEST_HEADERS: dict[str, str] = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-STATUS_UP  : str = "UP"
-STATUS_DOWN: str = "DOWN"
+STATUS_UP      : str = "UP"
+STATUS_DOWN    : str = "DOWN"
+STATUS_DEGRADED: str = "DEGRADED"   # probe succeeded but a performance finding fired
 
 
 # ---------------------------------------------------------------------------
@@ -155,13 +169,21 @@ def load_targets(path: Path = TARGETS_FILE) -> list[str]:
 # State management  (async-safe via asyncio.Lock)
 # ---------------------------------------------------------------------------
 
-class UrlState(TypedDict):
-    """Persisted state record for a single monitored URL."""
+class UrlState(TypedDict, total=False):
+    """
+    Persisted state record for a single monitored URL.
 
-    status      : str   # "UP" | "DOWN"
-    last_checked: str   # ISO-8601 UTC — updated every run
-    last_changed: str   # ISO-8601 UTC — updated only on a transition
-    last_error  : str   # empty string when status is UP
+    ``total=False`` because ``diagnostics`` is optional: it is present only
+    after a successful probe that produced a latency/BDP breakdown, and
+    absent for URLs that have only ever been DOWN. Every reader must treat
+    it as possibly-missing.
+    """
+
+    status      : str    # "UP" | "DEGRADED" | "DOWN"   (always present)
+    last_checked: str    # ISO-8601 UTC — updated every run
+    last_changed: str    # ISO-8601 UTC — updated only on a transition
+    last_error  : str    # "" when UP; failure detail when DOWN; reason when DEGRADED
+    diagnostics : dict   # last latency/BDP breakdown; on UP and DEGRADED probes
 
 
 class StateManager:
@@ -222,9 +244,18 @@ class StateManager:
 
     # ------------------------------------------------------------------ Public API
 
-    async def set_up(self, url: str) -> bool:
+    async def set_up(self, url: str, diagnostics: dict | None = None) -> bool:
         """
         Mark *url* as UP.
+
+        Args:
+            url:         The monitored URL.
+            diagnostics: Optional latency/BDP breakdown from diagnostics.
+                         phases_to_dict(); persisted verbatim under the
+                         ``diagnostics`` key when provided. None leaves any
+                         previously stored breakdown untouched is NOT the
+                         behaviour — a None simply omits the key on this write,
+                         reflecting "measured UP but no breakdown captured".
 
         Returns:
             True  — first check, or previous state was DOWN  → send alert.
@@ -235,12 +266,16 @@ class StateManager:
             previous = self._state.get(url)
             changed  = previous is None or previous["status"] != STATUS_UP
 
-            self._state[url] = UrlState(
+            record = UrlState(
                 status      =STATUS_UP,
                 last_checked=now,
                 last_changed=now if changed else previous["last_changed"],
                 last_error  ="",
             )
+            if diagnostics is not None:
+                record["diagnostics"] = diagnostics
+
+            self._state[url] = record
             self._write_sync()
             return changed
 
@@ -266,6 +301,40 @@ class StateManager:
             self._write_sync()
             return changed
 
+    async def set_degraded(
+        self, url: str, reason: str, diagnostics: dict | None = None
+    ) -> bool:
+        """
+        Mark *url* as DEGRADED — reachable and answering, but hurting.
+
+        Args:
+            url:         The monitored URL.
+            reason:      Human-readable degradation reason (stored in
+                         last_error and shown in the yellow alert).
+            diagnostics: Optional latency/BDP breakdown, persisted verbatim.
+
+        Returns:
+            True  — first check, or previous state was UP/DOWN → send alert.
+            False — was already DEGRADED                       → suppress alert.
+        """
+        async with self._lock:
+            now      = self._utc_now()
+            previous = self._state.get(url)
+            changed  = previous is None or previous["status"] != STATUS_DEGRADED
+
+            record = UrlState(
+                status      =STATUS_DEGRADED,
+                last_checked=now,
+                last_changed=now if changed else previous["last_changed"],
+                last_error  =reason,
+            )
+            if diagnostics is not None:
+                record["diagnostics"] = diagnostics
+
+            self._state[url] = record
+            self._write_sync()
+            return changed
+
 
 # ---------------------------------------------------------------------------
 # Discord alerting  (async)
@@ -276,17 +345,23 @@ def _build_discord_payload(
     status_detail: str,
     timestamp    : str,
     is_recovery  : bool,
+    is_degraded  : bool = False,
 ) -> dict:
     """
     Construct a colour-coded Discord embed payload.
 
-    Green embed for recoveries; red embed for failures.
+    Green for recoveries, red for failures, amber for degradations. Amber is
+    a distinct signal on purpose: a degraded service is not down, and paging
+    it red trains the on-call to distrust red. The colour carries the triage.
 
     Args:
         url:           Monitored URL.
-        status_detail: E.g. "HTTP 503", "Timeout (>5s)", or "Service is UP".
+        status_detail: E.g. "HTTP 503", "Timeout (>5s)", "Service is UP", or a
+                       degradation reason like "HIGH_RTT_NEEDS_EDGE (...)".
         timestamp:     ISO-8601 UTC string.
-        is_recovery:   Determines embed colour and title.
+        is_recovery:   Green recovery embed.
+        is_degraded:   Amber degradation embed. Takes precedence over the
+                       failure styling; ignored when is_recovery is True.
 
     Returns:
         Dict ready to be JSON-serialised and POSTed to Discord.
@@ -295,6 +370,10 @@ def _build_discord_payload(
         title        = "✅  Service Recovered"
         color        = 0x00C853  # green-A700
         status_label = "🟢  Current Status"
+    elif is_degraded:
+        title        = "⚠️  Service Degraded — Up But Hurting"
+        color        = 0xFFB300  # amber-600
+        status_label = "🟡  Degradation Detail"
     else:
         title        = "🚨  Infrastructure Alert — Health Check Failed"
         color        = 0xFF0000  # red
@@ -337,6 +416,7 @@ async def send_discord_alert(
     url          : str,
     status_detail: str,
     is_recovery  : bool = False,
+    is_degraded  : bool = False,
 ) -> None:
     """
     Dispatch a Discord Webhook POST using the shared aiohttp session.
@@ -348,8 +428,9 @@ async def send_discord_alert(
     Args:
         session:       Shared aiohttp.ClientSession for the run.
         url:           Target whose state just changed.
-        status_detail: Human-readable failure reason or "Service is UP".
+        status_detail: Human-readable failure/degradation reason or "Service is UP".
         is_recovery:   True → green recovery embed.
+        is_degraded:   True → amber degradation embed (ignored if is_recovery).
     """
     webhook_url: str | None = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook_url:
@@ -361,7 +442,7 @@ async def send_discord_alert(
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload   = _build_discord_payload(
         url=url, status_detail=status_detail, timestamp=timestamp,
-        is_recovery=is_recovery,
+        is_recovery=is_recovery, is_degraded=is_degraded,
     )
 
     try:
@@ -370,7 +451,11 @@ async def send_discord_alert(
             json=payload,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S),
         ) as resp:
-            kind = "recovery" if is_recovery else "failure"
+            kind = (
+                "recovery" if is_recovery
+                else "degraded" if is_degraded
+                else "failure"
+            )
             if resp.status == 204:
                 logger.info("Discord %s alert sent for %s.", kind, url)
             else:
@@ -396,28 +481,80 @@ class _ProbeFailure(Exception):
         self.detail = detail
 
 
-async def _probe_once(session: aiohttp.ClientSession, url: str) -> None:
+def _extract_cert_days(resp: aiohttp.ClientResponse) -> int | None:
     """
-    Fire a single async HTTP GET against *url*.
+    Pull the peer certificate off the live connection and return days-to-expiry.
+
+    Returns None for plain HTTP, or when the transport does not expose an
+    SSL object (connection reused from pool without re-exposing it, or a
+    mocked transport under test). Never raises — a missing cert must not
+    fail the probe.
+    """
+    try:
+        connection = resp.connection
+        if connection is None or connection.transport is None:
+            return None
+        ssl_object = connection.transport.get_extra_info("ssl_object")
+        if ssl_object is None:
+            return None
+        return cert_days_left(ssl_object.getpeercert())
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+async def _probe_once(
+    session: aiohttp.ClientSession,
+    url: str,
+    sample: ConnectionSample | None = None,
+) -> ProbePhases:
+    """
+    Fire a single async HTTP GET against *url* and measure its phases.
+
+    Beyond the pass/fail verdict, this reads the full response body so the
+    transfer can be timed and turned into a goodput sample, and it captures
+    per-phase timings (DNS, connect, TTFB, transfer) via the TraceConfig
+    context dict. RTT, TLS handshake time, and ALPN/h2 come from the
+    out-of-band ConnectionSample the caller took — measured on connections we
+    control, which aiohttp's own timings cannot provide cleanly.
 
     Args:
-        session: Shared aiohttp.ClientSession.
+        session: Shared aiohttp.ClientSession (must carry the diagnostics
+                 TraceConfig for DNS/connect timings to populate).
         url:     Target URL.
+        sample:  Pre-taken out-of-band connection sample, or None if it failed.
+
+    Returns:
+        A fully-populated ProbePhases on a 200 response.
 
     Raises:
         _ProbeFailure: On timeout, connection error, or non-200 response.
     """
+    rtt_ms = sample.rtt_ms if sample is not None else None
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S)
+    trace_ctx: dict = {}
+    start = time.monotonic()
     try:
         async with session.get(
             url,
             timeout=timeout,
             allow_redirects=True,
             headers=REQUEST_HEADERS,
+            trace_request_ctx=trace_ctx,
         ) as resp:
             if resp.status != EXPECTED_STATUS:
                 raise _ProbeFailure(f"HTTP {resp.status}")
-            logger.info("  attempt OK — HTTP %s ← %s", resp.status, url)
+
+            ttfb_ms = (time.monotonic() - start) * 1000.0
+            cert_days = _extract_cert_days(resp)
+
+            transfer_start = time.monotonic()
+            body = await resp.read()
+            transfer_ms = (time.monotonic() - transfer_start) * 1000.0
+            body_bytes = len(body)
+
+            logger.info(
+                "  attempt OK — HTTP %s ← %s (%d bytes)", resp.status, url, body_bytes
+            )
 
     except asyncio.TimeoutError:
         raise _ProbeFailure(f"Timeout (>{REQUEST_TIMEOUT_S}s)")
@@ -426,8 +563,58 @@ async def _probe_once(session: aiohttp.ClientSession, url: str) -> None:
     except aiohttp.ClientError as exc:
         raise _ProbeFailure(f"ClientError: {exc}")
 
+    dns_ms           = trace_ctx.get("dns_ms")
+    connect_total_ms = trace_ctx.get("connect_total_ms")
+    reused           = trace_ctx.get("connection_reused", False)
 
-async def _probe_with_backoff(session: aiohttp.ClientSession, url: str) -> None:
+    # TLS handshake time, ALPN, and h2 support come from the out-of-band
+    # sampler — measured on a connection it controls, back-to-back with its
+    # own RTT sample. This removes the old derive-from-aiohttp-connect
+    # subtraction, whose two figures came from different connections and could
+    # disagree enough to produce a negative TLS time.
+    tls_ms        = sample.tls_ms if sample is not None else None
+    alpn_protocol = sample.alpn_protocol if sample is not None else None
+    h2_supported  = sample.h2_supported if sample is not None else None
+
+    # Server processing is the time-to-first-byte with the known network
+    # setup (DNS + connect/TLS) and one request→first-byte round trip removed.
+    # What remains is the server thinking. Clamp negatives to None.
+    server_processing_ms: float | None = None
+    if rtt_ms is not None:
+        network_setup = (dns_ms or 0.0) + (connect_total_ms or 0.0) + rtt_ms
+        remainder = ttfb_ms - network_setup
+        server_processing_ms = remainder if remainder > 0 else None
+
+    # Goodput needs a transfer long enough to out-resolve the clock; a body
+    # that arrives in under a millisecond yields a meaningless division.
+    goodput_bps: float | None = None
+    if body_bytes > 0 and transfer_ms >= 1.0:
+        goodput_bps = (body_bytes * 8.0) / (transfer_ms / 1000.0)
+
+    return ProbePhases(
+        url=url,
+        http_status=resp.status,
+        ttfb_ms=ttfb_ms,
+        transfer_ms=transfer_ms,
+        body_bytes=body_bytes,
+        connection_reused=reused,
+        dns_ms=dns_ms,
+        connect_total_ms=connect_total_ms,
+        rtt_ms=rtt_ms,
+        tls_ms=tls_ms,
+        server_processing_ms=server_processing_ms,
+        goodput_bps=goodput_bps,
+        tls_cert_days_left=cert_days,
+        alpn_protocol=alpn_protocol,
+        h2_supported=h2_supported,
+    )
+
+
+async def _probe_with_backoff(
+    session: aiohttp.ClientSession,
+    url: str,
+    sample: ConnectionSample | None = None,
+) -> ProbePhases:
     """
     Attempt *url* up to RETRY_ATTEMPTS times with exponential backoff.
 
@@ -447,6 +634,10 @@ async def _probe_with_backoff(session: aiohttp.ClientSession, url: str) -> None:
     Args:
         session: Shared aiohttp.ClientSession.
         url:     Target URL.
+        sample:  Out-of-band connection sample forwarded to _probe_once.
+
+    Returns:
+        The ProbePhases of the first successful attempt.
 
     Raises:
         _ProbeFailure: After all RETRY_ATTEMPTS are exhausted.
@@ -455,8 +646,7 @@ async def _probe_with_backoff(session: aiohttp.ClientSession, url: str) -> None:
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            await _probe_once(session, url)
-            return  # success — exit immediately
+            return await _probe_once(session, url, sample)  # success — exit immediately
         except _ProbeFailure as exc:
             last_exc = exc
             if attempt < RETRY_ATTEMPTS:
@@ -476,6 +666,52 @@ async def _probe_with_backoff(session: aiohttp.ClientSession, url: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics logging
+# ---------------------------------------------------------------------------
+
+def _fmt_ms(value: float | None) -> str:
+    """Render an optional millisecond figure, or '—' when not measured."""
+    return "—" if value is None else f"{value:.0f}ms"
+
+
+def _log_diagnostics(url: str, phases: ProbePhases, findings: list) -> None:
+    """
+    Emit the per-phase breakdown and every diagnosis to the structured log.
+
+    One phase line gives the on-call engineer the whole timing picture at a
+    glance; one WARN/CRITICAL line per finding gives them the specific verdict
+    and the fix. This is the 1 AM contract: the log alone must be enough to
+    act on, without opening the source or re-running anything.
+    """
+    logger.info(
+        "  ⏱  phases %s | dns=%s connect=%s rtt=%s tls=%s ttfb=%s "
+        "server=%s transfer=%s body=%dB reused=%s cert_days=%s alpn=%s",
+        url,
+        _fmt_ms(phases.dns_ms),
+        _fmt_ms(phases.connect_total_ms),
+        _fmt_ms(phases.rtt_ms),
+        _fmt_ms(phases.tls_ms),
+        _fmt_ms(phases.ttfb_ms),
+        _fmt_ms(phases.server_processing_ms),
+        _fmt_ms(phases.transfer_ms),
+        phases.body_bytes,
+        phases.connection_reused,
+        "—" if phases.tls_cert_days_left is None else phases.tls_cert_days_left,
+        phases.alpn_protocol or "—",
+    )
+
+    for finding in findings:
+        line = "  🔎  %s [%s] %s → %s"
+        args = (url, finding.code, finding.evidence, finding.recommendation)
+        if finding.severity == "critical":
+            logger.error(line, *args)
+        elif finding.severity == "warn":
+            logger.warning(line, *args)
+        else:
+            logger.info(line, *args)
+
+
+# ---------------------------------------------------------------------------
 # Per-URL orchestration coroutine
 # ---------------------------------------------------------------------------
 
@@ -489,9 +725,16 @@ async def check_url(
 
     Pipeline
     --------
-    1. _probe_with_backoff()  →  fires up to RETRY_ATTEMPTS async GETs.
-    2. StateManager.set_up / set_down  →  persist result, detect transition.
-    3. If transition detected  →  send_discord_alert()  via shared session.
+    1. sample_connection()    →  out-of-band RTT + TLS + ALPN/h2 sample.
+    2. _probe_with_backoff()  →  fires up to RETRY_ATTEMPTS async GETs.
+    3. analyze()              →  turn phase timings into findings.
+    4. set_up / set_degraded / set_down  →  persist, detect transition.
+    5. If transition detected →  send the matching Discord alert.
+
+    A 200 does not always mean UP. If the probe succeeds but a performance
+    finding fired (or TTFB crossed the degraded threshold), the target is
+    DEGRADED — up and hurting — and gets an amber alert, distinct from the
+    red DOWN alert, so triage is carried by the colour.
 
     This coroutine is designed to be gathered concurrently with all others;
     it never touches shared mutable state outside the StateManager lock.
@@ -503,17 +746,44 @@ async def check_url(
     """
     logger.info("─── Checking: %s", url)
 
-    try:
-        await _probe_with_backoff(session, url)
+    # Sample the path out-of-band before the probe: a raw TCP connect for RTT
+    # and (for HTTPS) a controlled TLS handshake for TLS time and ALPN/h2.
+    # aiohttp's own trace hooks fuse TCP connect and TLS and only ever offer
+    # http/1.1, so they can give neither a clean RTT/TLS split nor server h2
+    # support. A None sample (firewall, refusal) only degrades diagnostics —
+    # never the probe.
+    sample: ConnectionSample | None = None
+    host_port = host_port_from_url(url)
+    if host_port is not None:
+        host, port = host_port
+        sample = await sample_connection(host, port, use_tls=url.lower().startswith("https"))
 
-        transitioned = await state.set_up(url)
-        if transitioned:
-            logger.info("🟢  STATE CHANGE → UP    %s", url)
-            await send_discord_alert(
-                session, url, status_detail="Service is UP", is_recovery=True
-            )
+    try:
+        phases = await _probe_with_backoff(session, url, sample)
+
+        findings = analyze(phases)
+        _log_diagnostics(url, phases, findings)
+        diagnostics = phases_to_dict(phases, findings)
+
+        reason = degraded_reason(phases, findings)
+        if reason is not None:
+            transitioned = await state.set_degraded(url, reason, diagnostics=diagnostics)
+            if transitioned:
+                logger.warning("🟡  STATE CHANGE → DEGRADED  %s | %s", url, reason)
+                await send_discord_alert(
+                    session, url, status_detail=reason, is_degraded=True
+                )
+            else:
+                logger.info("🟡  Still DEGRADED (alert suppressed)  %s | %s", url, reason)
         else:
-            logger.info("✅  OK (no change)       %s", url)
+            transitioned = await state.set_up(url, diagnostics=diagnostics)
+            if transitioned:
+                logger.info("🟢  STATE CHANGE → UP    %s", url)
+                await send_discord_alert(
+                    session, url, status_detail="Service is UP", is_recovery=True
+                )
+            else:
+                logger.info("✅  OK (no change)       %s", url)
 
     except _ProbeFailure as exc:
         transitioned = await state.set_down(url, error=exc.detail)
@@ -598,8 +868,14 @@ async def run_health_checks(targets: list[str] | None = None) -> None:
     logger.info("=" * 64)
 
     # One shared session for the whole run — efficient TCP reuse.
+    # The diagnostics TraceConfig records DNS and connection-create timings
+    # into each request's trace_request_ctx dict; without it, dns_ms and
+    # connect_total_ms come back None and the phase breakdown is partial.
     connector = aiohttp.TCPConnector(limit=100)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    trace_config = build_trace_config()
+    async with aiohttp.ClientSession(
+        connector=connector, trace_configs=[trace_config]
+    ) as session:
         # Build one coroutine per target, then gather concurrently.
         tasks = [check_url(url, session, state) for url in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)

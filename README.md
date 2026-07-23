@@ -194,6 +194,7 @@ infrastructure.
 ```
 .
 ├── main.py              Core service logic — async orchestrator
+├── diagnostics.py       Latency/BDP diagnostic engine — phase timings + findings
 ├── targets.yaml         URL configuration — edit freely, no restarts required
 ├── Dockerfile           Multi-stage, non-root, health-checked production image
 ├── docker-compose.yml   Standard deployment manifest
@@ -201,7 +202,7 @@ infrastructure.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               30-test suite covering every probe, state, and alert path
+├── tests/               63-test suite covering probes, state, alerts, and diagnostics
 ├── .github/             CI: pytest + docker build on every push and pull request
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
@@ -215,10 +216,13 @@ infrastructure.
 
 We do not ship what we cannot prove works.
 
-Thirty automated tests cover every component in isolation: target loading, state
-transitions, probe logic, retry backoff intervals, Discord payload construction,
-and the complete orchestration pipeline — including all four paths through the
-alert decision logic.
+Sixty-three automated tests cover every component in isolation: target loading, state
+transitions, probe logic, retry backoff intervals, Discord payload construction, the
+complete orchestration pipeline — including all four paths through the alert decision
+logic — and the full diagnostic engine, where every rule is tested on both sides of
+its threshold. A rule that fires is only half a test; a rule that fails to stay quiet
+just below its trigger is how a monitor learns to cry wolf, and a muted monitor is
+worse than none.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -256,6 +260,93 @@ format with ISO-8601 UTC timestamps. The log level semantics are strict:
 
 In a production environment, ship `health_checker.log` to your log aggregator of
 choice. The format is structured for ingestion without pre-processing.
+
+---
+
+## Latency & BDP Diagnostics
+
+"UP" and "DOWN" are the first question. They are not the last one.
+
+A service that answers 200 in 2.8 seconds is UP by every binary check ever written,
+and it is also the reason a customer closed the tab. "It's up" is not an answer to
+"why is it slow" — and "why is it slow" is the question that actually pages a human.
+This service answers it. Every successful probe is decomposed into its phases — DNS
+resolution, TCP round trip, TLS handshake, server processing, and body transfer —
+and each phase is run through a diagnostic engine that names the bottleneck and the
+fix.
+
+The output is not "latency is high." The output is one of these:
+
+| Finding | What it means | What it tells you to do |
+|---|---|---|
+| `HIGH_RTT_NEEDS_EDGE` | The round trip alone is >100 ms | Distance, not tuning. Put a CDN/edge closer to the probe. No sysctl shortens the speed of light. |
+| `SLOW_DNS` | The resolver spent >200 ms | The resolver, not the target. Run a caching resolver or point at a faster upstream. |
+| `TLS_HANDSHAKE_OVERHEAD` | The handshake cost more round trips than TLS 1.3 needs | Enable TLS 1.3, session resumption, OCSP stapling. |
+| `SLOW_BACKEND` | Time-to-first-byte minus the network is >500 ms | The network delivered; the server sat on it. Profile the handler, not the pipe. |
+| `WINDOW_LIMITED` | A large transfer never filled a 64 KB window | Throughput is window-limited, not pipe-limited. Enable window scaling / raise receive buffers. |
+| `CERT_EXPIRING` | The TLS certificate expires in <30 days (<7 = critical) | Renew now. This outage has a scheduled date and it is printed on the certificate. |
+| `HTTP2_NOT_SUPPORTED` | The server offers only HTTP/1.1 on a >100 ms path | Enable HTTP/2 (h2). On a high-RTT path, HTTP/1.1 head-of-line blocking serialises what h2 would multiplex. |
+
+Every diagnosis carries the numbers that triggered it and the specific remediation.
+It lands in two places: the structured log (one line per finding, at the severity the
+finding warrants) and `state.json`, under a `diagnostics` block per URL carrying the
+full phase breakdown, the derived BDP metrics, and the findings list. The 1 AM
+engineer reads the verdict, not the raw timings.
+
+### DEGRADED: up, and hurting
+
+A 200 is not the same as healthy, so the state machine has three states, not two.
+
+When a probe succeeds but a performance finding fired — high RTT, slow DNS, TLS
+overhead, a window-limited transfer, a slow backend — or time-to-first-byte crossed
+1.5 s, the target is **DEGRADED**, not UP. It gets an amber Discord alert on the
+transition, distinct from the red DOWN alert, because paging a slow-but-alive service
+in the same red as a dead one trains the on-call to distrust red. The colour carries
+the triage: green recovered, amber degraded, red down. `CERT_EXPIRING` and
+`HTTP2_NOT_SUPPORTED` deliberately do not trigger DEGRADED — an expiring cert is a
+scheduled *future* outage and a missing h2 is an optimization, neither is a symptom
+the user is feeling right now.
+
+### Knowing whether the server speaks HTTP/2
+
+aiohttp only ever speaks HTTP/1.1, so it can never tell you whether the server would
+have spoken HTTP/2. The out-of-band sampler can: it offers both `h2` and `http/1.1`
+in the ALPN extension of its own TLS handshake and records what the server picked.
+That negotiated protocol lands in `state.json` as `alpn_protocol` / `h2_supported`,
+and drives the `HTTP2_NOT_SUPPORTED` hint on slow paths. This costs nothing extra —
+it rides on the same handshake the sampler already performs to time the TLS phase.
+
+### On measurement honesty
+
+The bandwidth-delay product needs two inputs, and only one of them is free.
+
+RTT is sampled cleanly with a dedicated raw TCP connect — one round trip, no payload.
+Bandwidth is not free: a health endpoint returning 5 KB finishes inside TCP slow-start
+and tells you nothing about the path's capacity. Reporting a BDP off that sample would
+be inventing a number and printing it with a straight face. So every bandwidth-derived
+metric carries an explicit `bandwidth_confidence` field. It reads `HIGH` only when the
+response body cleared 256 KB — enough to exercise the window. Below that it reads
+`INSUFFICIENT_SAMPLE`, and no bandwidth verdict (`WINDOW_LIMITED`) is allowed to fire.
+A diagnosis from a 5 KB sample is not a diagnosis. It is noise wearing a lab coat, and
+this tool does not wear costumes.
+
+**This measurement runs entirely on the probe you already pay for.** No synthetic load
+against the monitored server, no new dependency. RTT, TLS time, and ALPN/h2 come from
+an out-of-band sampler — one plain TCP connect for RTT and, for HTTPS, one controlled
+handshake for TLS time and the negotiated protocol. That is one extra handshake for
+HTTP targets and two for HTTPS per target per run: SYN/FIN pairs, negligible.
+
+### Boundary condition: the RTT and TLS samples come from different connects
+
+The sampler's RTT (a plain TCP connect) and its TLS time (a separate TLS handshake)
+are two connections opened moments apart. On a jittery path they will not always
+agree — the RTT connect can read 281 ms while the TLS connect completes faster. When
+that makes the derived TLS handshake time negative, it is reported as `null`, never as
+a fabricated positive. Both figures now come from the same sampler back-to-back, so
+they agree far more often than the old aiohttp-vs-sampler derivation did — but they
+are still not one connection. The exit, when single-connection precision is required,
+is a raw socket probe that performs the TLS handshake inline and times every phase on
+one connection, at the cost of not reusing aiohttp's session.
 
 ---
 
@@ -317,12 +408,14 @@ escalation path. A P0 database outage and a non-critical staging endpoint return
 503 produce identical notification behaviour. At this scale, that is acceptable. At
 the next scale, it is not.
 
-**HTTP-only probe logic**
-The checker performs an HTTP GET and evaluates the response code. It does not
-evaluate response body content, does not check TLS certificate expiry, does not
-measure latency against a baseline, and does not perform DNS resolution time
-analysis independently of the HTTP request. It answers one question: did the server
-respond with 200? This is the right first question. It is not the only question.
+**Probe logic does not evaluate response body content**
+The checker performs an HTTP GET, evaluates the response code, and — as of the
+latency/BDP diagnostics — decomposes the connection into DNS, RTT, TLS, server, and
+transfer phases, checks TLS certificate expiry, and flags the bottleneck. What it
+still does not do is inspect the response *body* for correctness: a server returning
+200 with an error page or an empty JSON object reads as healthy. Body-content
+assertions (expected string present, schema valid) are the next question this probe
+does not yet answer.
 
 **No authentication support for protected endpoints**
 Targets are assumed to be publicly accessible. Endpoints that require an
@@ -378,12 +471,12 @@ implementations for Discord, PagerDuty, Slack, and email is a standard strategy
 pattern application. Severity tiers and routing rules live in the YAML configuration
 alongside the targets.
 
-**When you need richer probe results: extend `_probe_once()`**
-The probe function returns nothing on success and raises on failure. Extending it to
-return a `ProbeResult` dataclass — carrying status code, response time, TLS expiry
-days remaining, and body hash — adds observability without changing the retry or
-state logic that wraps it. The check pipeline stays identical; only the data it
-carries changes.
+**Richer probe results: done — `_probe_once()` returns `ProbePhases`**
+This ceiling has been broken. `_probe_once()` now returns a `ProbePhases` dataclass
+carrying status code, per-phase timings, body size, goodput, and TLS expiry days,
+which the diagnostic engine turns into findings. The retry and state logic that wraps
+it did not change — only the data it carries did, exactly as planned. The remaining
+extension on this axis is body-content assertion (see the probe-body limitation above).
 
 **When you need authenticated targets: extend the target schema**
 The YAML schema accepts a URL string today. Accepting a target object with optional

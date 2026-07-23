@@ -34,6 +34,8 @@ from aioresponses import aioresponses
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from diagnostics import ConnectionSample
+
 from main import (
     StateManager,
     _ProbeFailure,
@@ -43,6 +45,10 @@ from main import (
     check_url,
     load_targets,
 )
+
+# A healthy default sample for check_url tests: fast RTT, no h2 question,
+# no TLS issue. Individual tests override fields to force DEGRADED paths.
+_HEALTHY_SAMPLE = ConnectionSample(rtt_ms=15.0, tls_ms=8.0, alpn_protocol="h2", h2_supported=True)
 
 TARGET_URL = "https://example.com"
 
@@ -351,8 +357,9 @@ async def test_check_url_up_no_transition(tmp_path: Path) -> None:
     with aioresponses() as mock:
         mock.get(TARGET_URL, status=200)
         async with aiohttp.ClientSession() as session:
-            with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
-                await check_url(TARGET_URL, session, sm)
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                    await check_url(TARGET_URL, session, sm)
     mock_alert.assert_not_called()
 
 
@@ -364,8 +371,9 @@ async def test_check_url_up_transition_fires_recovery_alert(tmp_path: Path) -> N
     with aioresponses() as mock:
         mock.get(TARGET_URL, status=200)
         async with aiohttp.ClientSession() as session:
-            with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
-                await check_url(TARGET_URL, session, sm)
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                    await check_url(TARGET_URL, session, sm)
 
     mock_alert.assert_called_once()
     assert mock_alert.call_args.kwargs["is_recovery"] is True
@@ -382,8 +390,9 @@ async def test_check_url_down_transition_fires_failure_alert(tmp_path: Path) -> 
             mock.get(TARGET_URL, status=503)
             mock.get(TARGET_URL, status=503)
             async with aiohttp.ClientSession() as session:
-                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
-                    await check_url(TARGET_URL, session, sm)
+                with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                    with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                        await check_url(TARGET_URL, session, sm)
 
     mock_alert.assert_called_once()
     assert mock_alert.call_args.kwargs["is_recovery"] is False
@@ -400,7 +409,137 @@ async def test_check_url_down_no_transition_suppresses_alert(tmp_path: Path) -> 
             mock.get(TARGET_URL, status=503)
             mock.get(TARGET_URL, status=503)
             async with aiohttp.ClientSession() as session:
+                with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                    with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                        await check_url(TARGET_URL, session, sm)
+
+    mock_alert.assert_not_called()
+
+
+async def test_check_url_up_persists_diagnostics(tmp_path: Path) -> None:
+    """A successful probe must write a diagnostics block into state.json.
+
+    This is the whole point of the BDP feature: after check_url runs on an
+    UP target, an operator reading state.json must find the latency/BDP
+    breakdown, not just status=UP."""
+    state_file = tmp_path / "state.json"
+    sm = StateManager(state_file)
+
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"x" * 1024)
+        async with aiohttp.ClientSession() as session:
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                with patch("main.send_discord_alert", new_callable=AsyncMock):
+                    await check_url(TARGET_URL, session, sm)
+
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    record = data[TARGET_URL]
+    assert record["status"] == "UP"
+    assert "diagnostics" in record
+    assert record["diagnostics"]["measured"]["rtt_ms"] == 15.0
+    assert record["diagnostics"]["measured"]["body_bytes"] == 1024
+    # A 1 KB body is far below the bandwidth sample floor — confidence must
+    # be explicitly INSUFFICIENT_SAMPLE, never silently HIGH.
+    assert record["diagnostics"]["derived"]["bandwidth_confidence"] == "INSUFFICIENT_SAMPLE"
+
+
+async def test_probe_once_returns_phases_with_body(tmp_path: Path) -> None:
+    """_probe_once must return a populated ProbePhases and read the body.
+
+    Reading the body is what makes goodput measurable; a probe that only
+    reads headers can never diagnose a window-limited transfer."""
+    sample = ConnectionSample(rtt_ms=20.0, tls_ms=9.0, alpn_protocol="h2", h2_supported=True)
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"y" * 2048)
+        async with aiohttp.ClientSession() as session:
+            phases = await _probe_once(session, TARGET_URL, sample)
+
+    assert phases.http_status == 200
+    assert phases.body_bytes == 2048
+    assert phases.rtt_ms == 20.0
+    assert phases.tls_ms == 9.0
+    assert phases.h2_supported is True
+    assert phases.ttfb_ms >= 0.0
+
+
+# =============================================================================
+# G. DEGRADED state — probe succeeds but a performance finding fires
+#
+# A slow sample (rtt=300ms) trips HIGH_RTT_NEEDS_EDGE, which is in the
+# degrading set. check_url must route the target to DEGRADED, fire the amber
+# alert on transition, and suppress it when already DEGRADED.
+# =============================================================================
+
+_SLOW_SAMPLE = ConnectionSample(rtt_ms=300.0, tls_ms=20.0, alpn_protocol="h2", h2_supported=True)
+
+
+async def test_check_url_degraded_fires_amber_alert(tmp_path: Path) -> None:
+    """Clean → probe OK but RTT high → DEGRADED transition fires an amber alert."""
+    state_file = tmp_path / "state.json"
+    sm = StateManager(state_file)
+
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"x" * 1024)
+        async with aiohttp.ClientSession() as session:
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_SLOW_SAMPLE):
+                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                    await check_url(TARGET_URL, session, sm)
+
+    mock_alert.assert_called_once()
+    assert mock_alert.call_args.kwargs["is_degraded"] is True
+
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    assert data[TARGET_URL]["status"] == "DEGRADED"
+    assert "HIGH_RTT_NEEDS_EDGE" in data[TARGET_URL]["last_error"]
+
+
+async def test_check_url_degraded_no_transition_suppresses_alert(tmp_path: Path) -> None:
+    """Already DEGRADED → still degraded → alert suppressed (no duplicate)."""
+    sm = StateManager(tmp_path / "state.json")
+    await sm.set_degraded(TARGET_URL, "HIGH_RTT_NEEDS_EDGE (rtt_ms=300)")
+
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"x" * 1024)
+        async with aiohttp.ClientSession() as session:
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_SLOW_SAMPLE):
                 with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
                     await check_url(TARGET_URL, session, sm)
 
     mock_alert.assert_not_called()
+
+
+async def test_check_url_degraded_to_up_fires_recovery(tmp_path: Path) -> None:
+    """Was DEGRADED → probe now clean → recovery (green) alert fires."""
+    sm = StateManager(tmp_path / "state.json")
+    await sm.set_degraded(TARGET_URL, "HIGH_RTT_NEEDS_EDGE (rtt_ms=300)")
+
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"x" * 1024)
+        async with aiohttp.ClientSession() as session:
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                    await check_url(TARGET_URL, session, sm)
+
+    mock_alert.assert_called_once()
+    assert mock_alert.call_args.kwargs["is_recovery"] is True
+
+
+async def test_state_set_degraded_transition(tmp_path: Path) -> None:
+    """set_degraded returns True on first entry, False when already DEGRADED."""
+    sm = StateManager(tmp_path / "state.json")
+    assert await sm.set_degraded(TARGET_URL, "reason") is True
+    assert await sm.set_degraded(TARGET_URL, "reason") is False
+
+
+def test_discord_payload_degraded() -> None:
+    """Degraded embed must be amber and titled 'Degraded', distinct from red/green."""
+    payload = _build_discord_payload(
+        url=TARGET_URL,
+        status_detail="HIGH_RTT_NEEDS_EDGE (rtt_ms=300)",
+        timestamp="2026-01-01T00:00:00Z",
+        is_recovery=False,
+        is_degraded=True,
+    )
+    embed = payload["embeds"][0]
+    assert embed["color"] == 0xFFB300
+    assert "Degraded" in embed["title"]
