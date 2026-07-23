@@ -99,6 +99,20 @@ def test_load_targets_object_without_url_exits(tmp_path: Path) -> None:
         load_targets(f)
 
 
+def test_load_targets_non_string_expect_substring_exits(tmp_path: Path) -> None:
+    """expect_substring: 200 (no quotes) parses as an int in YAML. Without
+    validation, _probe_once's .encode("utf-8") call would crash that target's
+    probe every run — this must fail fast at load time instead, with a
+    message that points at the YAML typo, not a mystery AttributeError."""
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        "targets:\n  - url: https://api.com/health\n    expect_substring: 200\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        load_targets(f)
+
+
 def test_load_targets_missing_file(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         load_targets(tmp_path / "nonexistent.yaml")

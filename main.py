@@ -209,10 +209,20 @@ def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
         if isinstance(entry, str):
             targets.append(Target(url=entry))
         elif isinstance(entry, dict) and entry.get("url"):
-            targets.append(Target(
-                url=str(entry["url"]),
-                expect_substring=entry.get("expect_substring"),
-            ))
+            expect = entry.get("expect_substring")
+            if expect is not None and not isinstance(expect, str):
+                # YAML parses `expect_substring: 200` (no quotes) as an int.
+                # _probe_once calls .encode("utf-8") on this value — an
+                # unvalidated int would crash that target's probe every run,
+                # with the traceback misattributed to a "bug" in vigil rather
+                # than a config typo. Fail fast at load time instead.
+                logger.critical(
+                    "'%s' target %r has a non-string expect_substring (%r). "
+                    "Quote it in YAML, e.g.  expect_substring: '200'.",
+                    path, entry["url"], expect,
+                )
+                sys.exit(1)
+            targets.append(Target(url=str(entry["url"]), expect_substring=expect))
         else:
             logger.critical(
                 "'%s' contains an invalid target entry (%r). Each entry must "
