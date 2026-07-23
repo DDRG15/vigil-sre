@@ -508,11 +508,51 @@ async def test_webhook_204_first_try_no_retry(monkeypatch) -> None:
 
 
 async def test_webhook_429_then_204_retries_once(monkeypatch) -> None:
-    """A 429 (rate-limited) must be retried, and succeed on the 2nd attempt."""
+    """A 429 (rate-limited) with no Retry-After header must fall back to the
+    linear backoff schedule, and succeed on the 2nd attempt."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
     with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, status=429)
+            mock.post(WEBHOOK_URL, status=204)
+            async with aiohttp.ClientSession() as session:
+                await send_discord_alert(session, TARGET_URL, "HTTP 503")
+        mock_sleep.assert_called_once_with(1.0)
+
+
+async def test_webhook_429_honors_retry_after_header(monkeypatch) -> None:
+    """A 429 with a Retry-After header must sleep for exactly that long,
+    not the linear backoff schedule — Discord is telling us the real wait."""
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
+    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with aioresponses() as mock:
+            mock.post(WEBHOOK_URL, status=429, headers={"Retry-After": "5"})
+            mock.post(WEBHOOK_URL, status=204)
+            async with aiohttp.ClientSession() as session:
+                await send_discord_alert(session, TARGET_URL, "HTTP 503")
+        mock_sleep.assert_called_once_with(5.0)
+
+
+async def test_webhook_429_retry_after_is_capped(monkeypatch) -> None:
+    """A Retry-After longer than the cap must be clamped — a single 429 must
+    not be allowed to stall the whole run indefinitely."""
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
+    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with aioresponses() as mock:
+            mock.post(WEBHOOK_URL, status=429, headers={"Retry-After": "999"})
+            mock.post(WEBHOOK_URL, status=204)
+            async with aiohttp.ClientSession() as session:
+                await send_discord_alert(session, TARGET_URL, "HTTP 503")
+        mock_sleep.assert_called_once_with(30.0)
+
+
+async def test_webhook_429_malformed_retry_after_falls_back(monkeypatch) -> None:
+    """An unparseable Retry-After must not crash the retry loop — fall back
+    to the linear backoff schedule instead."""
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
+    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with aioresponses() as mock:
+            mock.post(WEBHOOK_URL, status=429, headers={"Retry-After": "not-a-number"})
             mock.post(WEBHOOK_URL, status=204)
             async with aiohttp.ClientSession() as session:
                 await send_discord_alert(session, TARGET_URL, "HTTP 503")

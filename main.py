@@ -132,8 +132,9 @@ STATE_SCHEMA_VERSION: int = 2   # bump whenever state.json's on-disk shape chang
 # Webhook delivery retry: alerts fire on state transitions ONLY, so a webhook
 # POST that dies on a transient Discord 429/5xx has no second chance next
 # run — the alert is gone. Retrying delivery here is the monitor's one job.
-WEBHOOK_RETRY_ATTEMPTS: int   = 3     # total attempts (1 original + 2 retries)
-WEBHOOK_RETRY_BASE_S  : float = 1.0   # linear backoff: 1 s, then 2 s between attempts
+WEBHOOK_RETRY_ATTEMPTS  : int   = 3     # total attempts (1 original + 2 retries)
+WEBHOOK_RETRY_BASE_S    : float = 1.0   # linear backoff: 1 s, then 2 s between attempts
+WEBHOOK_RETRY_AFTER_CAP_S: float = 30.0 # cap on an honoured Retry-After value
 
 # If a full run takes longer than this, the docker-compose `sleep 60` loop
 # (or an equivalent cron/systemd-timer interval) is scheduling overlapping
@@ -652,6 +653,18 @@ async def send_discord_alert(
                     return
 
                 sleep_s = WEBHOOK_RETRY_BASE_S * attempt
+                if resp.status == 429:
+                    # Discord tells us exactly how long to back off after a
+                    # rate limit — ignoring it and retrying on our own linear
+                    # schedule risks hitting the limit again immediately,
+                    # burning attempts and losing the alert for no reason.
+                    retry_after = resp.headers.get("Retry-After")
+                    try:
+                        if retry_after is not None:
+                            sleep_s = min(float(retry_after), WEBHOOK_RETRY_AFTER_CAP_S)
+                    except ValueError:
+                        pass  # malformed header — fall back to linear backoff
+
                 logger.warning(
                     "Discord webhook attempt %d/%d returned HTTP %s for %s "
                     "alert on %s — retrying in %.1fs",
