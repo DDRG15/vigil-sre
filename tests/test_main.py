@@ -34,6 +34,7 @@ from aioresponses import aioresponses
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import main
 from diagnostics import ConnectionSample
 
 from main import (
@@ -41,10 +42,13 @@ from main import (
     Target,
     _ProbeFailure,
     _build_discord_payload,
+    _exit_code,
     _probe_once,
     _probe_with_backoff,
+    _warn_if_over_budget,
     check_url,
     load_targets,
+    run_health_checks,
     send_discord_alert,
 )
 
@@ -780,3 +784,135 @@ def test_discord_payload_degraded() -> None:
     embed = payload["embeds"][0]
     assert embed["color"] == 0xFFB300
     assert "Degraded" in embed["title"]
+
+
+# =============================================================================
+# H. check_url() return value + StateManager.current_status() (an earlier release)
+#
+# --strict inspects the status check_url reports, so what it returns must be
+# exactly what state.json ends up holding — including the hysteresis-pending
+# nuance where a first failure from a healthy state does NOT yet read DOWN.
+# =============================================================================
+
+
+async def test_check_url_returns_up_status(tmp_path: Path) -> None:
+    sm = StateManager(tmp_path / "state.json")
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"x" * 1024)
+        async with aiohttp.ClientSession() as session:
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                with patch("main.send_discord_alert", new_callable=AsyncMock):
+                    result = await check_url(TARGET_URL, session, sm)
+    assert result == "UP"
+
+
+async def test_check_url_returns_degraded_status(tmp_path: Path) -> None:
+    sm = StateManager(tmp_path / "state.json")
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"x" * 1024)
+        async with aiohttp.ClientSession() as session:
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_SLOW_SAMPLE):
+                with patch("main.send_discord_alert", new_callable=AsyncMock):
+                    result = await check_url(TARGET_URL, session, sm)
+    assert result == "DEGRADED"
+
+
+async def test_check_url_returns_down_status_when_confirmed(tmp_path: Path) -> None:
+    """First-ever observation fails → confirmed DOWN immediately → returns DOWN."""
+    sm = StateManager(tmp_path / "state.json")
+    with patch("main.asyncio.sleep", new_callable=AsyncMock):
+        with aioresponses() as mock:
+            mock.get(TARGET_URL, status=503)
+            mock.get(TARGET_URL, status=503)
+            mock.get(TARGET_URL, status=503)
+            async with aiohttp.ClientSession() as session:
+                with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                    with patch("main.send_discord_alert", new_callable=AsyncMock):
+                        result = await check_url(TARGET_URL, session, sm)
+    assert result == "DOWN"
+
+
+async def test_check_url_returns_preserved_status_during_hysteresis_pending(tmp_path: Path) -> None:
+    """A healthy target's FIRST failure is only strike 1/2 — the persisted
+    (and returned) status must stay UP, not jump to DOWN before it's confirmed.
+    A --strict caller must never see 'down' for a target state.json still
+    calls UP."""
+    sm = StateManager(tmp_path / "state.json")
+    await sm.set_up(TARGET_URL)
+
+    with patch("main.asyncio.sleep", new_callable=AsyncMock):
+        with aioresponses() as mock:
+            mock.get(TARGET_URL, status=503)
+            mock.get(TARGET_URL, status=503)
+            mock.get(TARGET_URL, status=503)
+            async with aiohttp.ClientSession() as session:
+                with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                    with patch("main.send_discord_alert", new_callable=AsyncMock):
+                        result = await check_url(TARGET_URL, session, sm)
+    assert result == "UP"
+
+
+def test_state_current_status_reflects_persisted_value(tmp_path: Path) -> None:
+    sm = StateManager(tmp_path / "state.json")
+    assert sm.current_status(TARGET_URL) is None  # never observed
+
+
+async def test_state_current_status_after_set_up(tmp_path: Path) -> None:
+    sm = StateManager(tmp_path / "state.json")
+    await sm.set_up(TARGET_URL)
+    assert sm.current_status(TARGET_URL) == "UP"
+
+
+# =============================================================================
+# I. run_health_checks() down-count + _exit_code() (an earlier release)
+# =============================================================================
+
+
+async def test_run_health_checks_returns_down_count(tmp_path, monkeypatch) -> None:
+    """The returned count must reflect DOWN targets only — UP must not be
+    counted, since that count is what --strict acts on."""
+    monkeypatch.setattr(
+        main.StateManager.__init__, "__defaults__", (tmp_path / "state.json",)
+    )
+    up_url   = "https://up.example.test"
+    down_url = "https://down.example.test"
+
+    with patch("main.asyncio.sleep", new_callable=AsyncMock):
+        with aioresponses() as mock:
+            mock.get(up_url, status=200)
+            mock.get(down_url, status=503)
+            mock.get(down_url, status=503)
+            mock.get(down_url, status=503)
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                with patch("main.send_discord_alert", new_callable=AsyncMock):
+                    down_count = await run_health_checks(targets=[up_url, down_url])
+
+    assert down_count == 1
+
+
+def test_warn_if_over_budget_fires_over_threshold(caplog) -> None:
+    """A duration past RUN_BUDGET_S must log a WARNING naming the overlap risk."""
+    with caplog.at_level("WARNING"):
+        _warn_if_over_budget(main.RUN_BUDGET_S + 5.0)
+    assert any("exceeding" in r.message for r in caplog.records)
+
+
+def test_warn_if_over_budget_silent_under_threshold(caplog) -> None:
+    """A normal, fast run must not log anything about budget overlap."""
+    with caplog.at_level("WARNING"):
+        _warn_if_over_budget(1.0)
+    assert not any("exceeding" in r.message for r in caplog.records)
+
+
+def test_exit_code_no_strict_always_zero() -> None:
+    assert _exit_code(strict=False, down_count=0) == 0
+    assert _exit_code(strict=False, down_count=5) == 0
+
+
+def test_exit_code_strict_zero_down_is_zero() -> None:
+    assert _exit_code(strict=True, down_count=0) == 0
+
+
+def test_exit_code_strict_with_down_is_one() -> None:
+    assert _exit_code(strict=True, down_count=1) == 1
+    assert _exit_code(strict=True, down_count=3) == 1

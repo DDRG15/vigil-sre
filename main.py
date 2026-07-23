@@ -135,6 +135,14 @@ STATE_SCHEMA_VERSION: int = 2   # bump whenever state.json's on-disk shape chang
 WEBHOOK_RETRY_ATTEMPTS: int   = 3     # total attempts (1 original + 2 retries)
 WEBHOOK_RETRY_BASE_S  : float = 1.0   # linear backoff: 1 s, then 2 s between attempts
 
+# If a full run takes longer than this, the docker-compose `sleep 60` loop
+# (or an equivalent cron/systemd-timer interval) is scheduling overlapping
+# runs without anyone knowing — two StateManager instances writing the same
+# state.json concurrently is exactly the kind of silent corruption the
+# asyncio.Lock protects against WITHIN one run, but not across two runs that
+# were never supposed to overlap in the first place.
+RUN_BUDGET_S: float = 60.0
+
 
 # ---------------------------------------------------------------------------
 # YAML target loader
@@ -330,6 +338,22 @@ class StateManager:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # ------------------------------------------------------------------ Public API
+
+    def current_status(self, url: str) -> str | None:
+        """
+        The status currently persisted for *url*, or None if never observed.
+
+        A synchronous, lock-free dict read — safe here because it is only
+        ever called immediately after this same URL's own set_up/set_degraded/
+        set_down call already completed under the lock, so no other coroutine
+        can be mutating this specific key at the same instant. Used to report
+        the real (hysteresis-aware) final status of a run, e.g. for the
+        --strict exit code: a target still inside its DOWN_CONFIRMATIONS
+        window reports its preserved healthy status, not DOWN, exactly as
+        state.json itself does.
+        """
+        record = self._state.get(url)
+        return record["status"] if record is not None else None
 
     async def set_up(self, url: str, diagnostics: dict | None = None) -> bool:
         """
@@ -908,7 +932,7 @@ async def check_url(
     session         : aiohttp.ClientSession,
     state           : StateManager,
     expect_substring: str | None = None,
-) -> None:
+) -> str:
     """
     Run the full health-check pipeline for one URL.
 
@@ -936,6 +960,14 @@ async def check_url(
         session:          Shared aiohttp.ClientSession for HTTP I/O.
         state:            Shared StateManager for transition detection and persistence.
         expect_substring: Optional content assertion (see Target.expect_substring).
+
+    Returns:
+        The status actually persisted for this URL after this run — STATUS_UP,
+        STATUS_DEGRADED, or STATUS_DOWN. A target still inside its
+        DOWN_CONFIRMATIONS hysteresis window returns its preserved healthy
+        status (UP/DEGRADED), not DOWN — this mirrors exactly what state.json
+        itself says, so a --strict exit code never disagrees with the file an
+        operator would read.
     """
     logger.info("─── Checking: %s", url)
 
@@ -968,6 +1000,7 @@ async def check_url(
                 )
             else:
                 logger.info("🟡  Still DEGRADED (alert suppressed)  %s | %s", url, reason)
+            return STATUS_DEGRADED
         else:
             transitioned = await state.set_up(url, diagnostics=diagnostics)
             if transitioned:
@@ -977,6 +1010,7 @@ async def check_url(
                 )
             else:
                 logger.info("✅  OK (no change)       %s", url)
+            return STATUS_UP
 
     except _ProbeFailure as exc:
         transitioned = await state.set_down(url, error=exc.detail)
@@ -993,6 +1027,10 @@ async def check_url(
                 "⚠️   Failure recorded, alert suppressed (already DOWN or "
                 "pending confirmation)  %s | %s", url, exc.detail,
             )
+        # The persisted status is authoritative: a pending-hysteresis failure
+        # leaves the target's previous healthy status in place (see set_down),
+        # so this can legitimately come back UP/DEGRADED, not just DOWN.
+        return state.current_status(url) or STATUS_DOWN
 
 
 # ---------------------------------------------------------------------------
@@ -1031,7 +1069,22 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown_event: as
 # Main async entry point
 # ---------------------------------------------------------------------------
 
-async def run_health_checks(targets: list[str | Target] | None = None) -> None:
+def _warn_if_over_budget(duration_s: float) -> None:
+    """
+    Log a WARNING when a completed run's wall-clock duration exceeded
+    RUN_BUDGET_S — the signal that this scheduler interval (the compose loop's
+    ``sleep 60``, a cron entry, a Kubernetes CronJob schedule) is causing
+    overlapping runs, before an operator notices it any other way.
+    """
+    if duration_s > RUN_BUDGET_S:
+        logger.warning(
+            "Run took %.1fs, exceeding the %.0fs budget — if the scheduler "
+            "(cron/compose loop) fires every %.0fs, runs are now overlapping.",
+            duration_s, RUN_BUDGET_S, RUN_BUDGET_S,
+        )
+
+
+async def run_health_checks(targets: list[str | Target] | None = None) -> int:
     """
     Orchestrate concurrent health checks across all configured targets.
 
@@ -1055,6 +1108,13 @@ async def run_health_checks(targets: list[str | Target] | None = None) -> None:
                  — this keeps direct calls and existing tests working without
                  an expect_substring, exactly as load_targets would for a
                  targets.yaml entry with no object form.
+
+    Returns:
+        The number of targets that are DOWN (or crashed their check) at the
+        end of this run — 0 means every target is UP or DEGRADED. This is
+        what --strict inspects to decide the process exit code; the script
+        itself always exits 0 without --strict, since "some targets are
+        down" is this monitor's normal operating condition, not a bug in it.
     """
     raw_targets: list[str | Target] = targets or load_targets()
     resolved: list[Target] = [
@@ -1065,6 +1125,8 @@ async def run_health_checks(targets: list[str | Target] | None = None) -> None:
     loop           = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
     _install_signal_handlers(loop, shutdown_event)
+
+    run_start = time.monotonic()
 
     logger.info("=" * 64)
     logger.info(
@@ -1079,6 +1141,9 @@ async def run_health_checks(targets: list[str | Target] | None = None) -> None:
     # connect_total_ms come back None and the phase breakdown is partial.
     connector = aiohttp.TCPConnector(limit=100)
     trace_config = build_trace_config()
+    up_count       = 0
+    degraded_count = 0
+    down_count     = 0
     async with aiohttp.ClientSession(
         connector=connector, trace_configs=[trace_config]
     ) as session:
@@ -1089,20 +1154,52 @@ async def run_health_checks(targets: list[str | Target] | None = None) -> None:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Log any unexpected exceptions that leaked past check_url's own handlers.
         for target, result in zip(resolved, results):
             if isinstance(result, Exception):
+                # An unhandled exception is a bug in check_url, not a probe
+                # failure it already handled — but it still means this target
+                # was NOT confirmed healthy this run, so it counts toward
+                # down_count too: a crash must never look like a clean pass
+                # to a --strict caller.
                 logger.critical(
                     "Unhandled exception for %s: %r — this is a bug, please report it.",
                     target.url, result,
                 )
+                down_count += 1
+            elif result == STATUS_UP:
+                up_count += 1
+            elif result == STATUS_DEGRADED:
+                degraded_count += 1
+            else:
+                down_count += 1
 
     if shutdown_event.is_set():
         logger.info("Shutdown signal was processed cleanly.")
 
+    duration_s = time.monotonic() - run_start
+    _warn_if_over_budget(duration_s)
+
     logger.info("=" * 64)
-    logger.info("Run complete.  State file: %s", STATE_FILE.resolve())
+    logger.info(
+        "Run complete: %d up, %d degraded, %d down | duration=%.1fs | State file: %s",
+        up_count, degraded_count, down_count, duration_s, STATE_FILE.resolve(),
+    )
     logger.info("=" * 64)
+
+    return down_count
+
+
+def _exit_code(strict: bool, down_count: int) -> int:
+    """
+    Compute the process exit code for a completed run.
+
+    Without --strict this is always 0: "some targets are down" is this
+    monitor's normal operating condition, not a bug in the monitor itself —
+    a bare `python main.py` must not fail a cron job just because a target
+    it watches is having a bad day. With --strict, a non-zero down_count
+    becomes exit code 1 so a CI job or Kubernetes CronJob can act on it.
+    """
+    return 1 if (strict and down_count > 0) else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1110,10 +1207,19 @@ async def run_health_checks(targets: list[str | Target] | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    strict = "--strict" in sys.argv
     try:
-        asyncio.run(run_health_checks())
+        down_count = asyncio.run(run_health_checks())
     except KeyboardInterrupt:
         # Windows fallback — SIGINT arrives as KeyboardInterrupt, not via
         # add_signal_handler.  Log and exit cleanly without a traceback.
         logger.info("KeyboardInterrupt received — exiting.")
         sys.exit(0)
+
+    exit_code = _exit_code(strict, down_count)
+    if exit_code != 0:
+        logger.error(
+            "--strict: exiting %d because %d target(s) are DOWN.",
+            exit_code, down_count,
+        )
+    sys.exit(exit_code)
