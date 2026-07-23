@@ -496,15 +496,19 @@ def test_discord_payload_fields() -> None:
 WEBHOOK_URL = "https://discord.com/api/webhooks/test/token"
 
 
-async def test_webhook_204_first_try_no_retry(monkeypatch) -> None:
-    """A clean 204 must not sleep or retry."""
+async def test_webhook_204_first_try_no_retry(monkeypatch, caplog) -> None:
+    """A clean 204 must not sleep or retry, and must log that it was sent —
+    not just that no exception was raised. A function that silently returned
+    without posting would pass a sleep-count-only assertion just as well."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
     with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, status=204)
             async with aiohttp.ClientSession() as session:
-                await send_discord_alert(session, TARGET_URL, "Service is UP", is_recovery=True)
+                with caplog.at_level("INFO"):
+                    await send_discord_alert(session, TARGET_URL, "Service is UP", is_recovery=True)
         mock_sleep.assert_not_called()
+    assert any("alert sent" in r.message for r in caplog.records)
 
 
 async def test_webhook_429_then_204_retries_once(monkeypatch) -> None:
@@ -559,9 +563,10 @@ async def test_webhook_429_malformed_retry_after_falls_back(monkeypatch) -> None
         mock_sleep.assert_called_once_with(1.0)
 
 
-async def test_webhook_5xx_exhausts_retries_alert_lost(monkeypatch) -> None:
+async def test_webhook_5xx_exhausts_retries_alert_lost(monkeypatch, caplog) -> None:
     """3 consecutive 500s: retried twice, then abandoned — the alert is LOST,
-    but send_discord_alert must never raise for the caller (check_url)."""
+    logged as such (not silently or as if it succeeded), but send_discord_alert
+    must never raise for the caller (check_url)."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
     with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
@@ -569,24 +574,30 @@ async def test_webhook_5xx_exhausts_retries_alert_lost(monkeypatch) -> None:
             mock.post(WEBHOOK_URL, status=500)
             mock.post(WEBHOOK_URL, status=500)
             async with aiohttp.ClientSession() as session:
-                await send_discord_alert(session, TARGET_URL, "HTTP 503")  # must not raise
+                with caplog.at_level("ERROR"):
+                    await send_discord_alert(session, TARGET_URL, "HTTP 503")  # must not raise
         assert mock_sleep.call_count == 2
         assert mock_sleep.call_args_list == [call(1.0), call(2.0)]
+    assert any("LOST" in r.message for r in caplog.records)
 
 
-async def test_webhook_400_non_retryable_no_retry(monkeypatch) -> None:
-    """A 400 (malformed payload) will not heal on retry — one POST, no sleep."""
+async def test_webhook_400_non_retryable_no_retry(monkeypatch, caplog) -> None:
+    """A 400 (malformed payload) will not heal on retry — one POST, no sleep,
+    and the log must say why it was abandoned rather than retried."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
     with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, status=400)
             async with aiohttp.ClientSession() as session:
-                await send_discord_alert(session, TARGET_URL, "HTTP 503")
+                with caplog.at_level("ERROR"):
+                    await send_discord_alert(session, TARGET_URL, "HTTP 503")
         mock_sleep.assert_not_called()
+    assert any("non-retryable" in r.message for r in caplog.records)
 
 
-async def test_webhook_timeout_retries_then_gives_up(monkeypatch) -> None:
-    """A TimeoutError on every attempt must retry twice then give up cleanly."""
+async def test_webhook_timeout_retries_then_gives_up(monkeypatch, caplog) -> None:
+    """A TimeoutError on every attempt must retry twice then give up cleanly,
+    logging the alert as LOST rather than swallowing the failure silently."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
     with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
@@ -594,8 +605,10 @@ async def test_webhook_timeout_retries_then_gives_up(monkeypatch) -> None:
             mock.post(WEBHOOK_URL, exception=asyncio.TimeoutError())
             mock.post(WEBHOOK_URL, exception=asyncio.TimeoutError())
             async with aiohttp.ClientSession() as session:
-                await send_discord_alert(session, TARGET_URL, "HTTP 503")  # must not raise
+                with caplog.at_level("ERROR"):
+                    await send_discord_alert(session, TARGET_URL, "HTTP 503")  # must not raise
         assert mock_sleep.call_count == 2
+    assert any("LOST" in r.message for r in caplog.records)
 
 
 # =============================================================================
