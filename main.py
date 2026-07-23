@@ -116,6 +116,18 @@ STATUS_UP      : str = "UP"
 STATUS_DOWN    : str = "DOWN"
 STATUS_DEGRADED: str = "DEGRADED"   # probe succeeded but a performance finding fired
 
+# Flap hysteresis: consecutive failed RUNS required to knock a known-healthy
+# (UP or DEGRADED) target into confirmed DOWN. Retries inside _probe_with_backoff
+# already absorb blips within one run; this absorbs flapping ACROSS runs, where
+# a target bouncing UP/DOWN every run would otherwise fire an alert every run.
+# A target with no prior history (first-ever observation) skips the hysteresis
+# and fails straight to DOWN — there is no flapping to protect against on a
+# first sample, and smoke-test targets that are deliberately always-down must
+# still alert on their very first run.
+DOWN_CONFIRMATIONS: int = 2
+
+STATE_SCHEMA_VERSION: int = 2   # bump whenever state.json's on-disk shape changes
+
 
 # ---------------------------------------------------------------------------
 # YAML target loader
@@ -179,11 +191,12 @@ class UrlState(TypedDict, total=False):
     it as possibly-missing.
     """
 
-    status      : str    # "UP" | "DEGRADED" | "DOWN"   (always present)
-    last_checked: str    # ISO-8601 UTC — updated every run
-    last_changed: str    # ISO-8601 UTC — updated only on a transition
-    last_error  : str    # "" when UP; failure detail when DOWN; reason when DEGRADED
-    diagnostics : dict   # last latency/BDP breakdown; on UP and DEGRADED probes
+    status              : str    # "UP" | "DEGRADED" | "DOWN"   (always present)
+    last_checked        : str    # ISO-8601 UTC — updated every run
+    last_changed        : str    # ISO-8601 UTC — updated only on a transition
+    last_error          : str    # "" when UP; failure detail when DOWN/pending; reason when DEGRADED
+    diagnostics         : dict   # last latency/BDP breakdown; on UP and DEGRADED probes
+    consecutive_failures: int    # failed runs in a row since last healthy state; absent/0 when healthy
 
 
 class StateManager:
@@ -212,24 +225,52 @@ class StateManager:
     # ------------------------------------------------------------------ I/O
 
     def _load_sync(self) -> dict[str, UrlState]:
-        """Synchronous load called once at construction (before the loop starts)."""
+        """
+        Synchronous load called once at construction (before the loop starts).
+
+        Understands both on-disk shapes: schema v2 wraps the URL records
+        under a ``targets`` key alongside ``schema_version``; the legacy v1
+        file WAS the flat url→record mapping itself, with no wrapper at all.
+        A v1 file is migrated transparently — this returns its content as the
+        target map, and the very next write persists it in v2 shape. There is
+        no separate migration step to run or forget.
+        """
         if not self._path.exists():
             logger.info("No state file found at '%s' — starting fresh.", self._path)
             return {}
         try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning(
                 "Could not read '%s' (%s) — starting with empty state.", self._path, exc
             )
             return {}
 
+        if not isinstance(raw, dict):
+            logger.warning(
+                "State file '%s' root is not a JSON object — starting fresh.", self._path
+            )
+            return {}
+
+        if "schema_version" in raw:
+            return raw.get("targets", {})
+
+        logger.info(
+            "State file '%s' has no schema_version — treating as legacy v1 and "
+            "migrating to v%d on next write.", self._path, STATE_SCHEMA_VERSION,
+        )
+        return raw
+
     def _write_sync(self) -> None:
         """Atomic write: tmp file → rename.  Called inside the lock."""
         tmp = self._path.with_suffix(".tmp")
+        document = {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "targets"       : self._state,
+        }
         try:
             tmp.write_text(
-                json.dumps(self._state, indent=2, ensure_ascii=False),
+                json.dumps(document, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
             tmp.replace(self._path)
@@ -281,25 +322,69 @@ class StateManager:
 
     async def set_down(self, url: str, error: str) -> bool:
         """
-        Mark *url* as DOWN.
+        Record a failed probe for *url*, subject to flap hysteresis.
+
+        A target with no prior history fails straight to DOWN — there is no
+        flapping to protect against on a first observation. A target coming
+        from a healthy state (UP/DEGRADED) needs DOWN_CONFIRMATIONS
+        consecutive failed runs before it is confirmed DOWN; until then its
+        previous status is preserved (only last_checked, last_error, and the
+        strike counter advance), so a single blip that a future run recovers
+        from never reaches the alert path at all.
 
         Returns:
-            True  — first check, or previous state was UP   → send alert.
-            False — was already DOWN                         → suppress alert.
+            True  — DOWN just confirmed (first-ever observation, or the
+                    strike counter reached DOWN_CONFIRMATIONS)  → send alert.
+            False — already confirmed DOWN, or hysteresis still pending
+                    → suppress alert.
         """
         async with self._lock:
             now      = self._utc_now()
             previous = self._state.get(url)
-            changed  = previous is None or previous["status"] != STATUS_DOWN
+
+            if previous is None:
+                self._state[url] = UrlState(
+                    status               =STATUS_DOWN,
+                    last_checked         =now,
+                    last_changed         =now,
+                    last_error           =error,
+                    consecutive_failures =1,
+                )
+                self._write_sync()
+                return True
+
+            if previous["status"] == STATUS_DOWN:
+                self._state[url] = UrlState(
+                    status               =STATUS_DOWN,
+                    last_checked         =now,
+                    last_changed         =previous["last_changed"],
+                    last_error           =error,
+                    consecutive_failures =previous.get("consecutive_failures", 1) + 1,
+                )
+                self._write_sync()
+                return False
+
+            strikes = previous.get("consecutive_failures", 0) + 1
+            if strikes < DOWN_CONFIRMATIONS:
+                # Hysteresis holds: keep the previous healthy status and its
+                # diagnostics, only advance the failure bookkeeping.
+                pending = dict(previous)
+                pending["last_checked"]          = now
+                pending["last_error"]            = error
+                pending["consecutive_failures"]  = strikes
+                self._state[url] = pending  # type: ignore[assignment]
+                self._write_sync()
+                return False
 
             self._state[url] = UrlState(
-                status      =STATUS_DOWN,
-                last_checked=now,
-                last_changed=now if changed else previous["last_changed"],
-                last_error  =error,
+                status               =STATUS_DOWN,
+                last_checked         =now,
+                last_changed         =now,
+                last_error           =error,
+                consecutive_failures =strikes,
             )
             self._write_sync()
-            return changed
+            return True
 
     async def set_degraded(
         self, url: str, reason: str, diagnostics: dict | None = None
@@ -793,7 +878,13 @@ async def check_url(
                 session, url, status_detail=exc.detail, is_recovery=False
             )
         else:
-            logger.warning("⚠️   Still DOWN (alert suppressed)  %s | %s", url, exc.detail)
+            # Covers two cases: already-confirmed DOWN (repeat, alert already
+            # sent), or a healthy target still inside its DOWN_CONFIRMATIONS
+            # hysteresis window (not yet alerted). Either way: no alert here.
+            logger.warning(
+                "⚠️   Failure recorded, alert suppressed (already DOWN or "
+                "pending confirmation)  %s | %s", url, exc.detail,
+            )
 
 
 # ---------------------------------------------------------------------------

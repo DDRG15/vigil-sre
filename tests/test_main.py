@@ -130,10 +130,14 @@ async def test_state_down_to_up(tmp_path: Path) -> None:
 
 
 async def test_state_up_to_down(tmp_path: Path) -> None:
+    """A healthy target needs DOWN_CONFIRMATIONS (2) consecutive failures
+    before it is confirmed DOWN — the first failure only arms hysteresis."""
     sm = StateManager(tmp_path / "state.json")
     await sm.set_up(TARGET_URL)
-    transitioned = await sm.set_down(TARGET_URL, "Timeout (>5s)")
-    assert transitioned is True
+    first = await sm.set_down(TARGET_URL, "Timeout (>5s)")
+    assert first is False   # strike 1/2 — hysteresis pending, no alert yet
+    second = await sm.set_down(TARGET_URL, "Timeout (>5s)")
+    assert second is True   # strike 2/2 — confirmed DOWN, alert fires
 
 
 async def test_state_atomic_write(tmp_path: Path) -> None:
@@ -144,7 +148,8 @@ async def test_state_atomic_write(tmp_path: Path) -> None:
 
     assert state_file.exists()
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    record = data[TARGET_URL]
+    assert data["schema_version"] == 2
+    record = data["targets"][TARGET_URL]
     assert record["status"] == "UP"
     assert record["last_error"] == ""
     assert "T" in record["last_checked"]   # ISO-8601 sanity check
@@ -160,7 +165,7 @@ async def test_state_error_cleared_on_recovery(tmp_path: Path) -> None:
     await sm.set_up(TARGET_URL)
 
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    assert data[TARGET_URL]["last_error"] == ""
+    assert data["targets"][TARGET_URL]["last_error"] == ""
 
 
 async def test_state_last_changed_unchanged_on_repeat(tmp_path: Path) -> None:
@@ -172,12 +177,12 @@ async def test_state_last_changed_unchanged_on_repeat(tmp_path: Path) -> None:
     await sm.set_up(TARGET_URL)
 
     first = json.loads(state_file.read_text(encoding="utf-8"))
-    last_changed_after_first = first[TARGET_URL]["last_changed"]
+    last_changed_after_first = first["targets"][TARGET_URL]["last_changed"]
 
     await sm.set_up(TARGET_URL)  # same state — must not change last_changed
 
     second = json.loads(state_file.read_text(encoding="utf-8"))
-    last_changed_after_second = second[TARGET_URL]["last_changed"]
+    last_changed_after_second = second["targets"][TARGET_URL]["last_changed"]
 
     assert last_changed_after_first == last_changed_after_second
 
@@ -196,6 +201,77 @@ async def test_state_persists_across_restart(tmp_path: Path) -> None:
 
     # sm2 must know it was already DOWN — no transition should be detected
     assert transitioned is False
+
+
+# =============================================================================
+# B2. Flap hysteresis + schema v2 (an earlier release)
+# =============================================================================
+
+
+async def test_set_down_from_healthy_pending_keeps_previous_status(tmp_path: Path) -> None:
+    """First failure from UP must NOT flip status to DOWN — it stays UP while
+    the strike is recorded, so a recovering target never even reaches DOWN."""
+    state_file = tmp_path / "state.json"
+    sm = StateManager(state_file)
+    await sm.set_up(TARGET_URL)
+
+    transitioned = await sm.set_down(TARGET_URL, "HTTP 503")
+    assert transitioned is False
+
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    record = data["targets"][TARGET_URL]
+    assert record["status"] == "UP"                    # NOT flipped to DOWN
+    assert record["consecutive_failures"] == 1
+    assert record["last_error"] == "HTTP 503"           # failure detail visible
+
+
+async def test_set_down_recovery_resets_strike_counter(tmp_path: Path) -> None:
+    """A recovery between failures must reset the strike counter to zero —
+    otherwise two failures separated by a healthy day would wrongly combine
+    into a false DOWN confirmation."""
+    sm = StateManager(tmp_path / "state.json")
+    await sm.set_up(TARGET_URL)
+    await sm.set_down(TARGET_URL, "HTTP 503")   # strike 1/2, still UP
+    await sm.set_up(TARGET_URL)                 # recovers — strike resets
+
+    transitioned = await sm.set_down(TARGET_URL, "HTTP 503")
+    assert transitioned is False   # back to strike 1/2, not 2/2 — no alert yet
+
+
+async def test_set_down_degraded_to_down_confirms_after_threshold(tmp_path: Path) -> None:
+    """Hysteresis applies from DEGRADED too, not just from UP."""
+    sm = StateManager(tmp_path / "state.json")
+    await sm.set_degraded(TARGET_URL, "HIGH_RTT_NEEDS_EDGE (rtt_ms=300)")
+    first = await sm.set_down(TARGET_URL, "HTTP 503")
+    assert first is False
+    second = await sm.set_down(TARGET_URL, "HTTP 503")
+    assert second is True
+
+
+async def test_state_migrates_legacy_v1_schema(tmp_path: Path) -> None:
+    """A pre-Fase-7 state.json (flat url→record mapping, no schema_version)
+    must load transparently and re-save itself in v2 shape on the next write —
+    an operator upgrading vigil-sre must not lose alert-suppression history."""
+    state_file = tmp_path / "state.json"
+    legacy_v1 = {
+        TARGET_URL: {
+            "status"      : "UP",
+            "last_checked": "2026-01-01T00:00:00Z",
+            "last_changed": "2026-01-01T00:00:00Z",
+            "last_error"  : "",
+        }
+    }
+    state_file.write_text(json.dumps(legacy_v1), encoding="utf-8")
+
+    sm = StateManager(state_file)
+    # The legacy record must be visible immediately (no data loss on load)...
+    transitioned = await sm.set_up(TARGET_URL)
+    assert transitioned is False   # already UP per the migrated legacy record
+
+    # ...and the next write must upgrade the on-disk shape to v2.
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    assert data["schema_version"] == 2
+    assert data["targets"][TARGET_URL]["status"] == "UP"
 
 
 # =============================================================================
@@ -380,9 +456,15 @@ async def test_check_url_up_transition_fires_recovery_alert(tmp_path: Path) -> N
 
 
 async def test_check_url_down_transition_fires_failure_alert(tmp_path: Path) -> None:
-    """URL was UP → probe fails all retries → failure alert must fire with is_recovery=False."""
+    """URL was UP, already has one strike → probe fails all retries → the
+    2nd strike reaches DOWN_CONFIRMATIONS and the failure alert fires.
+
+    The strike is pre-seeded here because flap hysteresis (an earlier release) requires
+    DOWN_CONFIRMATIONS consecutive failed runs from a healthy state before
+    confirming DOWN — a single failure from UP no longer alerts immediately."""
     sm = StateManager(tmp_path / "state.json")
     await sm.set_up(TARGET_URL)
+    await sm.set_down(TARGET_URL, "priming strike 1/2")  # arm hysteresis
 
     with patch("main.asyncio.sleep", new_callable=AsyncMock):
         with aioresponses() as mock:
@@ -433,7 +515,7 @@ async def test_check_url_up_persists_diagnostics(tmp_path: Path) -> None:
                     await check_url(TARGET_URL, session, sm)
 
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    record = data[TARGET_URL]
+    record = data["targets"][TARGET_URL]
     assert record["status"] == "UP"
     assert "diagnostics" in record
     assert record["diagnostics"]["measured"]["rtt_ms"] == 15.0
@@ -489,8 +571,8 @@ async def test_check_url_degraded_fires_amber_alert(tmp_path: Path) -> None:
     assert mock_alert.call_args.kwargs["is_degraded"] is True
 
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    assert data[TARGET_URL]["status"] == "DEGRADED"
-    assert "HIGH_RTT_NEEDS_EDGE" in data[TARGET_URL]["last_error"]
+    assert data["targets"][TARGET_URL]["status"] == "DEGRADED"
+    assert "HIGH_RTT_NEEDS_EDGE" in data["targets"][TARGET_URL]["last_error"]
 
 
 async def test_check_url_degraded_no_transition_suppresses_alert(tmp_path: Path) -> None:
