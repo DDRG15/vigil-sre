@@ -44,6 +44,7 @@ from main import (
     _probe_with_backoff,
     check_url,
     load_targets,
+    send_discord_alert,
 )
 
 # A healthy default sample for check_url tests: fast RTT, no h2 question,
@@ -412,6 +413,78 @@ def test_discord_payload_fields() -> None:
     field_values = [f["value"] for f in fields]
     assert any(TARGET_URL in v for v in field_values)
     assert any("2026-01-01T00:00:00Z" in v for v in field_values)
+
+
+# =============================================================================
+# E2. send_discord_alert() — webhook delivery retry (an earlier release)
+#
+# An alert fires on a state transition only — there is no next-run retry the
+# way probes have. asyncio.sleep is mocked so retries don't add real wall time.
+# =============================================================================
+
+WEBHOOK_URL = "https://discord.com/api/webhooks/test/token"
+
+
+async def test_webhook_204_first_try_no_retry(monkeypatch) -> None:
+    """A clean 204 must not sleep or retry."""
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
+    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with aioresponses() as mock:
+            mock.post(WEBHOOK_URL, status=204)
+            async with aiohttp.ClientSession() as session:
+                await send_discord_alert(session, TARGET_URL, "Service is UP", is_recovery=True)
+        mock_sleep.assert_not_called()
+
+
+async def test_webhook_429_then_204_retries_once(monkeypatch) -> None:
+    """A 429 (rate-limited) must be retried, and succeed on the 2nd attempt."""
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
+    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with aioresponses() as mock:
+            mock.post(WEBHOOK_URL, status=429)
+            mock.post(WEBHOOK_URL, status=204)
+            async with aiohttp.ClientSession() as session:
+                await send_discord_alert(session, TARGET_URL, "HTTP 503")
+        mock_sleep.assert_called_once_with(1.0)
+
+
+async def test_webhook_5xx_exhausts_retries_alert_lost(monkeypatch) -> None:
+    """3 consecutive 500s: retried twice, then abandoned — the alert is LOST,
+    but send_discord_alert must never raise for the caller (check_url)."""
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
+    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with aioresponses() as mock:
+            mock.post(WEBHOOK_URL, status=500)
+            mock.post(WEBHOOK_URL, status=500)
+            mock.post(WEBHOOK_URL, status=500)
+            async with aiohttp.ClientSession() as session:
+                await send_discord_alert(session, TARGET_URL, "HTTP 503")  # must not raise
+        assert mock_sleep.call_count == 2
+        assert mock_sleep.call_args_list == [call(1.0), call(2.0)]
+
+
+async def test_webhook_400_non_retryable_no_retry(monkeypatch) -> None:
+    """A 400 (malformed payload) will not heal on retry — one POST, no sleep."""
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
+    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with aioresponses() as mock:
+            mock.post(WEBHOOK_URL, status=400)
+            async with aiohttp.ClientSession() as session:
+                await send_discord_alert(session, TARGET_URL, "HTTP 503")
+        mock_sleep.assert_not_called()
+
+
+async def test_webhook_timeout_retries_then_gives_up(monkeypatch) -> None:
+    """A TimeoutError on every attempt must retry twice then give up cleanly."""
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
+    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with aioresponses() as mock:
+            mock.post(WEBHOOK_URL, exception=asyncio.TimeoutError())
+            mock.post(WEBHOOK_URL, exception=asyncio.TimeoutError())
+            mock.post(WEBHOOK_URL, exception=asyncio.TimeoutError())
+            async with aiohttp.ClientSession() as session:
+                await send_discord_alert(session, TARGET_URL, "HTTP 503")  # must not raise
+        assert mock_sleep.call_count == 2
 
 
 # =============================================================================

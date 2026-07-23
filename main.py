@@ -128,6 +128,12 @@ DOWN_CONFIRMATIONS: int = 2
 
 STATE_SCHEMA_VERSION: int = 2   # bump whenever state.json's on-disk shape changes
 
+# Webhook delivery retry: alerts fire on state transitions ONLY, so a webhook
+# POST that dies on a transient Discord 429/5xx has no second chance next
+# run — the alert is gone. Retrying delivery here is the monitor's one job.
+WEBHOOK_RETRY_ATTEMPTS: int   = 3     # total attempts (1 original + 2 retries)
+WEBHOOK_RETRY_BASE_S  : float = 1.0   # linear backoff: 1 s, then 2 s between attempts
+
 
 # ---------------------------------------------------------------------------
 # YAML target loader
@@ -504,11 +510,23 @@ async def send_discord_alert(
     is_degraded  : bool = False,
 ) -> None:
     """
-    Dispatch a Discord Webhook POST using the shared aiohttp session.
+    Dispatch a Discord Webhook POST using the shared aiohttp session, with
+    retry on transient failures.
 
     The function is a no-op (CRITICAL log) when DISCORD_WEBHOOK_URL is absent.
     It never raises — all network errors are caught and logged so a broken
     webhook never masks the underlying probe result.
+
+    Retry policy
+    ------------
+    Alerts fire on state transitions ONLY — there is no second chance next
+    run if this POST dies. So timeouts, connection errors, HTTP 429
+    (rate-limited), and HTTP 5xx (Discord-side outage) are retried up to
+    WEBHOOK_RETRY_ATTEMPTS times with linear backoff (1 s, then 2 s). A
+    non-retryable 4xx (malformed payload, bad webhook token, wrong content
+    type) will not heal on retry — it is logged once and abandoned
+    immediately, since hammering a permanently-broken webhook only delays
+    the next probe cycle for no gain.
 
     Args:
         session:       Shared aiohttp.ClientSession for the run.
@@ -529,29 +547,59 @@ async def send_discord_alert(
         url=url, status_detail=status_detail, timestamp=timestamp,
         is_recovery=is_recovery, is_degraded=is_degraded,
     )
+    kind = "recovery" if is_recovery else "degraded" if is_degraded else "failure"
 
-    try:
-        async with session.post(
-            webhook_url,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S),
-        ) as resp:
-            kind = (
-                "recovery" if is_recovery
-                else "degraded" if is_degraded
-                else "failure"
-            )
-            if resp.status == 204:
-                logger.info("Discord %s alert sent for %s.", kind, url)
-            else:
-                logger.error(
-                    "Discord Webhook returned HTTP %s for %s alert on %s.",
-                    resp.status, kind, url,
+    for attempt in range(1, WEBHOOK_RETRY_ATTEMPTS + 1):
+        is_last_attempt = attempt == WEBHOOK_RETRY_ATTEMPTS
+        try:
+            async with session.post(
+                webhook_url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S),
+            ) as resp:
+                if resp.status == 204:
+                    logger.info("Discord %s alert sent for %s.", kind, url)
+                    return
+
+                retryable = resp.status == 429 or resp.status >= 500
+                if not retryable:
+                    logger.error(
+                        "Discord Webhook returned non-retryable HTTP %s for "
+                        "%s alert on %s — abandoning (will not heal on retry).",
+                        resp.status, kind, url,
+                    )
+                    return
+                if is_last_attempt:
+                    logger.error(
+                        "Discord %s alert LOST for %s: all %d attempts "
+                        "returned HTTP %s.",
+                        kind, url, WEBHOOK_RETRY_ATTEMPTS, resp.status,
+                    )
+                    return
+
+                sleep_s = WEBHOOK_RETRY_BASE_S * attempt
+                logger.warning(
+                    "Discord webhook attempt %d/%d returned HTTP %s for %s "
+                    "alert on %s — retrying in %.1fs",
+                    attempt, WEBHOOK_RETRY_ATTEMPTS, resp.status, kind, url, sleep_s,
                 )
-    except asyncio.TimeoutError:
-        logger.error("Timed out sending Discord alert for %s.", url)
-    except aiohttp.ClientError as exc:
-        logger.error("Discord alert failed for %s: %s", url, exc)
+                await asyncio.sleep(sleep_s)
+
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            if is_last_attempt:
+                logger.error(
+                    "Discord %s alert LOST for %s: all %d attempts raised %s: %s",
+                    kind, url, WEBHOOK_RETRY_ATTEMPTS, type(exc).__name__, exc,
+                )
+                return
+
+            sleep_s = WEBHOOK_RETRY_BASE_S * attempt
+            logger.warning(
+                "Discord webhook attempt %d/%d raised %s for %s alert on %s "
+                "— retrying in %.1fs",
+                attempt, WEBHOOK_RETRY_ATTEMPTS, type(exc).__name__, kind, url, sleep_s,
+            )
+            await asyncio.sleep(sleep_s)
 
 
 # ---------------------------------------------------------------------------
