@@ -153,9 +153,14 @@ services:
   health-checker:
     build: .
     env_file: .env
+    environment:
+      # state.json needs a directory mount, not a single-file one — see the
+      # comment in the repo's docker-compose.yml for why.
+      - STATE_FILE_PATH=/app/data/state.json
     volumes:
       - ./targets.yaml:/app/targets.yaml:ro
-      - ./state.json:/app/state.json
+      - ./data:/app/data
+      - ./history.db:/app/history.db
     restart: unless-stopped
     command: >
       sh -c "while true; do python main.py; sleep 60; done"
@@ -413,8 +418,8 @@ is a gap in a chart. Losing an alert is an incident nobody heard about.
 `history.db` is pruned every run: rows older than `HISTORY_RETENTION_DAYS` (default
 30) are deleted. Left unbounded, history grows without limit in the one service whose
 job is to notice things filling up — that failure mode does not get to happen here.
-Measured, not estimated: **~213 bytes per probe row** (schema above, `PRAGMA
-journal_mode=WAL`). At the default 30-day retention:
+Measured, not estimated: **~213 bytes per probe row** (schema above). At the
+default 30-day retention:
 
 | Targets | Rows/day | Disk/day | Disk at 30 days | Disk at 1 year (no retention) |
 |---|---|---|---|---|

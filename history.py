@@ -24,8 +24,21 @@ vigil-sre runs as a single instance (same constraint state.json already has).
 sqlite3 is synchronous, but asyncio.to_thread() moves each blocking call off
 the event loop for the ~150 microseconds it actually needs — cheap enough
 that a dedicated async driver (aiosqlite) would add a dependency to buy back
-a duration too small to matter. WAL mode lets a future read-only dashboard
-process query history.db while this process keeps writing to it.
+a duration too small to matter.
+
+Why the default journal mode, not WAL
+--------------------------------------
+An earlier version of this module set `PRAGMA journal_mode=WAL` for a future
+read-only dashboard process to query history.db concurrently. WAL splits
+persistence across history.db plus history.db-wal/-shm sidecar files, which
+only merge back into the main file on an automatic or explicit checkpoint —
+so most of the actual data can sit in the sidecars for extended periods. A
+Docker deployment bind-mounting only history.db (the same single-file pattern
+state.json already uses) would silently lose most of its history on every
+container recreation, which is the exact failure this module exists to
+prevent. That dashboard does not exist yet and has no committed design, so
+this module does not pay WAL's deployment cost for it today. Revisit journal
+mode if and when the dashboard's actual concurrency needs are known.
 
 Python  : 3.11+
 Depends : stdlib only (sqlite3, asyncio).
@@ -167,8 +180,9 @@ class HistoryRecorder:
     # ------------------------------------------------------------------ I/O
 
     def _connect(self) -> sqlite3.Connection:
+        # Default (rollback-journal) mode: single-file persistence, no -wal/
+        # -shm sidecars. See the module docstring for why WAL was dropped.
         con = sqlite3.connect(self._db_path, timeout=CONNECT_TIMEOUT_S)
-        con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA foreign_keys=ON")
         return con
 

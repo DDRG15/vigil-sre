@@ -1359,7 +1359,7 @@ async def run_health_checks(
     logger.info("=" * 64)
     logger.info(
         "Run complete: %d up, %d degraded, %d down | duration=%.1fs | State file: %s",
-        up_count, degraded_count, down_count, duration_s, STATE_FILE.resolve(),
+        up_count, degraded_count, down_count, duration_s, state_path.resolve(),
     )
     logger.info("=" * 64)
 
@@ -1385,8 +1385,18 @@ def _exit_code(strict: bool, down_count: int) -> int:
 
 if __name__ == "__main__":
     strict = "--strict" in sys.argv
+    # STATE_FILE_PATH lets a container deployment point state.json at a
+    # bind-mounted DIRECTORY (see docker-compose.yml) instead of the bare
+    # relative filename. A single-file bind mount cannot work here: state.json
+    # is a mount point in that case, and the OS refuses to rename() a file
+    # onto an active mount point (confirmed: EBUSY, reproducible on any OS,
+    # not a Docker Desktop quirk) — which is exactly what StateManager's
+    # atomic tmp-then-replace write does on every save. Unset, this resolves
+    # to the same STATE_FILE default as always; local/non-Docker runs are
+    # unaffected.
+    state_path = Path(os.getenv("STATE_FILE_PATH", str(STATE_FILE)))
     try:
-        down_count = asyncio.run(run_health_checks())
+        down_count = asyncio.run(run_health_checks(state_path=state_path))
     except KeyboardInterrupt:
         # Windows fallback — SIGINT arrives as KeyboardInterrupt, not via
         # add_signal_handler.  Log and exit cleanly without a traceback.

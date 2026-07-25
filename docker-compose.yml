@@ -2,9 +2,18 @@ services:
   health-checker:
     build: .
     env_file: .env
+    environment:
+      # state.json must live on a bind-mounted DIRECTORY, not a bind-mounted
+      # single file: StateManager writes atomically via a tmp-file rename,
+      # and the OS refuses to rename() a file onto an active mount point —
+      # which is exactly what a single-file bind mount target is. Unset,
+      # this would silently fail on every write (confirmed via `docker compose
+      # run` — see the design notes for the reproduction).
+      - STATE_FILE_PATH=/app/data/state.json
     volumes:
       - ./targets.yaml:/app/targets.yaml:ro
-      - ./state.json:/app/state.json
+      - ./data:/app/data
+      - ./history.db:/app/history.db
     restart: unless-stopped
     command: >
       sh -c "while true; do python main.py; sleep 60; done"

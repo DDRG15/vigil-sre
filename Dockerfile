@@ -3,15 +3,26 @@
 # =============================================================================
 #
 # Build:    docker build -t sre-health-checker .
+#
+# state.json needs a DIRECTORY bind mount, not a single-file one — see the
+# STATE_FILE_PATH comment in docker-compose.yml for why (rename() onto a
+# bind-mounted single file fails with EBUSY; a directory mount doesn't have
+# this problem). history.db doesn't need this: SQLite writes in place rather
+# than via a tmp-file rename, so a single-file mount is fine for it.
+#
 # Run once: docker run --rm \
 #               --env-file .env \
-#               -v "$(pwd)/state.json:/app/state.json" \
+#               -e STATE_FILE_PATH=/app/data/state.json \
+#               -v "$(pwd)/data:/app/data" \
+#               -v "$(pwd)/history.db:/app/history.db" \
 #               -v "$(pwd)/targets.yaml:/app/targets.yaml:ro" \
 #               sre-health-checker
 #
 # Run on a schedule (every 60 s via shell loop):
 #   docker run --rm --env-file .env \
-#       -v "$(pwd)/state.json:/app/state.json" \
+#       -e STATE_FILE_PATH=/app/data/state.json \
+#       -v "$(pwd)/data:/app/data" \
+#       -v "$(pwd)/history.db:/app/history.db" \
 #       -v "$(pwd)/targets.yaml:/app/targets.yaml:ro" \
 #       sre-health-checker \
 #       sh -c 'while true; do python main.py; sleep 60; done'
@@ -58,23 +69,30 @@ WORKDIR /app
 # in the runtime image, which keeps it small and reduces the attack surface.
 COPY --from=builder /install/lib/python3.11/site-packages /app/site-packages
 
-# Copy application source files.
+# Copy application source files — all three modules main.py imports.
 # targets.yaml and .env are expected to be bind-mounted at runtime (see above)
 # so they are NOT baked into the image — this keeps secrets out of image layers.
-COPY main.py .
+COPY main.py diagnostics.py history.py ./
 
-# state.json must be writable by the sre user.
-# When the file is bind-mounted from the host, the host file's permissions apply.
-# When not mounted (ephemeral run), the container writes here.
-RUN install -d -o sre -g sre /app && touch /app/state.json && chown sre:sre /app/state.json
+# state.json (ephemeral fallback path) and /app/data (the STATE_FILE_PATH
+# directory docker-compose.yml mounts — see its comment for why state.json
+# needs a directory mount, not a single-file one) must both be writable by
+# the sre user. When bind-mounted from the host, the host path's own
+# permissions apply instead; these just cover the ephemeral, non-mounted run.
+RUN install -d -o sre -g sre /app /app/data \
+ && touch /app/state.json && chown sre:sre /app/state.json
 
 # Drop privileges before the process starts.
 USER sre
 
-# Healthcheck: verify Python can import the two critical deps and the script
-# parses cleanly.  Docker marks the container unhealthy if this fails.
+# Healthcheck: import the actual application module, not just its deps.
+# `import aiohttp, yaml` passed even when main.py itself couldn't be
+# imported (ModuleNotFoundError on a sibling module missing from the image) —
+# a healthcheck that only proves the dependencies exist proves nothing about
+# whether the application can start. Docker marks the container unhealthy if
+# this fails.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import aiohttp, yaml; print('deps OK')" || exit 1
+    CMD python -c "import main; print('main OK')" || exit 1
 
 # Default command — runs one full check cycle and exits.
 # Pair with a CronJob (Kubernetes) or --restart=always + sleep loop (Docker)

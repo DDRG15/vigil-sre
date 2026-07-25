@@ -25,10 +25,31 @@ jobs:
         run: pytest tests/ -v
 
   docker:
-    name: docker build
+    name: docker build & run
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Build image
         run: docker build -t vigil-sre .
+
+      - name: Verify the image can import its own application module
+        # A `docker build` succeeding proves nothing about whether the app
+        # can start -- an earlier Dockerfile revision COPYed only main.py
+        # while main.py imports diagnostics and history, and the build still
+        # passed. Only running the image catches that. This mirrors the
+        # Dockerfile's own HEALTHCHECK command exactly, so a regression here
+        # is a regression there too.
+        run: docker run --rm --entrypoint python vigil-sre -c "import main; print('main OK')"
+
+      - name: Run one real health-check cycle end-to-end
+        # Exercises the actual deployment path (docker-compose.yml, the real
+        # targets.yaml smoke-test targets, state.json/history.db writes) —
+        # not just an import. main.py exits 0 regardless of target status
+        # unless --strict is passed, so this only fails on an unhandled crash.
+        run: |
+          cp .env.example .env
+          echo '{}' > state.json
+          : > history.db
+          docker compose build
+          docker compose run --rm health-checker python main.py
