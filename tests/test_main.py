@@ -30,7 +30,7 @@ from unittest.mock import AsyncMock, call, patch
 
 import aiohttp
 import pytest
-from aioresponses import aioresponses
+from aioresponses import CallbackResult, aioresponses
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -768,6 +768,50 @@ async def test_probe_once_returns_phases_with_body(tmp_path: Path) -> None:
     assert phases.tls_ms == 9.0
     assert phases.h2_supported is True
     assert phases.ttfb_ms >= 0.0
+
+
+async def test_probe_once_redirect_voids_server_processing_ms() -> None:
+    """A redirected request must never compute server_processing_ms.
+
+    The trace hooks keep only the LAST hop's dns/connect timings, but ttfb
+    spans the WHOLE chain (measured from before the first hop). Subtracting a
+    single-hop network cost from a multi-hop ttfb would misattribute the
+    earlier hop's full round trip to "the server thinking" -- a false
+    SLOW_BACKEND finding on a target that is only redirecting, not slow.
+    A large rtt_ms is used here specifically so that, absent the fix, the
+    subtraction would still likely yield a positive (wrong) number."""
+    sample = ConnectionSample(rtt_ms=5.0, tls_ms=None, alpn_protocol=None, h2_supported=None)
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=301, headers={"Location": "https://redirected.example.test/health"})
+        mock.get("https://redirected.example.test/health", status=200, body=b"ok")
+        async with aiohttp.ClientSession() as session:
+            phases = await _probe_once(session, TARGET_URL, sample)
+
+    assert phases.http_status == 200
+    assert phases.server_processing_ms is None
+
+
+async def test_probe_once_no_redirect_does_not_force_none(monkeypatch) -> None:
+    """The redirect guard must gate on `redirected`, not unconditionally void
+    server_processing_ms. Verified by forcing a large, deterministic ttfb via
+    a lightweight artificial delay inside the mocked GET (patching the global
+    time.monotonic is unsafe here -- it collides with asyncio's own internal
+    use of the same clock during event-loop teardown on Windows)."""
+    import asyncio as _asyncio
+
+    async def _slow_payload(url, **kwargs):
+        await _asyncio.sleep(0.05)  # ensure ttfb_ms measurably exceeds rtt_ms
+        return CallbackResult(status=200, body=b"ok")
+
+    sample = ConnectionSample(rtt_ms=0.001, tls_ms=None, alpn_protocol=None, h2_supported=None)
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, callback=_slow_payload)
+        async with aiohttp.ClientSession() as session:
+            phases = await _probe_once(session, TARGET_URL, sample)
+
+    assert phases.http_status == 200
+    assert phases.ttfb_ms > 10.0  # comfortably above the 0.001ms rtt_ms
+    assert phases.server_processing_ms is not None
 
 
 # =============================================================================

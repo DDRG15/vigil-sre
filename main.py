@@ -761,6 +761,7 @@ async def _probe_once(
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S)
     trace_ctx: dict = {}
     start = time.monotonic()
+    redirected = False
     try:
         async with session.get(
             url,
@@ -771,6 +772,16 @@ async def _probe_once(
         ) as resp:
             if resp.status != EXPECTED_STATUS:
                 raise _ProbeFailure(f"HTTP {resp.status}")
+
+            # On a redirect chain, the TraceConfig hooks overwrite dns_ms/
+            # connect_total_ms on every hop and keep only the last one, but
+            # ttfb_ms below spans the ENTIRE chain (measured from `start`,
+            # before the first hop). Subtracting a single-hop dns+connect from
+            # a multi-hop ttfb would attribute the earlier hops' full round
+            # trip to "the server thinking" — server_processing_ms is voided
+            # for redirected responses below instead of reporting a number
+            # that isn't measuring what its name says it measures.
+            redirected = len(resp.history) > 0
 
             ttfb_ms = (time.monotonic() - start) * 1000.0
             cert_days = _extract_cert_days(resp)
@@ -811,9 +822,10 @@ async def _probe_once(
 
     # Server processing is the time-to-first-byte with the known network
     # setup (DNS + connect/TLS) and one request→first-byte round trip removed.
-    # What remains is the server thinking. Clamp negatives to None.
+    # What remains is the server thinking. Clamp negatives to None. Never
+    # computed for a redirected response — see the `redirected` comment above.
     server_processing_ms: float | None = None
-    if rtt_ms is not None:
+    if rtt_ms is not None and not redirected:
         network_setup = (dns_ms or 0.0) + (connect_total_ms or 0.0) + rtt_ms
         remainder = ttfb_ms - network_setup
         server_processing_ms = remainder if remainder > 0 else None
