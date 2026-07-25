@@ -41,7 +41,7 @@ from __future__ import annotations
 import asyncio
 import ssl
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -437,7 +437,7 @@ def analyze(phases: ProbePhases) -> list[Diagnosis]:
     # --- Rule 1: high RTT — distance/routing, not tunable ------------------
     if phases.rtt_ms is not None and phases.rtt_ms > RTT_HIGH_MS:
         findings.append(Diagnosis(
-            code="HIGH_RTT_NEEDS_EDGE",
+            code=CODE_HIGH_RTT,
             severity=SEVERITY_WARN,
             evidence=f"rtt_ms={phases.rtt_ms:.0f} (threshold {RTT_HIGH_MS:.0f})",
             recommendation=(
@@ -451,7 +451,7 @@ def analyze(phases: ProbePhases) -> list[Diagnosis]:
     # --- Rule 2: slow DNS ---------------------------------------------------
     if phases.dns_ms is not None and phases.dns_ms > DNS_SLOW_MS:
         findings.append(Diagnosis(
-            code="SLOW_DNS",
+            code=CODE_SLOW_DNS,
             severity=SEVERITY_WARN,
             evidence=f"dns_ms={phases.dns_ms:.0f} (threshold {DNS_SLOW_MS:.0f})",
             recommendation=(
@@ -469,7 +469,7 @@ def analyze(phases: ProbePhases) -> list[Diagnosis]:
         and phases.tls_ms > 2 * phases.rtt_ms + TLS_OVERHEAD_SLACK_MS
     ):
         findings.append(Diagnosis(
-            code="TLS_HANDSHAKE_OVERHEAD",
+            code=CODE_TLS_OVERHEAD,
             severity=SEVERITY_WARN,
             evidence=(
                 f"tls_ms={phases.tls_ms:.0f} vs 2xRTT+{TLS_OVERHEAD_SLACK_MS:.0f}"
@@ -489,7 +489,7 @@ def analyze(phases: ProbePhases) -> list[Diagnosis]:
         and phases.server_processing_ms > TTFB_BACKEND_SLACK_MS
     ):
         findings.append(Diagnosis(
-            code="SLOW_BACKEND",
+            code=CODE_SLOW_BACKEND,
             severity=SEVERITY_WARN,
             evidence=(
                 f"server_processing_ms={phases.server_processing_ms:.0f} "
@@ -516,7 +516,7 @@ def analyze(phases: ProbePhases) -> list[Diagnosis]:
                 if ceiling is not None else ""
             )
             findings.append(Diagnosis(
-                code="WINDOW_LIMITED",
+                code=CODE_WINDOW_LIMITED,
                 severity=SEVERITY_WARN,
                 evidence=(
                     f"effective_window={eff_window:.0f}B over a "
@@ -538,7 +538,7 @@ def analyze(phases: ProbePhases) -> list[Diagnosis]:
     if phases.tls_cert_days_left is not None:
         if phases.tls_cert_days_left < CERT_CRIT_DAYS:
             findings.append(Diagnosis(
-                code="CERT_EXPIRING",
+                code=CODE_CERT_EXPIRING,
                 severity=SEVERITY_CRITICAL,
                 evidence=(
                     f"tls_cert_days_left={phases.tls_cert_days_left} "
@@ -552,7 +552,7 @@ def analyze(phases: ProbePhases) -> list[Diagnosis]:
             ))
         elif phases.tls_cert_days_left < CERT_WARN_DAYS:
             findings.append(Diagnosis(
-                code="CERT_EXPIRING",
+                code=CODE_CERT_EXPIRING,
                 severity=SEVERITY_WARN,
                 evidence=(
                     f"tls_cert_days_left={phases.tls_cert_days_left} "

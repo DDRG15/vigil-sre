@@ -33,10 +33,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from diagnostics import (
     BANDWIDTH_MIN_SAMPLE_BYTES,
+    CODE_CERT_EXPIRING,
+    CODE_HIGH_RTT,
     CODE_HTTP2_UNSUPPORTED,
+    CODE_SLOW_BACKEND,
+    CODE_SLOW_DNS,
+    CODE_TLS_OVERHEAD,
+    CODE_WINDOW_LIMITED,
     CONFIDENCE_HIGH,
     CONFIDENCE_INSUFFICIENT,
     DEGRADED_TTFB_MS,
+    DEGRADING_FINDING_CODES,
     ConnectionSample,
     Diagnosis,
     ProbePhases,
@@ -50,6 +57,19 @@ from diagnostics import (
     phases_to_dict,
     sample_connection,
 )
+
+# Every diagnosis code the rule engine can emit. Kept as its own set (not
+# derived from the module) so this list is a second, independent witness —
+# if a rule and this list ever disagree, that disagreement is the point.
+ALL_DIAGNOSIS_CODES: frozenset[str] = frozenset({
+    CODE_HIGH_RTT,
+    CODE_SLOW_DNS,
+    CODE_TLS_OVERHEAD,
+    CODE_SLOW_BACKEND,
+    CODE_WINDOW_LIMITED,
+    CODE_CERT_EXPIRING,
+    CODE_HTTP2_UNSUPPORTED,
+})
 
 
 def _codes(findings: list[Diagnosis]) -> set[str]:
@@ -137,70 +157,102 @@ def test_cert_days_left_garbage() -> None:
 
 def test_high_rtt_fires() -> None:
     findings = analyze(_base_phases(rtt_ms=150.0, connect_total_ms=160.0, tls_ms=10.0))
-    assert "HIGH_RTT_NEEDS_EDGE" in _codes(findings)
+    assert CODE_HIGH_RTT in _codes(findings)
 
 
 def test_high_rtt_silent_below_threshold() -> None:
     findings = analyze(_base_phases(rtt_ms=80.0))
-    assert "HIGH_RTT_NEEDS_EDGE" not in _codes(findings)
+    assert CODE_HIGH_RTT not in _codes(findings)
 
 
 def test_slow_dns_fires() -> None:
     findings = analyze(_base_phases(dns_ms=300.0))
-    assert "SLOW_DNS" in _codes(findings)
+    assert CODE_SLOW_DNS in _codes(findings)
 
 
 def test_slow_dns_silent_below_threshold() -> None:
     findings = analyze(_base_phases(dns_ms=150.0))
-    assert "SLOW_DNS" not in _codes(findings)
+    assert CODE_SLOW_DNS not in _codes(findings)
 
 
 def test_tls_overhead_fires() -> None:
     # rtt=20 → 2*rtt+50 = 90; tls of 120 exceeds it
     findings = analyze(_base_phases(rtt_ms=20.0, tls_ms=120.0, connect_total_ms=140.0))
-    assert "TLS_HANDSHAKE_OVERHEAD" in _codes(findings)
+    assert CODE_TLS_OVERHEAD in _codes(findings)
 
 
 def test_tls_overhead_silent_when_reasonable() -> None:
     # rtt=20 → threshold 90; tls of 40 is fine
     findings = analyze(_base_phases(rtt_ms=20.0, tls_ms=40.0, connect_total_ms=60.0))
-    assert "TLS_HANDSHAKE_OVERHEAD" not in _codes(findings)
+    assert CODE_TLS_OVERHEAD not in _codes(findings)
 
 
 def test_slow_backend_fires() -> None:
     findings = analyze(_base_phases(server_processing_ms=800.0))
-    assert "SLOW_BACKEND" in _codes(findings)
+    assert CODE_SLOW_BACKEND in _codes(findings)
 
 
 def test_slow_backend_silent_below_threshold() -> None:
     findings = analyze(_base_phases(server_processing_ms=200.0))
-    assert "SLOW_BACKEND" not in _codes(findings)
+    assert CODE_SLOW_BACKEND not in _codes(findings)
 
 
 def test_cert_warn_fires() -> None:
     findings = analyze(_base_phases(tls_cert_days_left=20))
-    cert = [f for f in findings if f.code == "CERT_EXPIRING"]
+    cert = [f for f in findings if f.code == CODE_CERT_EXPIRING]
     assert len(cert) == 1
     assert cert[0].severity == "warn"
 
 
 def test_cert_critical_fires() -> None:
     findings = analyze(_base_phases(tls_cert_days_left=3))
-    cert = [f for f in findings if f.code == "CERT_EXPIRING"]
+    cert = [f for f in findings if f.code == CODE_CERT_EXPIRING]
     assert len(cert) == 1
     assert cert[0].severity == "critical"
 
 
 def test_cert_healthy_silent() -> None:
     findings = analyze(_base_phases(tls_cert_days_left=200))
-    assert "CERT_EXPIRING" not in _codes(findings)
+    assert CODE_CERT_EXPIRING not in _codes(findings)
 
 
 def test_missing_rtt_suppresses_rtt_dependent_rules() -> None:
     """A None RTT must not crash analyze() and must skip RTT-based rules."""
     findings = analyze(_base_phases(rtt_ms=None, tls_ms=None, server_processing_ms=None))
-    assert "HIGH_RTT_NEEDS_EDGE" not in _codes(findings)
-    assert "TLS_HANDSHAKE_OVERHEAD" not in _codes(findings)
+    assert CODE_HIGH_RTT not in _codes(findings)
+    assert CODE_TLS_OVERHEAD not in _codes(findings)
+
+
+# =============================================================================
+# C2. Anti-drift invariant (audit fix: rules 1-6 used to emit string literals
+# instead of the CODE_* constants, so a future rename of a constant could
+# silently unlink it from the rule that is supposed to emit it, and from
+# DEGRADING_FINDING_CODES, without any test going red).
+# =============================================================================
+
+
+def test_degrading_codes_are_a_subset_of_all_known_codes() -> None:
+    """DEGRADING_FINDING_CODES must only ever reference codes analyze() can
+    actually emit — a typo or a stale entry here would silently misclassify
+    DEGRADED status without any rule ever producing that exact string."""
+    assert DEGRADING_FINDING_CODES <= ALL_DIAGNOSIS_CODES
+
+
+def test_every_rule_emits_its_named_constant_not_a_stray_literal() -> None:
+    """Fire every rule at once and assert the emitted codes are drawn from
+    ALL_DIAGNOSIS_CODES. This is the regression guard for the audit finding:
+    if a rule ever reverts to (or drifts to) a literal that doesn't match its
+    CODE_* constant, the emitted code stops belonging to this known set and
+    this test goes red — where asserting against a hand-typed string literal,
+    the same class of bug the original code had, would not have caught it."""
+    findings = analyze(_base_phases(
+        rtt_ms=150.0, connect_total_ms=170.0, tls_ms=130.0,
+        dns_ms=300.0, server_processing_ms=800.0,
+        tls_cert_days_left=3, h2_supported=False, alpn_protocol="http/1.1",
+    ))
+    emitted = _codes(findings)
+    assert emitted  # sanity: this phase mix must fire something
+    assert emitted <= ALL_DIAGNOSIS_CODES
 
 
 # =============================================================================
@@ -216,7 +268,7 @@ def test_window_limited_fires_on_large_sample() -> None:
         body_bytes=body, goodput_bps=1_000_000.0, rtt_ms=100.0,
         connect_total_ms=110.0, tls_ms=10.0,
     ))
-    assert "WINDOW_LIMITED" in _codes(findings)
+    assert CODE_WINDOW_LIMITED in _codes(findings)
 
 
 def test_window_limited_silent_on_small_sample() -> None:
@@ -225,7 +277,7 @@ def test_window_limited_silent_on_small_sample() -> None:
         body_bytes=1024, goodput_bps=1_000_000.0, rtt_ms=100.0,
         connect_total_ms=110.0, tls_ms=10.0,
     ))
-    assert "WINDOW_LIMITED" not in _codes(findings)
+    assert CODE_WINDOW_LIMITED not in _codes(findings)
 
 
 def test_confidence_high_only_on_large_body() -> None:
@@ -312,7 +364,7 @@ def test_phases_to_dict_shape() -> None:
     assert set(out.keys()) == {"measured", "derived", "findings", "measured_at"}
     assert out["measured"]["rtt_ms"] == 20.0
     assert out["derived"]["bandwidth_confidence"] == CONFIDENCE_INSUFFICIENT
-    assert any(f["code"] == "CERT_EXPIRING" for f in out["findings"])
+    assert any(f["code"] == CODE_CERT_EXPIRING for f in out["findings"])
 
 
 def test_phases_to_dict_preserves_none() -> None:
@@ -375,7 +427,7 @@ def test_degraded_reason_fires_on_performance_finding() -> None:
     phases = _base_phases(rtt_ms=300.0, connect_total_ms=310.0, tls_ms=10.0)
     reason = degraded_reason(phases, analyze(phases))
     assert reason is not None
-    assert "HIGH_RTT_NEEDS_EDGE" in reason
+    assert CODE_HIGH_RTT in reason
 
 
 def test_degraded_reason_fires_on_slow_ttfb_alone() -> None:
@@ -398,6 +450,6 @@ def test_degraded_reason_ignores_cert_and_http2() -> None:
     )
     findings = analyze(phases)
     # Sanity: the cert finding is present...
-    assert any(f.code == "CERT_EXPIRING" for f in findings)
+    assert any(f.code == CODE_CERT_EXPIRING for f in findings)
     # ...but it must not drive DEGRADED.
     assert degraded_reason(phases, findings) is None

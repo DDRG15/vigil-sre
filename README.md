@@ -348,6 +348,19 @@ are still not one connection. The exit, when single-connection precision is requ
 is a raw socket probe that performs the TLS handshake inline and times every phase on
 one connection, at the cost of not reusing aiohttp's session.
 
+### Boundary condition: the BDP estimate crosses two connections too
+
+`effective_window_bytes` multiplies `goodput_bps` (measured on the probe's own
+aiohttp connection, downloading the real response body) by `rtt_ms` (measured on the
+out-of-band sampler's separate connection to the same host). This is the same class
+of approximation as the RTT/TLS boundary condition above — two connections, not one —
+and it is why every bandwidth-derived number already ships with an explicit
+`bandwidth_confidence` field rather than being presented as measured fact. Treat the
+BDP estimate as directional (good enough to say "this path is window-limited," not
+precise enough to size a `tcp_rmem` value to the byte). The exit is the same raw
+single-connection socket probe named above — one connection carrying the request,
+the RTT sample, and the transfer all on the same TCP stream.
+
 ---
 
 ## Dependency Philosophy
