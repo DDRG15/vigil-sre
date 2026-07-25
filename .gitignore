@@ -10,6 +10,9 @@ build/
 # Runtime artifacts
 *.log
 state.json
+history.db
+history.db-wal
+history.db-shm
 
 # Secrets
 .env

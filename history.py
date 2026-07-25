@@ -1,0 +1,304 @@
+"""
+history.py — SQLite-backed historical persistence for vigil-sre.
+
+state.json answers "what is the status of this target RIGHT NOW, and should
+an alert fire?". It is small, hot, and load-bearing — the flap-hysteresis
+and alert-suppression logic in main.py depends on it being correct on every
+single run. This module answers a different question: "what has this
+target's status and latency looked like over time?" — the question that
+unlocks percentiles, uptime %, and trend detection, none of which state.json
+can ever answer because it only remembers the last observation.
+
+Isolation boundary (the one decision that matters here)
+---------------------------------------------------------
+HistoryRecorder runs strictly AFTER StateManager has persisted state and
+send_discord_alert has already fired for a run. Every method here catches
+its own exceptions, logs them, and returns — never re-raises. A full disk,
+a corrupted history.db, or a stuck SQLite lock degrades the history feature
+(a few rows go unrecorded) and must never touch alert delivery. Losing an
+alert is an incident; losing a history row is not.
+
+Why sqlite3 (stdlib) + asyncio.to_thread instead of an async driver
+--------------------------------------------------------------------
+vigil-sre runs as a single instance (same constraint state.json already has).
+sqlite3 is synchronous, but asyncio.to_thread() moves each blocking call off
+the event loop for the ~150 microseconds it actually needs — cheap enough
+that a dedicated async driver (aiosqlite) would add a dependency to buy back
+a duration too small to matter. WAL mode lets a future read-only dashboard
+process query history.db while this process keeps writing to it.
+
+Python  : 3.11+
+Depends : stdlib only (sqlite3, asyncio).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sqlite3
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from diagnostics import Diagnosis, ProbePhases, bandwidth_confidence
+
+logger = logging.getLogger("sre.history")
+
+HISTORY_DB_FILE: Path = Path("history.db")
+RETENTION_DAYS_DEFAULT: int = 30
+CONNECT_TIMEOUT_S: float = 5.0  # how long to wait on a busy SQLite lock
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS probe_results (
+    id                   INTEGER PRIMARY KEY,
+    run_started_at       TEXT NOT NULL,
+    url                  TEXT NOT NULL,
+    checked_at           TEXT NOT NULL,
+    status               TEXT NOT NULL,
+    error                TEXT,
+    http_status          INTEGER,
+    rtt_ms               REAL,
+    dns_ms               REAL,
+    connect_total_ms     REAL,
+    tls_ms               REAL,
+    ttfb_ms              REAL,
+    server_processing_ms REAL,
+    transfer_ms          REAL,
+    body_bytes           INTEGER,
+    goodput_bps          REAL,
+    tls_cert_days_left   INTEGER,
+    alpn_protocol        TEXT,
+    h2_supported         INTEGER,
+    connection_reused    INTEGER,
+    bandwidth_confidence TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_probe_results_url_time
+    ON probe_results(url, checked_at);
+
+CREATE TABLE IF NOT EXISTS probe_findings (
+    probe_id INTEGER NOT NULL REFERENCES probe_results(id) ON DELETE CASCADE,
+    code     TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    evidence TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_probe_findings_code ON probe_findings(code);
+"""
+
+
+def _retention_days_from_env() -> int:
+    """
+    Read HISTORY_RETENTION_DAYS from the environment, falling back to
+    RETENTION_DAYS_DEFAULT on absence or a malformed value.
+
+    A bad retention value must not crash the service — it isn't a primary
+    data path the way an invalid targets.yaml entry is. Log a warning and
+    keep running with the safe default instead.
+    """
+    raw = os.getenv("HISTORY_RETENTION_DAYS")
+    if raw is None:
+        return RETENTION_DAYS_DEFAULT
+    try:
+        days = int(raw)
+    except ValueError:
+        logger.warning(
+            "HISTORY_RETENTION_DAYS=%r is not an integer — using default %d.",
+            raw, RETENTION_DAYS_DEFAULT,
+        )
+        return RETENTION_DAYS_DEFAULT
+    if days <= 0:
+        logger.warning(
+            "HISTORY_RETENTION_DAYS=%d must be positive — using default %d.",
+            days, RETENTION_DAYS_DEFAULT,
+        )
+        return RETENTION_DAYS_DEFAULT
+    return days
+
+
+@dataclass
+class CheckOutcome:
+    """
+    Everything one check_url() run produced, for history persistence.
+
+    phases is None and findings is empty on a totally failed probe — a
+    target that never returned a successful response has nothing to measure
+    beyond the fact that it was DOWN and why. status and error are always
+    present regardless.
+    """
+
+    url     : str
+    status  : str                    # STATUS_UP | STATUS_DEGRADED | STATUS_DOWN
+    error   : str | None = None      # None when clean UP; detail otherwise
+    phases  : ProbePhases | None = None
+    findings: list[Diagnosis] = field(default_factory=list)
+
+
+class HistoryRecorder:
+    """
+    Append-only SQLite sink for probe history, isolated from the alert path.
+
+    Construction never raises: if schema initialisation fails (e.g. the
+    directory is not writable), the recorder marks itself disabled and every
+    subsequent call becomes a silent no-op with a logged metric — history is
+    a feature the service can run without, alerting is not.
+    """
+
+    def __init__(
+        self,
+        db_path       : Path = HISTORY_DB_FILE,
+        retention_days: int | None = None,
+    ) -> None:
+        self._db_path = db_path
+        self._retention_days = (
+            retention_days if retention_days is not None else _retention_days_from_env()
+        )
+        self._disabled = False
+        try:
+            self._init_schema()
+        except sqlite3.Error as exc:
+            logger.error(
+                "History schema init failed for '%s' (%s) — history recording "
+                "disabled for this run. event_type=metric "
+                "metric=history_write_failures_total value=1 reason=schema_init",
+                self._db_path, exc,
+            )
+            self._disabled = True
+
+    # ------------------------------------------------------------------ I/O
+
+    def _connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self._db_path, timeout=CONNECT_TIMEOUT_S)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA foreign_keys=ON")
+        return con
+
+    def _init_schema(self) -> None:
+        con = self._connect()
+        try:
+            con.executescript(SCHEMA)
+            con.commit()
+        finally:
+            con.close()
+
+    def _record_run_sync(self, run_started_at: str, outcomes: list[CheckOutcome]) -> int:
+        con = self._connect()
+        try:
+            written = 0
+            for outcome in outcomes:
+                phases = outcome.phases
+                # checked_at uses run_started_at rather than a per-phase
+                # timestamp: ProbePhases stores durations, not a wall-clock
+                # reading, and every check_url() in a run starts within the
+                # same asyncio.gather() dispatch, so the two are equivalent
+                # for history purposes.
+                row = (
+                    run_started_at,
+                    outcome.url,
+                    run_started_at,
+                    outcome.status,
+                    outcome.error,
+                    phases.http_status if phases else None,
+                    phases.rtt_ms if phases else None,
+                    phases.dns_ms if phases else None,
+                    phases.connect_total_ms if phases else None,
+                    phases.tls_ms if phases else None,
+                    phases.ttfb_ms if phases else None,
+                    phases.server_processing_ms if phases else None,
+                    phases.transfer_ms if phases else None,
+                    phases.body_bytes if phases else None,
+                    phases.goodput_bps if phases else None,
+                    phases.tls_cert_days_left if phases else None,
+                    phases.alpn_protocol if phases else None,
+                    (None if phases is None or phases.h2_supported is None
+                     else int(phases.h2_supported)),
+                    (None if phases is None else int(phases.connection_reused)),
+                    bandwidth_confidence(phases) if phases else None,
+                )
+                cur = con.execute(
+                    """
+                    INSERT INTO probe_results (
+                        run_started_at, url, checked_at, status, error,
+                        http_status, rtt_ms, dns_ms, connect_total_ms, tls_ms,
+                        ttfb_ms, server_processing_ms, transfer_ms, body_bytes,
+                        goodput_bps, tls_cert_days_left, alpn_protocol,
+                        h2_supported, connection_reused, bandwidth_confidence
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    row,
+                )
+                probe_id = cur.lastrowid
+                for finding in outcome.findings:
+                    con.execute(
+                        "INSERT INTO probe_findings (probe_id, code, severity, evidence) "
+                        "VALUES (?,?,?,?)",
+                        (probe_id, finding.code, finding.severity, finding.evidence),
+                    )
+                written += 1
+            con.commit()
+            return written
+        finally:
+            con.close()
+
+    def _prune_sync(self) -> int:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=self._retention_days)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        con = self._connect()
+        try:
+            cur = con.execute("DELETE FROM probe_results WHERE checked_at < ?", (cutoff,))
+            con.commit()
+            return cur.rowcount
+        finally:
+            con.close()
+
+    # ------------------------------------------------------------------ Public API
+
+    async def record_run(self, run_started_at: str, outcomes: list[CheckOutcome]) -> None:
+        """
+        Persist one run's outcomes in a single batch insert.
+
+        Never raises. A write failure here is a history gap, not a service
+        failure — the caller (run_health_checks) has already finished
+        alerting by the time this is called, and must be able to proceed
+        regardless of what happens in this method.
+        """
+        if self._disabled or not outcomes:
+            return
+        try:
+            written = await asyncio.to_thread(self._record_run_sync, run_started_at, outcomes)
+            logger.info(
+                "History recorded %d row(s) for run %s. "
+                "event_type=metric metric=history_rows_written_total value=%d",
+                written, run_started_at, written,
+            )
+        except Exception as exc:  # noqa: BLE001 — deliberate: see module docstring
+            logger.error(
+                "History write failed for run %s: %s. event_type=metric "
+                "metric=history_write_failures_total value=1 reason=write",
+                run_started_at, exc,
+            )
+
+    async def prune(self) -> None:
+        """
+        Delete rows older than the configured retention window.
+
+        Cheap in steady state: called once per run, so each call only ever
+        deletes the handful of rows that just crossed the retention boundary
+        since the previous call, not the whole aged backlog at once.
+        """
+        if self._disabled:
+            return
+        try:
+            deleted = await asyncio.to_thread(self._prune_sync)
+            if deleted:
+                logger.info(
+                    "History pruned %d row(s) older than %d days. "
+                    "event_type=metric metric=history_rows_pruned_total value=%d",
+                    deleted, self._retention_days, deleted,
+                )
+        except Exception as exc:  # noqa: BLE001 — deliberate: see module docstring
+            logger.error(
+                "History prune failed: %s. event_type=metric "
+                "metric=history_write_failures_total value=1 reason=prune",
+                exc,
+            )

@@ -195,6 +195,7 @@ infrastructure.
 .
 ├── main.py              Core service logic — async orchestrator
 ├── diagnostics.py       Latency/BDP diagnostic engine — phase timings + findings
+├── history.py           SQLite historical persistence — isolated from the alert path
 ├── targets.yaml         URL configuration — edit freely, no restarts required
 ├── Dockerfile           Multi-stage, non-root, health-checked production image
 ├── docker-compose.yml   Standard deployment manifest
@@ -202,11 +203,12 @@ infrastructure.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               63-test suite covering probes, state, alerts, and diagnostics
+├── tests/               145-test suite covering probes, state, alerts, diagnostics, history
 ├── .github/             CI: pytest + docker build on every push and pull request
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
 ├── state.json           Runtime artifact — auto-created, bind-mounted
+├── history.db           Runtime artifact — auto-created, pruned by HISTORY_RETENTION_DAYS
 └── health_checker.log   Runtime artifact — structured log output
 ```
 
@@ -216,13 +218,15 @@ infrastructure.
 
 We do not ship what we cannot prove works.
 
-Sixty-three automated tests cover every component in isolation: target loading, state
+145 automated tests cover every component in isolation: target loading, state
 transitions, probe logic, retry backoff intervals, Discord payload construction, the
 complete orchestration pipeline — including all four paths through the alert decision
-logic — and the full diagnostic engine, where every rule is tested on both sides of
-its threshold. A rule that fires is only half a test; a rule that fails to stay quiet
-just below its trigger is how a monitor learns to cry wolf, and a muted monitor is
-worse than none.
+logic — the full diagnostic engine, where every rule is tested on both sides of
+its threshold, and the historical persistence layer, including forcing internal
+writes to fail to prove the isolation boundary holds rather than assuming it does.
+A rule that fires is only half a test; a rule that fails to stay quiet just below
+its trigger is how a monitor learns to cry wolf, and a muted monitor is worse than
+none.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -363,6 +367,65 @@ the RTT sample, and the transfer all on the same TCP stream.
 
 ---
 
+## Historical Persistence
+
+`state.json` remembers exactly one thing per target: what it looks like right now.
+That answers "is it up," which is necessary and not sufficient. It cannot answer
+"how many minutes was it down last month," "did my p95 latency get worse this week,"
+or "am I meeting my uptime SLA" — every question that turns a monitor into something
+you can report on instead of something you only stare at during an incident.
+
+Every run now writes a batch to `history.db`, a SQLite file living beside `state.json`.
+Two tables: `probe_results` (one row per target per run — status, error, and the full
+latency/BDP phase breakdown) and `probe_findings` (one row per diagnostic finding,
+linked back to its probe). No new service, no new port, no new failure mode to
+operate — it is a file, and the backup procedure is the same one already documented
+for `state.json`: copy it.
+
+```sql
+-- p50/p95/p99 RTT and average TTFB per target, over everything history.db has kept
+SELECT url, COUNT(*) n, AVG(ttfb_ms) avg_ttfb,
+       MAX(CASE WHEN pr <= 0.50 THEN rtt_ms END) p50_rtt,
+       MAX(CASE WHEN pr <= 0.95 THEN rtt_ms END) p95_rtt,
+       MAX(CASE WHEN pr <= 0.99 THEN rtt_ms END) p99_rtt
+FROM (SELECT url, ttfb_ms, rtt_ms,
+             PERCENT_RANK() OVER (PARTITION BY url ORDER BY rtt_ms) pr
+      FROM probe_results)
+GROUP BY url;
+
+-- Uptime % per target
+SELECT url, 100.0 * SUM(status = 'UP') / COUNT(*) AS uptime_pct
+FROM probe_results GROUP BY url;
+```
+
+### Isolation boundary: history can fail; alerting cannot
+
+History recording runs strictly after `state.json` has been updated and the Discord
+alert (if any) has already been sent for the run. Every method on `HistoryRecorder`
+catches its own exceptions, logs them, and returns — it never raises into
+`run_health_checks`. A full disk, a corrupted `history.db`, or a stuck SQLite lock
+degrades the history feature — a run's worth of rows goes unrecorded — and never
+touches the part of this service whose job is to page a human. Losing a history row
+is a gap in a chart. Losing an alert is an incident nobody heard about.
+
+### Retention
+
+`history.db` is pruned every run: rows older than `HISTORY_RETENTION_DAYS` (default
+30) are deleted. Left unbounded, history grows without limit in the one service whose
+job is to notice things filling up — that failure mode does not get to happen here.
+Measured, not estimated: **~213 bytes per probe row** (schema above, `PRAGMA
+journal_mode=WAL`). At the default 30-day retention:
+
+| Targets | Rows/day | Disk/day | Disk at 30 days | Disk at 1 year (no retention) |
+|---|---|---|---|---|
+| 6       | 8,640     | 1.8 MB  | 55 MB  | 0.67 GB |
+| 50      | 72,000    | 15.3 MB | 460 MB | 5.59 GB |
+
+Raise `HISTORY_RETENTION_DAYS` if you need a longer window and have the disk for it;
+lower it if you are running many targets on a constrained volume.
+
+---
+
 ## Dependency Philosophy
 
 The `requirements.txt` contains exactly three entries: `aiohttp`, `PyYAML`, and
@@ -370,7 +433,10 @@ The `requirements.txt` contains exactly three entries: `aiohttp`, `PyYAML`, and
 introduced — a hand-rolled loop is preferable to a dependency when the logic fits
 in a screen and the readers are on-call engineers, not library authors. Every
 dependency in a production service is a liability. We carry only the ones that pay
-rent.
+rent. Historical persistence (`history.py`) is the largest feature added since v3
+and it added zero: `sqlite3` and `asyncio.to_thread` are both standard library — an
+async driver like `aiosqlite` would buy back a sub-millisecond duration at the cost
+of a permanent dependency, which is not a trade this project makes.
 
 ---
 

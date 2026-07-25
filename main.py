@@ -62,6 +62,11 @@ from diagnostics import (
     phases_to_dict,
     sample_connection,
 )
+from history import (
+    HISTORY_DB_FILE,
+    CheckOutcome,
+    HistoryRecorder,
+)
 
 # ---------------------------------------------------------------------------
 # Bootstrap — load .env before anything reads os.getenv()
@@ -1048,7 +1053,7 @@ async def check_url(
     timeout_s       : float | None = None,
     degraded_ttfb_ms: float | None = None,
     degraded_rtt_ms : float | None = None,
-) -> str:
+) -> CheckOutcome:
     """
     Run the full health-check pipeline for one URL.
 
@@ -1086,12 +1091,13 @@ async def check_url(
                           falls back to diagnostics.RTT_HIGH_MS.
 
     Returns:
-        The status actually persisted for this URL after this run — STATUS_UP,
-        STATUS_DEGRADED, or STATUS_DOWN. A target still inside its
-        DOWN_CONFIRMATIONS hysteresis window returns its preserved healthy
-        status (UP/DEGRADED), not DOWN — this mirrors exactly what state.json
-        itself says, so a --strict exit code never disagrees with the file an
-        operator would read.
+        A CheckOutcome carrying the status actually persisted for this URL
+        after this run — STATUS_UP, STATUS_DEGRADED, or STATUS_DOWN — plus
+        the phases/findings (when available) for history persistence. A
+        target still inside its DOWN_CONFIRMATIONS hysteresis window reports
+        its preserved healthy status (UP/DEGRADED), not DOWN — this mirrors
+        exactly what state.json itself says, so a --strict exit code never
+        disagrees with the file an operator would read.
     """
     logger.info("─── Checking: %s", url)
 
@@ -1132,7 +1138,10 @@ async def check_url(
                 )
             else:
                 logger.info("🟡  Still DEGRADED (alert suppressed)  %s | %s", url, reason)
-            return STATUS_DEGRADED
+            return CheckOutcome(
+                url=url, status=STATUS_DEGRADED, error=reason,
+                phases=phases, findings=findings,
+            )
         else:
             transitioned = await state.set_up(url, diagnostics=diagnostics)
             if transitioned:
@@ -1142,7 +1151,10 @@ async def check_url(
                 )
             else:
                 logger.info("✅  OK (no change)       %s", url)
-            return STATUS_UP
+            return CheckOutcome(
+                url=url, status=STATUS_UP, error=None,
+                phases=phases, findings=findings,
+            )
 
     except _ProbeFailure as exc:
         transitioned = await state.set_down(url, error=exc.detail)
@@ -1161,8 +1173,12 @@ async def check_url(
             )
         # The persisted status is authoritative: a pending-hysteresis failure
         # leaves the target's previous healthy status in place (see set_down),
-        # so this can legitimately come back UP/DEGRADED, not just DOWN.
-        return state.current_status(url) or STATUS_DOWN
+        # so this can legitimately come back UP/DEGRADED, not just DOWN — with
+        # exc.detail still carried as `error`, so history shows a probe that
+        # failed this run even though the persisted status didn't flip.
+        return CheckOutcome(
+            url=url, status=state.current_status(url) or STATUS_DOWN, error=exc.detail,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1217,8 +1233,9 @@ def _warn_if_over_budget(duration_s: float) -> None:
 
 
 async def run_health_checks(
-    targets   : list[str | Target] | None = None,
-    state_path: Path = STATE_FILE,
+    targets     : list[str | Target] | None = None,
+    state_path  : Path = STATE_FILE,
+    history_path: Path = HISTORY_DB_FILE,
 ) -> int:
     """
     Orchestrate concurrent health checks across all configured targets.
@@ -1243,10 +1260,12 @@ async def run_health_checks(
                     — this keeps direct calls and existing tests working without
                     an expect_substring, exactly as load_targets would for a
                     targets.yaml entry with no object form.
-        state_path: Path StateManager persists to. Defaults to the module's
-                    STATE_FILE; tests and scripts that need an isolated state
-                    file pass this explicitly rather than monkeypatching
-                    StateManager's constructor default.
+        state_path:   Path StateManager persists to. Defaults to the module's
+                      STATE_FILE; tests and scripts that need an isolated state
+                      file pass this explicitly rather than monkeypatching
+                      StateManager's constructor default.
+        history_path: Path HistoryRecorder persists to. Same isolation
+                      rationale as state_path.
 
     Returns:
         The number of targets that are DOWN (or crashed their check) at the
@@ -1259,13 +1278,15 @@ async def run_health_checks(
     resolved: list[Target] = [
         t if isinstance(t, Target) else Target(url=t) for t in raw_targets
     ]
-    state = StateManager(state_path)
+    state   = StateManager(state_path)
+    history = HistoryRecorder(history_path)
 
     loop           = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
     _install_signal_handlers(loop, shutdown_event)
 
-    run_start = time.monotonic()
+    run_start      = time.monotonic()
+    run_started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     logger.info("=" * 64)
     logger.info(
@@ -1300,6 +1321,7 @@ async def run_health_checks(
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        outcomes: list[CheckOutcome] = []
         for target, result in zip(resolved, results):
             if isinstance(result, Exception):
                 # An unhandled exception is a bug in check_url, not a probe
@@ -1312,12 +1334,21 @@ async def run_health_checks(
                     target.url, result,
                 )
                 down_count += 1
-            elif result == STATUS_UP:
-                up_count += 1
-            elif result == STATUS_DEGRADED:
-                degraded_count += 1
             else:
-                down_count += 1
+                outcomes.append(result)
+                if result.status == STATUS_UP:
+                    up_count += 1
+                elif result.status == STATUS_DEGRADED:
+                    degraded_count += 1
+                else:
+                    down_count += 1
+
+    # History recording happens AFTER the session block closes — every alert
+    # for this run has already been sent by this point. A history write
+    # failure (full disk, locked file) must never be able to affect alerting,
+    # and it can't: HistoryRecorder never raises (see history.py).
+    await history.record_run(run_started_at, outcomes)
+    await history.prune()
 
     if shutdown_event.is_set():
         logger.info("Shutdown signal was processed cleanly.")

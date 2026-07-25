@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
@@ -940,7 +941,7 @@ async def test_check_url_degraded_rtt_override_stays_up(tmp_path: Path) -> None:
                 with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
                     result = await check_url(TARGET_URL, session, sm, degraded_rtt_ms=400.0)
 
-    assert result == "UP"
+    assert result.status == "UP"
     mock_alert.assert_called_once()
     assert mock_alert.call_args.kwargs["is_recovery"] is True
 
@@ -1010,6 +1011,9 @@ def test_discord_payload_degraded() -> None:
 
 
 async def test_check_url_returns_up_status(tmp_path: Path) -> None:
+    """check_url returns a CheckOutcome (an earlier release), not a bare string — status
+    is the field that used to be the whole return value; phases/error are
+    the new fields history persistence needs."""
     sm = StateManager(tmp_path / "state.json")
     with aioresponses() as mock:
         mock.get(TARGET_URL, status=200, body=b"x" * 1024)
@@ -1017,7 +1021,9 @@ async def test_check_url_returns_up_status(tmp_path: Path) -> None:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
                 with patch("main.send_discord_alert", new_callable=AsyncMock):
                     result = await check_url(TARGET_URL, session, sm)
-    assert result == "UP"
+    assert result.status == "UP"
+    assert result.error is None
+    assert result.phases is not None
 
 
 async def test_check_url_returns_degraded_status(tmp_path: Path) -> None:
@@ -1028,11 +1034,15 @@ async def test_check_url_returns_degraded_status(tmp_path: Path) -> None:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_SLOW_SAMPLE):
                 with patch("main.send_discord_alert", new_callable=AsyncMock):
                     result = await check_url(TARGET_URL, session, sm)
-    assert result == "DEGRADED"
+    assert result.status == "DEGRADED"
+    assert result.error is not None
+    assert result.phases is not None
+    assert result.findings  # the finding that drove DEGRADED must be attached
 
 
 async def test_check_url_returns_down_status_when_confirmed(tmp_path: Path) -> None:
-    """First-ever observation fails → confirmed DOWN immediately → returns DOWN."""
+    """First-ever observation fails → confirmed DOWN immediately → returns DOWN.
+    phases is None on a total failure — there is nothing to measure."""
     sm = StateManager(tmp_path / "state.json")
     with patch("main.asyncio.sleep", new_callable=AsyncMock):
         with aioresponses() as mock:
@@ -1043,14 +1053,18 @@ async def test_check_url_returns_down_status_when_confirmed(tmp_path: Path) -> N
                 with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
                     with patch("main.send_discord_alert", new_callable=AsyncMock):
                         result = await check_url(TARGET_URL, session, sm)
-    assert result == "DOWN"
+    assert result.status == "DOWN"
+    assert result.error == "HTTP 503"
+    assert result.phases is None
 
 
 async def test_check_url_returns_preserved_status_during_hysteresis_pending(tmp_path: Path) -> None:
     """A healthy target's FIRST failure is only strike 1/2 — the persisted
     (and returned) status must stay UP, not jump to DOWN before it's confirmed.
     A --strict caller must never see 'down' for a target state.json still
-    calls UP."""
+    calls UP. error still carries the failure detail even though status
+    didn't flip — this run's probe genuinely failed, even if hysteresis
+    is suppressing the alert."""
     sm = StateManager(tmp_path / "state.json")
     await sm.set_up(TARGET_URL)
 
@@ -1063,7 +1077,8 @@ async def test_check_url_returns_preserved_status_during_hysteresis_pending(tmp_
                 with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
                     with patch("main.send_discord_alert", new_callable=AsyncMock):
                         result = await check_url(TARGET_URL, session, sm)
-    assert result == "UP"
+    assert result.status == "UP"
+    assert result.error == "HTTP 503"
 
 
 def test_state_current_status_reflects_persisted_value(tmp_path: Path) -> None:
@@ -1086,11 +1101,13 @@ async def test_run_health_checks_returns_down_count(tmp_path) -> None:
     """The returned count must reflect DOWN targets only — UP must not be
     counted, since that count is what --strict acts on.
 
-    Uses run_health_checks' state_path= parameter to isolate state.json in
-    tmp_path, instead of monkeypatching StateManager.__init__.__defaults__
-    (audit nitpick, an earlier release review: the monkeypatch silently stops working
-    the moment the constructor is called with an explicit path anywhere, and
-    a test that isolates itself by parameter can't have that failure mode)."""
+    Uses run_health_checks' state_path=/history_path= parameters to isolate
+    both files in tmp_path, instead of monkeypatching constructor defaults
+    (audit nitpick, an earlier release review: a monkeypatch silently stops working
+    the moment a constructor is called with an explicit path anywhere, and a
+    test that isolates itself by parameter can't have that failure mode).
+    Without history_path= here, this test would silently write a real
+    history.db into the project root on every run — caught once, fixed here."""
     up_url   = "https://up.example.test"
     down_url = "https://down.example.test"
 
@@ -1103,10 +1120,47 @@ async def test_run_health_checks_returns_down_count(tmp_path) -> None:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
                 with patch("main.send_discord_alert", new_callable=AsyncMock):
                     down_count = await run_health_checks(
-                        targets=[up_url, down_url], state_path=tmp_path / "state.json"
+                        targets=[up_url, down_url],
+                        state_path=tmp_path / "state.json",
+                        history_path=tmp_path / "history.db",
                     )
 
     assert down_count == 1
+
+
+async def test_run_health_checks_writes_outcomes_to_history_db(tmp_path) -> None:
+    """End-to-end: a real run must persist one probe_results row per target
+    into history.db, findings linked correctly, tagged with the same
+    run_started_at — this is the whole point of an earlier release."""
+    up_url   = "https://up.example.test"
+    down_url = "https://down.example.test"
+    history_path = tmp_path / "history.db"
+
+    with patch("main.asyncio.sleep", new_callable=AsyncMock):
+        with aioresponses() as mock:
+            mock.get(up_url, status=200, body=b"x" * 1024)
+            mock.get(down_url, status=503)
+            mock.get(down_url, status=503)
+            mock.get(down_url, status=503)
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                with patch("main.send_discord_alert", new_callable=AsyncMock):
+                    await run_health_checks(
+                        targets=[up_url, down_url],
+                        state_path=tmp_path / "state.json",
+                        history_path=history_path,
+                    )
+
+    con = sqlite3.connect(history_path)
+    rows = con.execute(
+        "SELECT url, status, error, run_started_at FROM probe_results ORDER BY url"
+    ).fetchall()
+    con.close()
+
+    assert len(rows) == 2
+    assert rows[0][3] == rows[1][3]  # same run_started_at for both targets
+    urls_by_status = {r[0]: r[1] for r in rows}
+    assert urls_by_status[up_url] == "UP"
+    assert urls_by_status[down_url] == "DOWN"
 
 
 def test_warn_if_over_budget_fires_over_threshold(caplog) -> None:
