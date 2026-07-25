@@ -113,6 +113,64 @@ def test_load_targets_non_string_expect_substring_exits(tmp_path: Path) -> None:
         load_targets(f)
 
 
+def test_load_targets_valid_overrides(tmp_path: Path) -> None:
+    """The 4 per-target override fields (an earlier release) must parse into Target as-is."""
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        "targets:\n"
+        "  - url: https://api.com/health\n"
+        "    expected_status: 204\n"
+        "    timeout_s: 10\n"
+        "    degraded_ttfb_ms: 3000\n"
+        "    degraded_rtt_ms: 250\n",
+        encoding="utf-8",
+    )
+    result = load_targets(f)
+    assert result == [Target(
+        url="https://api.com/health",
+        expected_status=204, timeout_s=10, degraded_ttfb_ms=3000, degraded_rtt_ms=250,
+    )]
+
+
+def test_load_targets_overrides_are_optional(tmp_path: Path) -> None:
+    """An entry with no override fields must default every one to None —
+    retro-compatible with every targets.yaml written before an earlier release."""
+    f = tmp_path / "targets.yaml"
+    f.write_text("targets:\n  - url: https://api.com/health\n", encoding="utf-8")
+    result = load_targets(f)
+    target = result[0]
+    assert target.expected_status is None
+    assert target.timeout_s is None
+    assert target.degraded_ttfb_ms is None
+    assert target.degraded_rtt_ms is None
+
+
+@pytest.mark.parametrize("field", ["expected_status", "timeout_s", "degraded_ttfb_ms", "degraded_rtt_ms"])
+def test_load_targets_non_numeric_override_exits(tmp_path: Path, field: str) -> None:
+    """A quoted/non-numeric override value must fail fast at load time,
+    same discipline as the expect_substring type check above."""
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        f"targets:\n  - url: https://api.com/health\n    {field}: 'not-a-number'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        load_targets(f)
+
+
+@pytest.mark.parametrize("field", ["expected_status", "timeout_s", "degraded_ttfb_ms", "degraded_rtt_ms"])
+def test_load_targets_boolean_override_exits(tmp_path: Path, field: str) -> None:
+    """YAML's true/false must never silently become 1/0 for a numeric field —
+    bool is a subtype of int in Python, so this needs an explicit rejection."""
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        f"targets:\n  - url: https://api.com/health\n    {field}: true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        load_targets(f)
+
+
 def test_load_targets_missing_file(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         load_targets(tmp_path / "nonexistent.yaml")
@@ -814,6 +872,27 @@ async def test_probe_once_no_redirect_does_not_force_none(monkeypatch) -> None:
     assert phases.server_processing_ms is not None
 
 
+async def test_probe_once_expected_status_override_accepts_204() -> None:
+    """A target whose healthy response is 204 (not 200) must succeed when
+    expected_status=204 is passed, and the default 200 check must reject it."""
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=204)
+        async with aiohttp.ClientSession() as session:
+            phases = await _probe_once(session, TARGET_URL, expected_status=204)
+    assert phases.http_status == 204
+
+
+async def test_probe_once_expected_status_default_rejects_204() -> None:
+    """Without the override, a 204 must still fail — proves the override is
+    additive, not a silent relaxation of the default check."""
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=204)
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(_ProbeFailure) as exc_info:
+                await _probe_once(session, TARGET_URL)
+    assert "204" in exc_info.value.detail
+
+
 # =============================================================================
 # G. DEGRADED state — probe succeeds but a performance finding fires
 #
@@ -843,6 +922,30 @@ async def test_check_url_degraded_fires_amber_alert(tmp_path: Path) -> None:
     data = json.loads(state_file.read_text(encoding="utf-8"))
     assert data["targets"][TARGET_URL]["status"] == "DEGRADED"
     assert "HIGH_RTT_NEEDS_EDGE" in data["targets"][TARGET_URL]["last_error"]
+
+
+async def test_check_url_degraded_rtt_override_stays_up(tmp_path: Path) -> None:
+    """The exact case that motivated an earlier release: an RTT (300ms) that trips the
+    global default (100ms) must stay UP when the target declares a higher
+    degraded_rtt_ms override — a legitimately-distant target (this is what
+    google/github/cloudflare looked like from the operator's own network in
+    production) must not chronically read DEGRADED."""
+    state_file = tmp_path / "state.json"
+    sm = StateManager(state_file)
+
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"x" * 1024)
+        async with aiohttp.ClientSession() as session:
+            with patch("main.sample_connection", new_callable=AsyncMock, return_value=_SLOW_SAMPLE):
+                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                    result = await check_url(TARGET_URL, session, sm, degraded_rtt_ms=400.0)
+
+    assert result == "UP"
+    mock_alert.assert_called_once()
+    assert mock_alert.call_args.kwargs["is_recovery"] is True
+
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    assert data["targets"][TARGET_URL]["status"] == "UP"
 
 
 async def test_check_url_degraded_no_transition_suppresses_alert(tmp_path: Path) -> None:
@@ -979,12 +1082,15 @@ async def test_state_current_status_after_set_up(tmp_path: Path) -> None:
 # =============================================================================
 
 
-async def test_run_health_checks_returns_down_count(tmp_path, monkeypatch) -> None:
+async def test_run_health_checks_returns_down_count(tmp_path) -> None:
     """The returned count must reflect DOWN targets only — UP must not be
-    counted, since that count is what --strict acts on."""
-    monkeypatch.setattr(
-        main.StateManager.__init__, "__defaults__", (tmp_path / "state.json",)
-    )
+    counted, since that count is what --strict acts on.
+
+    Uses run_health_checks' state_path= parameter to isolate state.json in
+    tmp_path, instead of monkeypatching StateManager.__init__.__defaults__
+    (audit nitpick, an earlier release review: the monkeypatch silently stops working
+    the moment the constructor is called with an explicit path anywhere, and
+    a test that isolates itself by parameter can't have that failure mode)."""
     up_url   = "https://up.example.test"
     down_url = "https://down.example.test"
 
@@ -996,7 +1102,9 @@ async def test_run_health_checks_returns_down_count(tmp_path, monkeypatch) -> No
             mock.get(down_url, status=503)
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
                 with patch("main.send_discord_alert", new_callable=AsyncMock):
-                    down_count = await run_health_checks(targets=[up_url, down_url])
+                    down_count = await run_health_checks(
+                        targets=[up_url, down_url], state_path=tmp_path / "state.json"
+                    )
 
     assert down_count == 1
 

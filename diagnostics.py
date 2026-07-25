@@ -424,22 +424,31 @@ def default_window_ceiling_bps(phases: ProbePhases) -> float | None:
 # Rule engine
 # ---------------------------------------------------------------------------
 
-def analyze(phases: ProbePhases) -> list[Diagnosis]:
+def analyze(phases: ProbePhases, *, rtt_high_ms: float = RTT_HIGH_MS) -> list[Diagnosis]:
     """
     Run every diagnostic rule against *phases* and return the findings.
 
     Rule discipline: each rule names its trigger (a threshold constant) and
     tolerates missing inputs by not firing.  Bandwidth rules additionally
     require CONFIDENCE_HIGH — no verdicts from insufficient samples.
+
+    Args:
+        phases:      The measured probe phases.
+        rtt_high_ms: Per-target override of RTT_HIGH_MS (rules 1 and 7 — both
+                     concern the same physical quantity, so both honour the
+                     same override). A single global threshold produces
+                     chronic false HIGH_RTT_NEEDS_EDGE findings for a target
+                     that is legitimately far away; a chronically-false
+                     finding gets ignored, which defeats the point of having it.
     """
     findings: list[Diagnosis] = []
 
     # --- Rule 1: high RTT — distance/routing, not tunable ------------------
-    if phases.rtt_ms is not None and phases.rtt_ms > RTT_HIGH_MS:
+    if phases.rtt_ms is not None and phases.rtt_ms > rtt_high_ms:
         findings.append(Diagnosis(
             code=CODE_HIGH_RTT,
             severity=SEVERITY_WARN,
-            evidence=f"rtt_ms={phases.rtt_ms:.0f} (threshold {RTT_HIGH_MS:.0f})",
+            evidence=f"rtt_ms={phases.rtt_ms:.0f} (threshold {rtt_high_ms:.0f})",
             recommendation=(
                 "RTT this high is distance or routing — no sysctl shrinks the "
                 "speed of light. Serve this endpoint from a CDN or an edge/"
@@ -573,14 +582,14 @@ def analyze(phases: ProbePhases) -> list[Diagnosis]:
     if (
         phases.h2_supported is False
         and phases.rtt_ms is not None
-        and phases.rtt_ms > RTT_HIGH_MS
+        and phases.rtt_ms > rtt_high_ms
     ):
         findings.append(Diagnosis(
             code=CODE_HTTP2_UNSUPPORTED,
             severity=SEVERITY_INFO,
             evidence=(
                 f"alpn={phases.alpn_protocol!r} h2=no at rtt_ms="
-                f"{phases.rtt_ms:.0f} (threshold {RTT_HIGH_MS:.0f})"
+                f"{phases.rtt_ms:.0f} (threshold {rtt_high_ms:.0f})"
             ),
             recommendation=(
                 "The server only offers HTTP/1.1. On this high-RTT path, "
@@ -594,13 +603,26 @@ def analyze(phases: ProbePhases) -> list[Diagnosis]:
     return findings
 
 
-def degraded_reason(phases: ProbePhases, findings: list[Diagnosis]) -> str | None:
+def degraded_reason(
+    phases: ProbePhases,
+    findings: list[Diagnosis],
+    *,
+    degraded_ttfb_ms: float = DEGRADED_TTFB_MS,
+) -> str | None:
     """
     Decide whether a *successful* probe should count as DEGRADED, and why.
 
     A 200 is not the same as healthy. A service answering 200 in 2.8 seconds,
     or tripping a performance finding, is up and hurting — the state machine
     must be able to say so without waiting for it to go fully DOWN.
+
+    Args:
+        phases:           The measured probe phases.
+        findings:         The findings analyze() already produced for phases.
+        degraded_ttfb_ms: Per-target override of DEGRADED_TTFB_MS. A report
+                          that legitimately takes 3s is a chronic false
+                          DEGRADED under the global default — the whole point
+                          of a per-target SLA override.
 
     Returns:
         A short human-readable reason string when the service is degraded, or
@@ -611,8 +633,8 @@ def degraded_reason(phases: ProbePhases, findings: list[Diagnosis]) -> str | Non
     if degrading:
         return "; ".join(f"{f.code} ({f.evidence})" for f in degrading)
 
-    if phases.ttfb_ms > DEGRADED_TTFB_MS:
-        return f"SLOW_RESPONSE (ttfb_ms={phases.ttfb_ms:.0f} > {DEGRADED_TTFB_MS:.0f})"
+    if phases.ttfb_ms > degraded_ttfb_ms:
+        return f"SLOW_RESPONSE (ttfb_ms={phases.ttfb_ms:.0f} > {degraded_ttfb_ms:.0f})"
 
     return None
 

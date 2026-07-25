@@ -50,6 +50,8 @@ import yaml
 from dotenv import load_dotenv
 
 from diagnostics import (
+    DEGRADED_TTFB_MS,
+    RTT_HIGH_MS,
     ConnectionSample,
     ProbePhases,
     analyze,
@@ -161,13 +163,52 @@ class Target:
     tells "answered" from "answered correctly". The body is already read in
     full for the goodput measurement, so this assertion costs nothing extra.
 
+    ``expected_status``, ``timeout_s``, ``degraded_ttfb_ms``, and
+    ``degraded_rtt_ms`` are per-target overrides of the module-wide defaults
+    (EXPECTED_STATUS, REQUEST_TIMEOUT_S, and diagnostics.DEGRADED_TTFB_MS /
+    RTT_HIGH_MS). A single global RTT threshold produces chronic false
+    DEGRADEDs for a target that is legitimately far away, and a global
+    EXPECTED_STATUS makes a healthy 204-returning endpoint unmonitorable —
+    a threshold with chronic false positives gets ignored, which defeats the
+    monitor entirely. None means "use the module default".
+
     This dict-based YAML schema (string OR object per entry) is also the
-    extension point for future per-target settings — expected status,
-    timeout, auth headers — without another schema migration.
+    extension point for future per-target settings — auth headers, etc. —
+    without another schema migration.
     """
 
     url             : str
-    expect_substring: str | None = None
+    expect_substring: str   | None = None
+    expected_status : int   | None = None
+    timeout_s       : float | None = None
+    degraded_ttfb_ms: float | None = None
+    degraded_rtt_ms : float | None = None
+
+
+def _validated_numeric_field(
+    entry: dict, key: str, path: Path, *, numeric_types: tuple[type, ...]
+) -> int | float | None:
+    """
+    Return entry[key] if absent or already a plain number of an allowed
+    type, else exit with a message naming the fix.
+
+    ``bool`` is explicitly rejected even though it is a subtype of ``int`` in
+    Python — YAML's ``true``/``false`` must never silently become 1/0 for a
+    numeric override. Same failure mode as the unvalidated expect_substring
+    that crashed a probe every run before it was caught at load time: fail
+    fast here instead of downstream inside the probe loop.
+    """
+    value = entry.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, numeric_types):
+        logger.critical(
+            "'%s' target %r has a non-numeric %s (%r). Remove any quotes so "
+            "YAML parses it as a number, e.g.  %s: 10.",
+            path, entry.get("url"), key, value, key,
+        )
+        sys.exit(1)
+    return value
 
 
 def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
@@ -180,6 +221,10 @@ def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
           - https://www.example.com
           - url: https://api.example.com/health
             expect_substring: '"status":"ok"'
+            expected_status: 204
+            timeout_s: 10
+            degraded_ttfb_ms: 3000
+            degraded_rtt_ms: 250
 
     Exits with a clear message if the file is missing, malformed, empty, or
     contains an object entry without a ``url`` key.
@@ -223,7 +268,26 @@ def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
                     path, entry["url"], expect,
                 )
                 sys.exit(1)
-            targets.append(Target(url=str(entry["url"]), expect_substring=expect))
+            expected_status = _validated_numeric_field(
+                entry, "expected_status", path, numeric_types=(int,)
+            )
+            timeout_s = _validated_numeric_field(
+                entry, "timeout_s", path, numeric_types=(int, float)
+            )
+            degraded_ttfb_ms = _validated_numeric_field(
+                entry, "degraded_ttfb_ms", path, numeric_types=(int, float)
+            )
+            degraded_rtt_ms = _validated_numeric_field(
+                entry, "degraded_rtt_ms", path, numeric_types=(int, float)
+            )
+            targets.append(Target(
+                url=str(entry["url"]),
+                expect_substring=expect,
+                expected_status=expected_status,
+                timeout_s=timeout_s,
+                degraded_ttfb_ms=degraded_ttfb_ms,
+                degraded_rtt_ms=degraded_rtt_ms,
+            ))
         else:
             logger.critical(
                 "'%s' contains an invalid target entry (%r). Each entry must "
@@ -727,6 +791,8 @@ async def _probe_once(
     url: str,
     sample: ConnectionSample | None = None,
     expect_substring: str | None = None,
+    expected_status: int = EXPECTED_STATUS,
+    timeout_s: float = REQUEST_TIMEOUT_S,
 ) -> ProbePhases:
     """
     Fire a single async HTTP GET against *url* and measure its phases.
@@ -748,17 +814,22 @@ async def _probe_once(
                           not contain this string counts as a probe failure —
                           a status code alone cannot tell "answered" from
                           "answered correctly" (error page, empty JSON, etc).
+        expected_status:  HTTP status that counts as success (default 200).
+                          Per-target override for endpoints that legitimately
+                          answer 204, 202, etc.
+        timeout_s:        Per-attempt timeout in seconds (default REQUEST_TIMEOUT_S).
+                          Per-target override for endpoints with a slower SLA.
 
     Returns:
-        A fully-populated ProbePhases on a 200 response that also passes the
-        content assertion (when one is configured).
+        A fully-populated ProbePhases on an `expected_status` response that
+        also passes the content assertion (when one is configured).
 
     Raises:
-        _ProbeFailure: On timeout, connection error, non-200 response, or a
+        _ProbeFailure: On timeout, connection error, unexpected status, or a
                        failed content assertion.
     """
     rtt_ms = sample.rtt_ms if sample is not None else None
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S)
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
     trace_ctx: dict = {}
     start = time.monotonic()
     redirected = False
@@ -770,7 +841,7 @@ async def _probe_once(
             headers=REQUEST_HEADERS,
             trace_request_ctx=trace_ctx,
         ) as resp:
-            if resp.status != EXPECTED_STATUS:
+            if resp.status != expected_status:
                 raise _ProbeFailure(f"HTTP {resp.status}")
 
             # On a redirect chain, the TraceConfig hooks overwrite dns_ms/
@@ -801,7 +872,7 @@ async def _probe_once(
             )
 
     except asyncio.TimeoutError:
-        raise _ProbeFailure(f"Timeout (>{REQUEST_TIMEOUT_S}s)")
+        raise _ProbeFailure(f"Timeout (>{timeout_s}s)")
     except aiohttp.ClientConnectionError as exc:
         raise _ProbeFailure(f"ConnectionError: {exc}")
     except aiohttp.ClientError as exc:
@@ -860,6 +931,8 @@ async def _probe_with_backoff(
     url: str,
     sample: ConnectionSample | None = None,
     expect_substring: str | None = None,
+    expected_status: int = EXPECTED_STATUS,
+    timeout_s: float = REQUEST_TIMEOUT_S,
 ) -> ProbePhases:
     """
     Attempt *url* up to RETRY_ATTEMPTS times with exponential backoff.
@@ -882,6 +955,8 @@ async def _probe_with_backoff(
         url:              Target URL.
         sample:           Out-of-band connection sample forwarded to _probe_once.
         expect_substring: Optional content assertion forwarded to _probe_once.
+        expected_status:  Per-target expected HTTP status, forwarded to _probe_once.
+        timeout_s:        Per-target per-attempt timeout, forwarded to _probe_once.
 
     Returns:
         The ProbePhases of the first successful attempt.
@@ -893,7 +968,9 @@ async def _probe_with_backoff(
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            return await _probe_once(session, url, sample, expect_substring)  # success
+            return await _probe_once(
+                session, url, sample, expect_substring, expected_status, timeout_s
+            )  # success
         except _ProbeFailure as exc:
             last_exc = exc
             if attempt < RETRY_ATTEMPTS:
@@ -967,6 +1044,10 @@ async def check_url(
     session         : aiohttp.ClientSession,
     state           : StateManager,
     expect_substring: str | None = None,
+    expected_status : int   | None = None,
+    timeout_s       : float | None = None,
+    degraded_ttfb_ms: float | None = None,
+    degraded_rtt_ms : float | None = None,
 ) -> str:
     """
     Run the full health-check pipeline for one URL.
@@ -995,6 +1076,14 @@ async def check_url(
         session:          Shared aiohttp.ClientSession for HTTP I/O.
         state:            Shared StateManager for transition detection and persistence.
         expect_substring: Optional content assertion (see Target.expect_substring).
+        expected_status:  Per-target expected HTTP status; None falls back to
+                          the module default EXPECTED_STATUS.
+        timeout_s:        Per-target per-attempt timeout; None falls back to
+                          the module default REQUEST_TIMEOUT_S.
+        degraded_ttfb_ms: Per-target DEGRADED threshold on TTFB; None falls
+                          back to diagnostics.DEGRADED_TTFB_MS.
+        degraded_rtt_ms:  Per-target DEGRADED/HIGH_RTT threshold on RTT; None
+                          falls back to diagnostics.RTT_HIGH_MS.
 
     Returns:
         The status actually persisted for this URL after this run — STATUS_UP,
@@ -1005,6 +1094,11 @@ async def check_url(
         operator would read.
     """
     logger.info("─── Checking: %s", url)
+
+    effective_expected_status = expected_status if expected_status is not None else EXPECTED_STATUS
+    effective_timeout_s = timeout_s if timeout_s is not None else REQUEST_TIMEOUT_S
+    effective_degraded_ttfb_ms = degraded_ttfb_ms if degraded_ttfb_ms is not None else DEGRADED_TTFB_MS
+    effective_rtt_high_ms = degraded_rtt_ms if degraded_rtt_ms is not None else RTT_HIGH_MS
 
     # Sample the path out-of-band before the probe: a raw TCP connect for RTT
     # and (for HTTPS) a controlled TLS handshake for TLS time and ALPN/h2.
@@ -1019,13 +1113,16 @@ async def check_url(
         sample = await sample_connection(host, port, use_tls=url.lower().startswith("https"))
 
     try:
-        phases = await _probe_with_backoff(session, url, sample, expect_substring)
+        phases = await _probe_with_backoff(
+            session, url, sample, expect_substring,
+            effective_expected_status, effective_timeout_s,
+        )
 
-        findings = analyze(phases)
+        findings = analyze(phases, rtt_high_ms=effective_rtt_high_ms)
         _log_diagnostics(url, phases, findings)
         diagnostics = phases_to_dict(phases, findings)
 
-        reason = degraded_reason(phases, findings)
+        reason = degraded_reason(phases, findings, degraded_ttfb_ms=effective_degraded_ttfb_ms)
         if reason is not None:
             transitioned = await state.set_degraded(url, reason, diagnostics=diagnostics)
             if transitioned:
@@ -1119,7 +1216,10 @@ def _warn_if_over_budget(duration_s: float) -> None:
         )
 
 
-async def run_health_checks(targets: list[str | Target] | None = None) -> int:
+async def run_health_checks(
+    targets   : list[str | Target] | None = None,
+    state_path: Path = STATE_FILE,
+) -> int:
     """
     Orchestrate concurrent health checks across all configured targets.
 
@@ -1138,11 +1238,15 @@ async def run_health_checks(targets: list[str | Target] | None = None) -> int:
     closed and the loop exits.
 
     Args:
-        targets: Optional override; defaults to loading targets.yaml. Plain
-                 URL strings are normalised to Target(url=..., expect_substring=None)
-                 — this keeps direct calls and existing tests working without
-                 an expect_substring, exactly as load_targets would for a
-                 targets.yaml entry with no object form.
+        targets:    Optional override; defaults to loading targets.yaml. Plain
+                    URL strings are normalised to Target(url=..., expect_substring=None)
+                    — this keeps direct calls and existing tests working without
+                    an expect_substring, exactly as load_targets would for a
+                    targets.yaml entry with no object form.
+        state_path: Path StateManager persists to. Defaults to the module's
+                    STATE_FILE; tests and scripts that need an isolated state
+                    file pass this explicitly rather than monkeypatching
+                    StateManager's constructor default.
 
     Returns:
         The number of targets that are DOWN (or crashed their check) at the
@@ -1155,7 +1259,7 @@ async def run_health_checks(targets: list[str | Target] | None = None) -> int:
     resolved: list[Target] = [
         t if isinstance(t, Target) else Target(url=t) for t in raw_targets
     ]
-    state = StateManager()
+    state = StateManager(state_path)
 
     loop           = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -1184,7 +1288,14 @@ async def run_health_checks(targets: list[str | Target] | None = None) -> int:
     ) as session:
         # Build one coroutine per target, then gather concurrently.
         tasks = [
-            check_url(t.url, session, state, expect_substring=t.expect_substring)
+            check_url(
+                t.url, session, state,
+                expect_substring=t.expect_substring,
+                expected_status=t.expected_status,
+                timeout_s=t.timeout_s,
+                degraded_ttfb_ms=t.degraded_ttfb_ms,
+                degraded_rtt_ms=t.degraded_rtt_ms,
+            )
             for t in resolved
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)

@@ -412,6 +412,37 @@ def test_http2_silent_when_untested() -> None:
 
 
 # =============================================================================
+# G2. Per-target threshold overrides (an earlier release)
+# =============================================================================
+
+
+def test_analyze_rtt_high_ms_override_raises_the_bar() -> None:
+    """An RTT that trips the global default must stay silent under a higher
+    per-target override — the whole point of the override is to stop a
+    legitimately-distant target from chronically false-firing HIGH_RTT."""
+    phases = _base_phases(rtt_ms=150.0, connect_total_ms=160.0, tls_ms=10.0)
+    assert CODE_HIGH_RTT in _codes(analyze(phases))                       # default fires
+    assert CODE_HIGH_RTT not in _codes(analyze(phases, rtt_high_ms=250.0))  # override silences it
+
+
+def test_analyze_rtt_high_ms_override_lowers_the_bar_too() -> None:
+    """A tighter override must fire where the global default would stay quiet
+    — proves the kwarg actually replaces the threshold, not just raises a floor."""
+    phases = _base_phases(rtt_ms=60.0)
+    assert CODE_HIGH_RTT not in _codes(analyze(phases))                  # default: 60 < 100, silent
+    assert CODE_HIGH_RTT in _codes(analyze(phases, rtt_high_ms=50.0))    # override: 60 > 50, fires
+
+
+def test_analyze_rtt_high_ms_override_also_gates_http2_rule() -> None:
+    """Rule 7 (HTTP2_NOT_SUPPORTED) shares the same physical threshold as
+    rule 1 — both concern 'is this RTT high', so a per-target override must
+    apply to both, not just the rule it was first written for."""
+    phases = _base_phases(rtt_ms=150.0, h2_supported=False, alpn_protocol="http/1.1")
+    assert CODE_HTTP2_UNSUPPORTED in _codes(analyze(phases))
+    assert CODE_HTTP2_UNSUPPORTED not in _codes(analyze(phases, rtt_high_ms=250.0))
+
+
+# =============================================================================
 # H. degraded_reason() — the DEGRADED policy
 # =============================================================================
 
@@ -436,6 +467,14 @@ def test_degraded_reason_fires_on_slow_ttfb_alone() -> None:
     reason = degraded_reason(phases, [])
     assert reason is not None
     assert "SLOW_RESPONSE" in reason
+
+
+def test_degraded_reason_ttfb_override_raises_the_bar() -> None:
+    """A per-target degraded_ttfb_ms override must stop a legitimately-slow
+    report (e.g. a 3s export endpoint) from chronically reading DEGRADED."""
+    phases = _base_phases(rtt_ms=20.0, ttfb_ms=3_000.0, server_processing_ms=10.0)
+    assert degraded_reason(phases, []) is not None                        # default: fires
+    assert degraded_reason(phases, [], degraded_ttfb_ms=5_000.0) is None  # override: silent
 
 
 def test_degraded_reason_ignores_cert_and_http2() -> None:

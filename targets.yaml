@@ -20,6 +20,18 @@
 # A 200 whose body does NOT contain expect_substring counts as a probe
 # failure, same as a timeout or a 503 — a status code alone cannot tell a
 # real response from a server returning 200 with an error page.
+#
+# Per-target overrides (optional): a single global threshold produces
+# chronic false positives for a target with a different SLA or a
+# legitimately-distant network path — a threshold that's always wrong gets
+# ignored, which defeats having it. Every field below falls back to the
+# module default when omitted:
+#
+#   - url: https://api.yourcompany.com/health
+#     expected_status: 204       # default 200 — for endpoints that answer 204/202
+#     timeout_s: 10               # default 5   — for endpoints with a slower SLA
+#     degraded_ttfb_ms: 3000      # default 1500 — for a legitimately slow report
+#     degraded_rtt_ms: 250        # default 100  — for a legitimately distant target
 # =============================================================================
 
 targets:
