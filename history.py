@@ -96,6 +96,14 @@ CREATE TABLE IF NOT EXISTS probe_findings (
     evidence TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_probe_findings_code ON probe_findings(code);
+-- Without this, ON DELETE CASCADE full-scans probe_findings for every row
+-- deleted from probe_results: measured 140s to prune one day's worth of
+-- rows (8,640) versus 403ms with the index (348x). Steady-state prune (a
+-- handful of rows per run) is cheap either way -- this only matters once,
+-- on a large retroactive prune (e.g. lowering HISTORY_RETENTION_DAYS on an
+-- established database), but IF NOT EXISTS means an existing database picks
+-- this up on its very next connection with no migration step required.
+CREATE INDEX IF NOT EXISTS idx_probe_findings_probe_id ON probe_findings(probe_id);
 """
 
 
@@ -137,13 +145,23 @@ class CheckOutcome:
     target that never returned a successful response has nothing to measure
     beyond the fact that it was DOWN and why. status and error are always
     present regardless.
+
+    checked_at is the wall-clock time check_url() actually finished probing
+    THIS url — main.py sets it explicitly at each of its three return sites.
+    It defaults to construction time here only so call sites that don't care
+    about the exact value (most tests) don't need to pass one; that default
+    is never reached in production, where the explicit value is always
+    supplied.
     """
 
-    url     : str
-    status  : str                    # STATUS_UP | STATUS_DEGRADED | STATUS_DOWN
-    error   : str | None = None      # None when clean UP; detail otherwise
-    phases  : ProbePhases | None = None
-    findings: list[Diagnosis] = field(default_factory=list)
+    url       : str
+    status    : str                    # STATUS_UP | STATUS_DEGRADED | STATUS_DOWN
+    error     : str | None = None      # None when clean UP; detail otherwise
+    checked_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    phases    : ProbePhases | None = None
+    findings  : list[Diagnosis] = field(default_factory=list)
 
 
 class HistoryRecorder:
@@ -200,15 +218,10 @@ class HistoryRecorder:
             written = 0
             for outcome in outcomes:
                 phases = outcome.phases
-                # checked_at uses run_started_at rather than a per-phase
-                # timestamp: ProbePhases stores durations, not a wall-clock
-                # reading, and every check_url() in a run starts within the
-                # same asyncio.gather() dispatch, so the two are equivalent
-                # for history purposes.
                 row = (
                     run_started_at,
                     outcome.url,
-                    run_started_at,
+                    outcome.checked_at,
                     outcome.status,
                     outcome.error,
                     phases.http_status if phases else None,

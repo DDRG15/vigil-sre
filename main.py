@@ -1123,6 +1123,7 @@ async def check_url(
             session, url, sample, expect_substring,
             effective_expected_status, effective_timeout_s,
         )
+        checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         findings = analyze(phases, rtt_high_ms=effective_rtt_high_ms)
         _log_diagnostics(url, phases, findings)
@@ -1139,7 +1140,7 @@ async def check_url(
             else:
                 logger.info("🟡  Still DEGRADED (alert suppressed)  %s | %s", url, reason)
             return CheckOutcome(
-                url=url, status=STATUS_DEGRADED, error=reason,
+                url=url, status=STATUS_DEGRADED, error=reason, checked_at=checked_at,
                 phases=phases, findings=findings,
             )
         else:
@@ -1152,11 +1153,12 @@ async def check_url(
             else:
                 logger.info("✅  OK (no change)       %s", url)
             return CheckOutcome(
-                url=url, status=STATUS_UP, error=None,
+                url=url, status=STATUS_UP, error=None, checked_at=checked_at,
                 phases=phases, findings=findings,
             )
 
     except _ProbeFailure as exc:
+        checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         transitioned = await state.set_down(url, error=exc.detail)
         if transitioned:
             logger.error("🔴  STATE CHANGE → DOWN  %s | %s", url, exc.detail)
@@ -1178,6 +1180,7 @@ async def check_url(
         # failed this run even though the persisted status didn't flip.
         return CheckOutcome(
             url=url, status=state.current_status(url) or STATUS_DOWN, error=exc.detail,
+            checked_at=checked_at,
         )
 
 
