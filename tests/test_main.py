@@ -2,12 +2,13 @@
 tests/test_main.py — Test suite for vigil-sre health checker.
 
 Coverage:
-  A. load_targets()            —  5 tests  (sync)
+  A. load_targets()            —  8 tests  (sync) — incl. an earlier release ${VAR} resolution
   B. StateManager              — 10 tests  (async) — includes invariant checks
-  C. _probe_once()             —  5 tests  (async, aioresponses mock)
+  C. _probe_once()             —  6 tests  (async, aioresponses mock)
   D. _probe_with_backoff()     —  3 tests  (async, sleep call count verified)
   E. _build_discord_payload()  —  3 tests  (sync)
-  F. check_url() pipeline      —  4 tests  (async, full orchestration)
+  F. check_url() pipeline      —  5 tests  (async, full orchestration)
+  J. Logging configuration     —  2 tests  (sync) — an earlier release log rotation
 
 Run: pytest tests/ -v
 
@@ -23,9 +24,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
@@ -166,6 +169,49 @@ def test_load_targets_boolean_override_exits(tmp_path: Path, field: str) -> None
     f = tmp_path / "targets.yaml"
     f.write_text(
         f"targets:\n  - url: https://api.com/health\n    {field}: true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        load_targets(f)
+
+
+def test_load_targets_resolves_env_var_expect_substring(tmp_path: Path, monkeypatch) -> None:
+    """${VAR_NAME} in expect_substring (an earlier release) resolves from the environment
+    at load time: the real value is used for matching, and expect_substring_display
+    carries a safe placeholder instead — never the secret itself."""
+    monkeypatch.setenv("HEALTH_TOKEN", "super-secret-value")
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        "targets:\n  - url: https://api.com/health\n    expect_substring: ${HEALTH_TOKEN}\n",
+        encoding="utf-8",
+    )
+    result = load_targets(f)
+    assert result[0].expect_substring == "super-secret-value"
+    assert result[0].expect_substring_display == "${HEALTH_TOKEN} (from env)"
+
+
+def test_load_targets_literal_expect_substring_has_no_display_override(tmp_path: Path) -> None:
+    """A plain literal (not ${VAR_NAME}) must leave expect_substring_display
+    as None -- it is already public in git, nothing to redact, and callers
+    fall back to expect_substring itself when display is None."""
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        "targets:\n  - url: https://api.com/health\n    expect_substring: literal-value\n",
+        encoding="utf-8",
+    )
+    result = load_targets(f)
+    assert result[0].expect_substring == "literal-value"
+    assert result[0].expect_substring_display is None
+
+
+def test_load_targets_missing_env_var_in_expect_substring_exits(tmp_path: Path, monkeypatch) -> None:
+    """A ${VAR_NAME} reference to an unset variable must fail fast at load
+    time -- a probe that silently never matches because its secret failed to
+    resolve is a worse failure mode than refusing to start."""
+    monkeypatch.delenv("MISSING_TOKEN", raising=False)
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        "targets:\n  - url: https://api.com/health\n    expect_substring: ${MISSING_TOKEN}\n",
         encoding="utf-8",
     )
     with pytest.raises(SystemExit):
@@ -451,6 +497,24 @@ async def test_probe_once_content_check_fails() -> None:
                     session, TARGET_URL, expect_substring='"status":"ok"'
                 )
     assert "Content check failed" in exc_info.value.detail
+
+
+async def test_probe_once_content_check_failure_redacts_secret() -> None:
+    """When expect_substring_display is set (an earlier release, ${VAR_NAME} secrets),
+    a failed content check must report the placeholder, never the real
+    secret -- this is the one point of redaction every downstream sink
+    (logs, alerts, state.json, history.db) inherits from."""
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"<html>error page</html>")
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(_ProbeFailure) as exc_info:
+                await _probe_once(
+                    session, TARGET_URL,
+                    expect_substring="super-secret-value",
+                    expect_substring_display="${HEALTH_TOKEN} (from env)",
+                )
+    assert "${HEALTH_TOKEN} (from env)" in exc_info.value.detail
+    assert "super-secret-value" not in exc_info.value.detail
 
 
 # =============================================================================
@@ -781,6 +845,35 @@ async def test_check_url_content_check_failure_routes_to_down(tmp_path: Path) ->
     data = json.loads(state_file.read_text(encoding="utf-8"))
     assert data["targets"][TARGET_URL]["status"] == "DOWN"
     assert "Content check failed" in data["targets"][TARGET_URL]["last_error"]
+
+
+async def test_check_url_redacts_env_var_secret_end_to_end(tmp_path: Path) -> None:
+    """The redaction contract (an earlier release) survives the full pipeline: a target
+    configured with an env-var-backed expect_substring must never leak the
+    real secret into state.json, even though the secret IS what the probe
+    matched against — only the ${VAR_NAME} placeholder should land on disk."""
+    state_file = tmp_path / "state.json"
+    sm = StateManager(state_file)
+    real_secret = "super-secret-value"
+
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"<html>down for maintenance</html>")
+        mock.get(TARGET_URL, status=200, body=b"<html>down for maintenance</html>")
+        mock.get(TARGET_URL, status=200, body=b"<html>down for maintenance</html>")
+        with patch("main.asyncio.sleep", new_callable=AsyncMock):
+            async with aiohttp.ClientSession() as session:
+                with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+                    with patch("main.send_discord_alert", new_callable=AsyncMock):
+                        await check_url(
+                            TARGET_URL, session, sm,
+                            expect_substring=real_secret,
+                            expect_substring_display="${HEALTH_TOKEN} (from env)",
+                        )
+
+    raw = state_file.read_text(encoding="utf-8")
+    assert real_secret not in raw
+    data = json.loads(raw)
+    assert "${HEALTH_TOKEN} (from env)" in data["targets"][TARGET_URL]["last_error"]
 
 
 async def test_check_url_up_persists_diagnostics(tmp_path: Path) -> None:
@@ -1189,3 +1282,45 @@ def test_exit_code_strict_zero_down_is_zero() -> None:
 def test_exit_code_strict_with_down_is_one() -> None:
     assert _exit_code(strict=True, down_count=1) == 1
     assert _exit_code(strict=True, down_count=3) == 1
+
+
+# =============================================================================
+# J. Logging configuration (an earlier release)
+#
+# main.py wires RotatingFileHandler up via logging.basicConfig() at import
+# time, but basicConfig() is a documented no-op once the root logger already
+# has handlers -- and pytest's own logging plugin pre-attaches one before any
+# test module is imported. Confirmed with a standalone `python -c "import
+# main"` (outside pytest): the RotatingFileHandler IS installed correctly.
+# Inspecting the live root logger from inside a test would therefore test
+# pytest's plugin ordering, not main.py -- these tests check the pieces that
+# ARE observable from inside the harness instead: the constants main.py wires
+# up with, and that RotatingFileHandler itself genuinely rotates.
+# =============================================================================
+
+
+def test_log_rotation_constants_match_documented_values() -> None:
+    assert main.LOG_MAX_BYTES == 10 * 1024 * 1024
+    assert main.LOG_BACKUP_COUNT == 5
+
+
+def test_rotating_file_handler_actually_rotates(tmp_path: Path) -> None:
+    """A plain FileHandler(mode='a') never rotates -- the bug an earlier release fixes.
+    Proves RotatingFileHandler, the class main.py now wires up, genuinely
+    creates a backup file once the size threshold is crossed (small
+    thresholds here so the test stays fast; main.py's real 10 MiB/5-backup
+    values are checked separately above)."""
+    log_file = tmp_path / "rotating.log"
+    handler = RotatingFileHandler(log_file, maxBytes=200, backupCount=2, encoding="utf-8")
+    logger = logging.getLogger("test.log_rotation")
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        for _ in range(50):
+            logger.info("x" * 20)  # far past the 200-byte threshold
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+    assert log_file.exists()
+    assert (tmp_path / "rotating.log.1").exists()

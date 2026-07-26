@@ -208,13 +208,13 @@ infrastructure.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               145-test suite covering probes, state, alerts, diagnostics, history
-├── .github/             CI: pytest + docker build on every push and pull request
+├── tests/               156-test suite covering probes, state, alerts, diagnostics, history
+├── .github/             CI: pytest, then docker build + run a real health-check cycle
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
 ├── state.json           Runtime artifact — auto-created, bind-mounted
 ├── history.db           Runtime artifact — auto-created, pruned by HISTORY_RETENTION_DAYS
-└── health_checker.log   Runtime artifact — structured log output
+└── health_checker.log   Runtime artifact — structured, rotates at 10 MiB × 5 backups
 ```
 
 ---
@@ -223,15 +223,15 @@ infrastructure.
 
 We do not ship what we cannot prove works.
 
-145 automated tests cover every component in isolation: target loading, state
-transitions, probe logic, retry backoff intervals, Discord payload construction, the
-complete orchestration pipeline — including all four paths through the alert decision
-logic — the full diagnostic engine, where every rule is tested on both sides of
-its threshold, and the historical persistence layer, including forcing internal
-writes to fail to prove the isolation boundary holds rather than assuming it does.
-A rule that fires is only half a test; a rule that fails to stay quiet just below
-its trigger is how a monitor learns to cry wolf, and a muted monitor is worse than
-none.
+156 automated tests cover every component in isolation: target loading (including
+`${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
+intervals, Discord payload construction, the complete orchestration pipeline —
+including all four paths through the alert decision logic — the full diagnostic
+engine, where every rule is tested on both sides of its threshold, and the
+historical persistence layer, including forcing internal writes to fail to prove
+the isolation boundary holds rather than assuming it does. A rule that fires is
+only half a test; a rule that fails to stay quiet just below its trigger is how a
+monitor learns to cry wolf, and a muted monitor is worse than none.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -247,11 +247,15 @@ the exact sleep call count and precise interval values. We verify the intervals,
 not just the results.
 
 CI runs on every push and pull request to `main` via GitHub Actions: `pytest`
-against Python 3.11 and `docker build` to verify the image builds cleanly. The
-last thing you want to discover is that the tool watching your production
-services broke three commits ago and nobody noticed. CI is not ceremony. It is
-the check that prevents you from being the engineer who explains to stakeholders
-why the monitor was down while the monitored service was also down.
+against Python 3.11, then a Docker job that builds the image, runs it to confirm
+it actually starts (`import main`), and executes one real end-to-end health-check
+cycle inside a container. Building an image without ever running it is how a
+`ModuleNotFoundError` at container startup once survived twelve phases undetected
+— CI now runs the thing, not just builds it. The last thing you want to discover
+is that the tool watching your production services broke three commits ago and
+nobody noticed. CI is not ceremony. It is the check that prevents you from being
+the engineer who explains to stakeholders why the
+monitor was down while the monitored service was also down.
 
 ---
 
@@ -269,6 +273,11 @@ format with ISO-8601 UTC timestamps. The log level semantics are strict:
 
 In a production environment, ship `health_checker.log` to your log aggregator of
 choice. The format is structured for ingestion without pre-processing.
+
+`health_checker.log` rotates automatically at 10 MiB, keeping 5 backups (50 MiB cap).
+The one service whose job is to notice disk space filling up should not be the one
+that fills it — an unrotated log on a long-lived host is a slow-motion version of the
+exact incident it exists to page you about.
 
 ---
 
@@ -428,6 +437,32 @@ default 30-day retention:
 
 Raise `HISTORY_RETENTION_DAYS` if you need a longer window and have the disk for it;
 lower it if you are running many targets on a constrained volume.
+
+---
+
+## Secret Redaction (`expect_substring`)
+
+`expect_substring` is a content assertion, and content assertions are sometimes
+secrets: a private health-check token nobody outside the team should be able to
+guess from a log line. Written as a literal in `targets.yaml`, that string is
+already public — the file is committed to git, forever, regardless of what
+anything downstream does with it.
+
+```yaml
+- url: https://api.yourcompany.com/private-health
+  expect_substring: ${HEALTH_TOKEN}   # resolved from .env, never logged
+```
+
+A value written as `${VAR_NAME}` is resolved from `.env` at load time and never
+appears again — every sink a failed check can reach (console, `health_checker.log`,
+the Discord alert, `state.json`, `history.db`) shows `${VAR_NAME} (from env)`
+instead of the real value. Redaction happens once, at the single point where the
+failure message is built, so all five sinks inherit it for free; a plain literal
+is untouched, since redacting only some of the sinks for a value that is already
+public in git would be security theater, not security. Referencing a variable
+that isn't set in `.env` fails the run at startup with a clear message — a probe
+that silently never matches because its secret failed to resolve is a worse
+failure mode than refusing to start.
 
 ---
 

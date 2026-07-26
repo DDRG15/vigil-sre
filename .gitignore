@@ -9,6 +9,7 @@ build/
 
 # Runtime artifacts
 *.log
+*.log.*
 state.json
 history.db
 data/

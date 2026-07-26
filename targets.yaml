@@ -21,6 +21,14 @@
 # failure, same as a timeout or a 503 — a status code alone cannot tell a
 # real response from a server returning 200 with an error page.
 #
+# If expect_substring is a secret rather than a public fixture, reference an
+# environment variable instead of writing it here (this file is committed to
+# git):
+#
+#   - url: https://api.yourcompany.com/private-health
+#     expect_substring: ${HEALTH_TOKEN}   # resolved from .env, never logged
+#
+
 # Per-target overrides (optional): a single global threshold produces
 # chronic false positives for a target with a different SLA or a
 # legitimately-distant network path — a threshold that's always wrong gets

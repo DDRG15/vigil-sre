@@ -37,11 +37,13 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TypedDict
 
@@ -74,10 +76,12 @@ from history import (
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Logging — dual handler (console + rotating-style flat file)
+# Logging — dual handler (console + rotating flat file)
 # ---------------------------------------------------------------------------
 LOG_FORMAT  = "[%(asctime)s] [%(levelname)-8s] [%(name)s] %(message)s"
 DATE_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
+LOG_MAX_BYTES   : int = 10 * 1024 * 1024  # rotate at 10 MiB
+LOG_BACKUP_COUNT: int = 5                 # keep 5 rotated files (50 MiB total cap)
 
 # On Windows the default console codec (cp1252) cannot encode the emoji
 # characters used in log messages. Reconfigure stdout to UTF-8 so the
@@ -92,7 +96,10 @@ logging.basicConfig(
     datefmt=DATE_FORMAT,
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("health_checker.log", mode="a", encoding="utf-8"),
+        RotatingFileHandler(
+            "health_checker.log", mode="a", maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+        ),
     ],
 )
 logger = logging.getLogger("sre.health_checker")
@@ -168,6 +175,15 @@ class Target:
     tells "answered" from "answered correctly". The body is already read in
     full for the goodput measurement, so this assertion costs nothing extra.
 
+    ``expect_substring`` may reference an environment variable instead of a
+    literal (``${HEALTH_TOKEN}``, resolved from .env at load time) for values
+    that are secrets rather than public fixtures. ``expect_substring_display``
+    is what every downstream sink (logs, Discord, state.json, history.db)
+    shows on a failed check: the literal value for a plain string (already
+    public in git either way), or ``${VAR_NAME} (from env)`` for an env-var
+    reference — never the resolved secret. Redacting once here, at load time,
+    means the 5 sinks inherit it for free instead of needing 5 separate fixes.
+
     ``expected_status``, ``timeout_s``, ``degraded_ttfb_ms``, and
     ``degraded_rtt_ms`` are per-target overrides of the module-wide defaults
     (EXPECTED_STATUS, REQUEST_TIMEOUT_S, and diagnostics.DEGRADED_TTFB_MS /
@@ -182,12 +198,45 @@ class Target:
     without another schema migration.
     """
 
-    url             : str
-    expect_substring: str   | None = None
-    expected_status : int   | None = None
-    timeout_s       : float | None = None
-    degraded_ttfb_ms: float | None = None
-    degraded_rtt_ms : float | None = None
+    url                     : str
+    expect_substring        : str   | None = None
+    expect_substring_display: str   | None = None
+    expected_status         : int   | None = None
+    timeout_s               : float | None = None
+    degraded_ttfb_ms        : float | None = None
+    degraded_rtt_ms         : float | None = None
+
+
+_ENV_VAR_REF = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _resolve_expect_substring(raw: str, path: Path, url: str) -> tuple[str, str | None]:
+    """
+    Resolve a ${VAR_NAME} env-var reference in expect_substring, if present.
+
+    Returns (value_to_match, value_to_display). A plain literal returns
+    (raw, None) — None means "no override", so downstream code displays the
+    value itself on a failed check (safe: targets.yaml is committed to git,
+    nothing to protect). A ${VAR_NAME} reference is the signal that this
+    value is a secret: it resolves to the real value from .env for matching,
+    and to a safe placeholder for display. Exits at load time (like every
+    other malformed-target check in this loader) if the referenced variable
+    is not set — a probe that silently never matches because its secret
+    failed to resolve is a worse failure mode than refusing to start.
+    """
+    match = _ENV_VAR_REF.match(raw)
+    if match is None:
+        return raw, None
+    var_name = match.group(1)
+    value = os.getenv(var_name)
+    if value is None:
+        logger.critical(
+            "'%s' target %r references ${%s} in expect_substring, but %s is "
+            "not set. Add it to .env and try again.",
+            path, url, var_name, var_name,
+        )
+        sys.exit(1)
+    return value, f"${{{var_name}}} (from env)"
 
 
 def _validated_numeric_field(
@@ -230,9 +279,12 @@ def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
             timeout_s: 10
             degraded_ttfb_ms: 3000
             degraded_rtt_ms: 250
+          - url: https://api.example.com/private-health
+            expect_substring: ${HEALTH_TOKEN}   # resolved from .env, never logged
 
-    Exits with a clear message if the file is missing, malformed, empty, or
-    contains an object entry without a ``url`` key.
+    Exits with a clear message if the file is missing, malformed, empty,
+    contains an object entry without a ``url`` key, or references a
+    ``${VAR_NAME}`` in ``expect_substring`` that isn't set in the environment.
 
     Args:
         path: Path to the YAML targets file.
@@ -273,6 +325,9 @@ def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
                     path, entry["url"], expect,
                 )
                 sys.exit(1)
+            expect_display = None
+            if expect is not None:
+                expect, expect_display = _resolve_expect_substring(expect, path, str(entry["url"]))
             expected_status = _validated_numeric_field(
                 entry, "expected_status", path, numeric_types=(int,)
             )
@@ -288,6 +343,7 @@ def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
             targets.append(Target(
                 url=str(entry["url"]),
                 expect_substring=expect,
+                expect_substring_display=expect_display,
                 expected_status=expected_status,
                 timeout_s=timeout_s,
                 degraded_ttfb_ms=degraded_ttfb_ms,
@@ -798,6 +854,7 @@ async def _probe_once(
     expect_substring: str | None = None,
     expected_status: int = EXPECTED_STATUS,
     timeout_s: float = REQUEST_TIMEOUT_S,
+    expect_substring_display: str | None = None,
 ) -> ProbePhases:
     """
     Fire a single async HTTP GET against *url* and measure its phases.
@@ -824,6 +881,9 @@ async def _probe_once(
                           answer 204, 202, etc.
         timeout_s:        Per-attempt timeout in seconds (default REQUEST_TIMEOUT_S).
                           Per-target override for endpoints with a slower SLA.
+        expect_substring_display: What a failed content check reports instead
+                          of expect_substring itself — see Target's docstring.
+                          Falls back to expect_substring when not given.
 
     Returns:
         A fully-populated ProbePhases on an `expected_status` response that
@@ -868,8 +928,9 @@ async def _probe_once(
             body_bytes = len(body)
 
             if expect_substring is not None and expect_substring.encode("utf-8") not in body:
+                display = expect_substring_display if expect_substring_display is not None else expect_substring
                 raise _ProbeFailure(
-                    f"Content check failed: {expect_substring!r} not found in body"
+                    f"Content check failed: {display!r} not found in body"
                 )
 
             logger.info(
@@ -938,6 +999,7 @@ async def _probe_with_backoff(
     expect_substring: str | None = None,
     expected_status: int = EXPECTED_STATUS,
     timeout_s: float = REQUEST_TIMEOUT_S,
+    expect_substring_display: str | None = None,
 ) -> ProbePhases:
     """
     Attempt *url* up to RETRY_ATTEMPTS times with exponential backoff.
@@ -962,19 +1024,23 @@ async def _probe_with_backoff(
         expect_substring: Optional content assertion forwarded to _probe_once.
         expected_status:  Per-target expected HTTP status, forwarded to _probe_once.
         timeout_s:        Per-target per-attempt timeout, forwarded to _probe_once.
+        expect_substring_display: Forwarded to _probe_once — see its docstring.
 
     Returns:
         The ProbePhases of the first successful attempt.
 
     Raises:
-        _ProbeFailure: After all RETRY_ATTEMPTS are exhausted.
+        _ProbeFailure: After all RETRY_ATTEMPTS are exhausted. exc.detail is
+                       already redacted (see expect_substring_display), so
+                       every log line below is safe to emit as-is.
     """
     last_exc: _ProbeFailure | None = None
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             return await _probe_once(
-                session, url, sample, expect_substring, expected_status, timeout_s
+                session, url, sample, expect_substring, expected_status, timeout_s,
+                expect_substring_display=expect_substring_display,
             )  # success
         except _ProbeFailure as exc:
             last_exc = exc
@@ -1045,14 +1111,15 @@ def _log_diagnostics(url: str, phases: ProbePhases, findings: list) -> None:
 # ---------------------------------------------------------------------------
 
 async def check_url(
-    url             : str,
-    session         : aiohttp.ClientSession,
-    state           : StateManager,
-    expect_substring: str | None = None,
-    expected_status : int   | None = None,
-    timeout_s       : float | None = None,
-    degraded_ttfb_ms: float | None = None,
-    degraded_rtt_ms : float | None = None,
+    url                     : str,
+    session                 : aiohttp.ClientSession,
+    state                   : StateManager,
+    expect_substring        : str   | None = None,
+    expected_status         : int   | None = None,
+    timeout_s               : float | None = None,
+    degraded_ttfb_ms        : float | None = None,
+    degraded_rtt_ms         : float | None = None,
+    expect_substring_display: str   | None = None,
 ) -> CheckOutcome:
     """
     Run the full health-check pipeline for one URL.
@@ -1089,6 +1156,8 @@ async def check_url(
                           back to diagnostics.DEGRADED_TTFB_MS.
         degraded_rtt_ms:  Per-target DEGRADED/HIGH_RTT threshold on RTT; None
                           falls back to diagnostics.RTT_HIGH_MS.
+        expect_substring_display: Forwarded to _probe_with_backoff — see
+                          Target's docstring for the redaction contract.
 
     Returns:
         A CheckOutcome carrying the status actually persisted for this URL
@@ -1122,6 +1191,7 @@ async def check_url(
         phases = await _probe_with_backoff(
             session, url, sample, expect_substring,
             effective_expected_status, effective_timeout_s,
+            expect_substring_display=expect_substring_display,
         )
         checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1319,6 +1389,7 @@ async def run_health_checks(
                 timeout_s=t.timeout_s,
                 degraded_ttfb_ms=t.degraded_ttfb_ms,
                 degraded_rtt_ms=t.degraded_rtt_ms,
+                expect_substring_display=t.expect_substring_display,
             )
             for t in resolved
         ]
