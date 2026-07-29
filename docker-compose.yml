@@ -16,4 +16,4 @@ services:
       - ./history.db:/app/history.db
     restart: unless-stopped
     command: >
-      sh -c "while true; do python main.py; sleep 60; done"
+      sh -c "while true; do python main.py || exit 1; sleep 60; done"

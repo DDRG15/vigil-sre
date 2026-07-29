@@ -207,7 +207,8 @@ class Target:
     degraded_rtt_ms         : float | None = None
 
 
-_ENV_VAR_REF = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+_ENV_VAR_REF     = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+_ENV_VAR_SUSPECT = re.compile(r"\$\{")
 
 
 def _resolve_expect_substring(raw: str, path: Path, url: str) -> tuple[str, str | None]:
@@ -220,20 +221,53 @@ def _resolve_expect_substring(raw: str, path: Path, url: str) -> tuple[str, str 
     nothing to protect). A ${VAR_NAME} reference is the signal that this
     value is a secret: it resolves to the real value from .env for matching,
     and to a safe placeholder for display. Exits at load time (like every
-    other malformed-target check in this loader) if the referenced variable
-    is not set — a probe that silently never matches because its secret
-    failed to resolve is a worse failure mode than refusing to start.
+    other malformed-target check in this loader) on any of three malformed
+    inputs — a probe that silently never matches, or never fails, because its
+    secret didn't resolve as intended is a worse failure mode than refusing
+    to start:
+
+    1. A value containing "${" that isn't a clean, whole-string reference
+       (concatenation like "Bearer ${TOKEN}", missing braces, stray spaces).
+       This would otherwise be compared byte-for-byte against the response
+       body, never match, and leave the target DOWN forever.
+    2. A lowercase or mixed-case variable name. os.environ is
+       case-insensitive on Windows and case-sensitive on Linux — ${token}
+       against a TOKEN= entry resolves fine in local dev and hard-exits the
+       moment the same targets.yaml runs in the container.
+    3. A variable that resolves to None (unset) or "" (set but empty).
+       "" is contained in every byte string, so an empty value would silently
+       turn the content assertion into a no-op that reports UP over any body,
+       including an error page.
     """
     match = _ENV_VAR_REF.match(raw)
     if match is None:
+        if _ENV_VAR_SUSPECT.search(raw):
+            logger.critical(
+                "'%s' target %r has a malformed expect_substring (%r). An "
+                "environment reference must be the ENTIRE value, e.g. "
+                "expect_substring: ${HEALTH_TOKEN}. Concatenation is not "
+                "supported.",
+                path, url, raw,
+            )
+            sys.exit(1)
         return raw, None
     var_name = match.group(1)
+    if var_name != var_name.upper():
+        logger.critical(
+            "'%s' target %r references ${%s}, but environment references "
+            "must be uppercase — Windows resolves them case-insensitively "
+            "and Linux does not, so this works in dev and hard-exits in the "
+            "container. Use ${%s}.",
+            path, url, var_name, var_name.upper(),
+        )
+        sys.exit(1)
     value = os.getenv(var_name)
-    if value is None:
+    if not value:
         logger.critical(
             "'%s' target %r references ${%s} in expect_substring, but %s is "
-            "not set. Add it to .env and try again.",
+            "%s. Add a non-empty value to .env and try again.",
             path, url, var_name, var_name,
+            "not set" if value is None else "set to an empty string",
         )
         sys.exit(1)
     return value, f"${{{var_name}}} (from env)"

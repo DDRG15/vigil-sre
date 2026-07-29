@@ -2,13 +2,13 @@
 tests/test_main.py — Test suite for vigil-sre health checker.
 
 Coverage:
-  A. load_targets()            —  8 tests  (sync) — incl. an earlier release ${VAR} resolution
+  A. load_targets()            — 14 tests  (sync) — incl. an earlier release ${VAR} resolution + audit fixes
   B. StateManager              — 10 tests  (async) — includes invariant checks
   C. _probe_once()             —  6 tests  (async, aioresponses mock)
   D. _probe_with_backoff()     —  3 tests  (async, sleep call count verified)
   E. _build_discord_payload()  —  3 tests  (sync)
   F. check_url() pipeline      —  5 tests  (async, full orchestration)
-  J. Logging configuration     —  2 tests  (sync) — an earlier release log rotation
+  J. Logging configuration     —  3 tests  (sync) — an earlier release log rotation, incl. subprocess wiring check
 
 Run: pytest tests/ -v
 
@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -216,6 +217,75 @@ def test_load_targets_missing_env_var_in_expect_substring_exits(tmp_path: Path, 
     )
     with pytest.raises(SystemExit):
         load_targets(f)
+
+
+def test_load_targets_empty_env_var_in_expect_substring_exits(tmp_path: Path, monkeypatch) -> None:
+    """A variable that IS set but resolves to "" must also fail fast: "" is
+    contained in every byte string, so the content assertion would silently
+    become a no-op that reports UP over any body, including an error page --
+    the exact case the assertion exists to catch. (audit finding)"""
+    monkeypatch.setenv("HEALTH_TOKEN", "")
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        "targets:\n  - url: https://api.com/health\n    expect_substring: ${HEALTH_TOKEN}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        load_targets(f)
+
+
+def test_load_targets_lowercase_env_reference_exits(tmp_path: Path, monkeypatch) -> None:
+    """os.environ is case-insensitive on Windows and case-sensitive on Linux:
+    ${health_token} against a HEALTH_TOKEN= entry resolves in local dev and
+    hard-exits main.py the moment the same targets.yaml runs in the
+    container. Rejecting it on every platform makes the config fail cheaply
+    in dev instead of expensively in a crash-looping container."""
+    monkeypatch.setenv("HEALTH_TOKEN", "super-secret-value")
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        "targets:\n  - url: https://api.com/health\n    expect_substring: ${health_token}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        load_targets(f)
+
+
+@pytest.mark.parametrize("bad", [
+    "Bearer ${HEALTH_TOKEN}",
+    '${HEALTH_TOKEN}"}',
+    "${ HEALTH_TOKEN }",
+])
+def test_load_targets_partial_env_reference_exits(tmp_path: Path, monkeypatch, bad: str) -> None:
+    """A value that contains "${" but isn't a clean whole-string match
+    (concatenation, stray spaces) would otherwise be compared byte-for-byte
+    against the response body -- it can never match, leaving the target DOWN
+    forever on a config typo dressed as a real outage."""
+    monkeypatch.setenv("HEALTH_TOKEN", "super-secret-value")
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        f"targets:\n  - url: https://api.com/health\n    expect_substring: '{bad}'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        load_targets(f)
+
+
+@pytest.mark.parametrize("literal", ['"$schema"', "$HEALTH_TOKEN", "price: $5.00"])
+def test_load_targets_dollar_sign_without_braces_is_not_mistaken_for_a_reference(
+    tmp_path: Path, literal: str
+) -> None:
+    """A literal that happens to contain a bare '$' (a price, '$schema' in a
+    JSON body, or even a var-like "$NAME" with no braces) is not an env-var
+    reference -- only "${" triggers the malformed-reference check, by design,
+    so all of these must load as normal literals rather than aborting."""
+    f = tmp_path / "targets.yaml"
+    f.write_text(
+        f"targets:\n  - url: https://api.com/health\n    expect_substring: '{literal}'\n",
+        encoding="utf-8",
+    )
+    result = load_targets(f)
+    assert result[0].expect_substring == literal
+    assert result[0].expect_substring_display is None
 
 
 def test_load_targets_missing_file(tmp_path: Path) -> None:
@@ -1290,18 +1360,53 @@ def test_exit_code_strict_with_down_is_one() -> None:
 # main.py wires RotatingFileHandler up via logging.basicConfig() at import
 # time, but basicConfig() is a documented no-op once the root logger already
 # has handlers -- and pytest's own logging plugin pre-attaches one before any
-# test module is imported. Confirmed with a standalone `python -c "import
-# main"` (outside pytest): the RotatingFileHandler IS installed correctly.
-# Inspecting the live root logger from inside a test would therefore test
-# pytest's plugin ordering, not main.py -- these tests check the pieces that
-# ARE observable from inside the harness instead: the constants main.py wires
-# up with, and that RotatingFileHandler itself genuinely rotates.
+# test module is imported, inside THIS process. A subprocess with a clean
+# interpreter doesn't have that problem, so that's what actually verifies the
+# wiring below -- inspecting the in-process root logger was tried first and
+# abandoned: it can only ever observe pytest's handler, never main.py's.
 # =============================================================================
 
 
 def test_log_rotation_constants_match_documented_values() -> None:
     assert main.LOG_MAX_BYTES == 10 * 1024 * 1024
     assert main.LOG_BACKUP_COUNT == 5
+
+
+def test_main_wires_rotating_file_handler_in_a_clean_interpreter(tmp_path: Path) -> None:
+    """The real logging.basicConfig() call in main.py is only observable
+    outside pytest's own logging plugin -- a subprocess with a fresh
+    interpreter proves it, rather than asserting against a synthetic
+    RotatingFileHandler built by the test itself. Without this, changing
+    maxBytes=LOG_MAX_BYTES to maxBytes=0 (rotation silently disabled, the
+    exact bug an earlier release fixes) passes every other test in this file.
+
+    Runs with cwd=tmp_path on purpose: importing main creates
+    health_checker.log in the current directory, and a test that forgets to
+    isolate a file path has bitten this project twice already (state_path in
+    an earlier release, history_path in an earlier release)."""
+    project_root = Path(__file__).resolve().parent.parent
+    code = (
+        "import json, logging, main;"
+        "h=[x for x in logging.getLogger().handlers "
+        "   if isinstance(x, main.RotatingFileHandler)];"
+        "print(json.dumps({'n': len(h),"
+        "                  'max': h[0].maxBytes if h else None,"
+        "                  'bak': h[0].backupCount if h else None}))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(tmp_path),
+        env={**os.environ, "PYTHONPATH": str(project_root)},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    wiring = json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert wiring["n"] == 1, "main.py must install exactly one RotatingFileHandler"
+    assert wiring["max"] == main.LOG_MAX_BYTES
+    assert wiring["max"] > 0, "maxBytes=0 disables rotation entirely"
+    assert wiring["bak"] == main.LOG_BACKUP_COUNT
+    assert wiring["bak"] > 0
 
 
 def test_rotating_file_handler_actually_rotates(tmp_path: Path) -> None:

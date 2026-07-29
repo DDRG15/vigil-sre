@@ -85,14 +85,18 @@ RUN install -d -o sre -g sre /app /app/data \
 # Drop privileges before the process starts.
 USER sre
 
-# Healthcheck: import the actual application module, not just its deps.
-# `import aiohttp, yaml` passed even when main.py itself couldn't be
-# imported (ModuleNotFoundError on a sibling module missing from the image) —
-# a healthcheck that only proves the dependencies exist proves nothing about
-# whether the application can start. Docker marks the container unhealthy if
-# this fails.
+# Healthcheck: import the actual application module AND load its config, not
+# just prove the module imports. `import main` alone passed even with a
+# missing/malformed ${VAR_NAME} reference in targets.yaml (main.py exits 1 on
+# that at run time, inside load_targets -- a function `import main` never
+# calls), so a container stuck exiting 1 every cycle still reported healthy.
+# The logger is muted to CRITICAL so the "Loaded N target(s)" INFO line
+# doesn't write every 30s (2,880/day) on top of the healthcheck's own output --
+# the RotatingFileHandler caps total size, but there's no reason to spend that
+# budget on a probe that runs a full order of magnitude more often than the
+# service itself. Docker marks the container unhealthy if this fails.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import main; print('main OK')" || exit 1
+    CMD python -c "import logging, main; logging.getLogger('sre.health_checker').setLevel(logging.CRITICAL); main.load_targets(); print('main OK')" || exit 1
 
 # Default command — runs one full check cycle and exits.
 # Pair with a CronJob (Kubernetes) or --restart=always + sleep loop (Docker)
