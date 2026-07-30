@@ -1,0 +1,452 @@
+"""
+notifiers.py — Multi-channel alert delivery for vigil-sre (the design note, an earlier release).
+
+Why more than one channel
+--------------------------
+A single webhook is a single point of delivery failure, and not on the side
+you would expect. The POST can succeed, Discord can accept it, and the alert
+can still fail to reach a human: buried under other notifications, delayed by
+the phone's delivery queue, or silenced by a notification setting nobody
+remembers configuring. No retry policy fixes that, because nothing failed —
+delivery worked and attention did not.
+
+Two independent channels receiving the same alert covers that. The
+duplication is the point, not waste. There are no routing rules by design:
+every channel receives every alert, because a rule that sends an alert to
+only one place reintroduces exactly the single point of failure this module
+exists to remove.
+
+Isolation boundary
+------------------
+``send()`` never raises. ``dispatch_alert()`` gathers with
+``return_exceptions=True`` on top of that — belt and braces on purpose: the
+never-raise invariant is a convention a future notifier author can break
+without noticing, and the gather makes it structural. A dead channel must
+never reach check_url, and must never delay or block a healthy channel.
+
+Why parallel dispatch is a requirement, not an optimisation
+------------------------------------------------------------
+Measured against this module's own constants: worst case per channel is
+3 attempts x 5 s timeout + two 30 s capped Retry-After sleeps = 75 s.
+Dispatching two channels sequentially is 150 s against a RUN_BUDGET_S of
+60 s — a guaranteed overrun of 2.5x. In parallel it is max(75, 75) = 75 s,
+which is what a single channel already costs today. See the design note.
+
+Python  : 3.11+
+Depends : aiohttp (already required by the probe), stdlib otherwise.
+"""
+
+from __future__ import annotations
+
+import abc
+import asyncio
+import logging
+import os
+from datetime import datetime, timezone
+from enum import Enum
+
+import aiohttp
+
+logger = logging.getLogger("sre.notifiers")
+
+# Webhook delivery retry: alerts fire on state transitions ONLY, so a POST
+# that dies on a transient 429/5xx has no second chance next run — the alert
+# is gone. Retrying delivery here is the monitor's one job.
+WEBHOOK_RETRY_ATTEMPTS   : int   = 3     # total attempts (1 original + 2 retries)
+WEBHOOK_RETRY_BASE_S     : float = 1.0   # linear backoff: 1 s, then 2 s
+WEBHOOK_RETRY_AFTER_CAP_S: float = 30.0  # cap on an honoured Retry-After value
+
+# Deliberately independent from the probe's REQUEST_TIMEOUT_S even though both
+# are 5 s today. They were coupled only by history; an earlier release already made the
+# probe timeout per-target configurable while this one stayed global, so they
+# are different concerns that happened to share a number.
+WEBHOOK_TIMEOUT_S: float = 5.0
+
+
+class AlertKind(Enum):
+    """
+    What kind of state change produced this alert.
+
+    Replaces the ``is_recovery``/``is_degraded`` boolean pair: two booleans
+    encoded three real states plus one impossible combination (both True),
+    resolved by a precedence rule that lived in a docstring. This concept
+    already existed implicitly — the old code recomputed it as a string on
+    every call — so naming it here formalises what was already there.
+
+    an earlier release adds CERT_EXPIRING by appending one member, with no signature
+    change anywhere in the call chain.
+    """
+
+    FAILURE  = "failure"
+    RECOVERY = "recovery"
+    DEGRADED = "degraded"
+
+
+class Notifier(abc.ABC):
+    """
+    One alert channel, with the retry policy shared across all of them.
+
+    Subclasses supply what genuinely differs per channel — the env var
+    holding the webhook, the payload shape, and what HTTP status means
+    success — and inherit the delivery policy. That policy is not generic
+    boilerplate: it was designed in an earlier release and corrected by an audit (honour
+    Discord's Retry-After instead of overriding it with our own backoff), so
+    it lives in exactly one place where a fix reaches every channel at once.
+    """
+
+    #: Human-readable channel name, used in logs and metric labels.
+    name: str = ""
+    #: Environment variable holding this channel's webhook URL.
+    env_var: str = ""
+    #: HTTP status this channel returns on a successful post.
+    success_status: int = 204
+
+    @abc.abstractmethod
+    def build_payload(
+        self, url: str, status_detail: str, timestamp: str, kind: AlertKind
+    ) -> dict:
+        """
+        Build this channel's JSON body. Pure: no I/O, no clock, no network.
+
+        Kept separate from send() so the wire format of every channel is
+        testable without touching the network — the same reason the original
+        _build_discord_payload was a standalone function.
+        """
+
+    def webhook_url(self) -> str | None:
+        """Return this channel's configured webhook, or None if unset."""
+        return os.getenv(self.env_var) or None
+
+    async def send(
+        self,
+        session      : aiohttp.ClientSession,
+        url          : str,
+        status_detail: str,
+        kind         : AlertKind,
+    ) -> bool:
+        """
+        Deliver one alert on this channel. Returns True only on confirmed
+        delivery.
+
+        Never raises. Every network error is caught and logged so a broken
+        webhook can never mask the probe result that triggered it, and can
+        never take down a sibling channel.
+
+        The boolean return is what makes ``alerts_lost_all_channels_total``
+        computable — "the alert was generated and nobody will hear about it"
+        is a different event from "one channel failed", and only the caller
+        seeing every channel's outcome can tell them apart.
+
+        Retry policy
+        ------------
+        Timeouts, connection errors, HTTP 429 (rate-limited) and HTTP 5xx are
+        retried up to WEBHOOK_RETRY_ATTEMPTS times with linear backoff. A
+        non-retryable 4xx (malformed payload, revoked token) will not heal on
+        retry: it is logged once and abandoned, since hammering a permanently
+        broken webhook only delays the next probe cycle for no gain.
+        """
+        webhook = self.webhook_url()
+        if webhook is None:
+            # Not an error: an unconfigured channel is one the operator chose
+            # not to use. dispatch_alert() is what notices if NO channel is
+            # configured, which is the case that actually loses alerts.
+            return False
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload   = self.build_payload(url, status_detail, timestamp, kind)
+
+        for attempt in range(1, WEBHOOK_RETRY_ATTEMPTS + 1):
+            is_last_attempt = attempt == WEBHOOK_RETRY_ATTEMPTS
+            try:
+                async with session.post(
+                    webhook,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=WEBHOOK_TIMEOUT_S),
+                ) as resp:
+                    if resp.status == self.success_status:
+                        logger.info(
+                            "%s %s alert sent for %s. event_type=metric "
+                            "metric=alerts_sent_total channel=%s value=1",
+                            self.name, kind.value, url, self.name,
+                        )
+                        return True
+
+                    retryable = resp.status == 429 or resp.status >= 500
+                    if not retryable:
+                        logger.error(
+                            "%s webhook returned non-retryable HTTP %s for %s "
+                            "alert on %s — abandoning (will not heal on retry). "
+                            "event_type=metric metric=alerts_lost_total "
+                            "channel=%s value=1 reason=non_retryable",
+                            self.name, resp.status, kind.value, url, self.name,
+                        )
+                        return False
+                    if is_last_attempt:
+                        logger.error(
+                            "%s %s alert LOST for %s: all %d attempts returned "
+                            "HTTP %s. event_type=metric metric=alerts_lost_total "
+                            "channel=%s value=1 reason=http_%s",
+                            self.name, kind.value, url, WEBHOOK_RETRY_ATTEMPTS,
+                            resp.status, self.name, resp.status,
+                        )
+                        return False
+
+                    sleep_s = WEBHOOK_RETRY_BASE_S * attempt
+                    if resp.status == 429:
+                        # The channel tells us exactly how long to back off
+                        # after a rate limit — ignoring it and retrying on our
+                        # own linear schedule risks hitting the limit again
+                        # immediately, burning attempts and losing the alert
+                        # for no reason.
+                        retry_after = resp.headers.get("Retry-After")
+                        try:
+                            if retry_after is not None:
+                                sleep_s = min(
+                                    float(retry_after), WEBHOOK_RETRY_AFTER_CAP_S
+                                )
+                        except ValueError:
+                            pass  # malformed header — fall back to linear backoff
+
+                    logger.warning(
+                        "%s webhook attempt %d/%d returned HTTP %s for %s alert "
+                        "on %s — retrying in %.1fs",
+                        self.name, attempt, WEBHOOK_RETRY_ATTEMPTS, resp.status,
+                        kind.value, url, sleep_s,
+                    )
+                    await asyncio.sleep(sleep_s)
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                if is_last_attempt:
+                    logger.error(
+                        "%s %s alert LOST for %s: all %d attempts raised %s: %s. "
+                        "event_type=metric metric=alerts_lost_total channel=%s "
+                        "value=1 reason=%s",
+                        self.name, kind.value, url, WEBHOOK_RETRY_ATTEMPTS,
+                        type(exc).__name__, exc, self.name, type(exc).__name__,
+                    )
+                    return False
+
+                sleep_s = WEBHOOK_RETRY_BASE_S * attempt
+                logger.warning(
+                    "%s webhook attempt %d/%d raised %s for %s alert on %s "
+                    "— retrying in %.1fs",
+                    self.name, attempt, WEBHOOK_RETRY_ATTEMPTS,
+                    type(exc).__name__, kind.value, url, sleep_s,
+                )
+                await asyncio.sleep(sleep_s)
+
+        return False  # unreachable: the loop always returns. Explicit for mypy.
+
+
+class DiscordNotifier(Notifier):
+    """Discord Webhook channel. Payload unchanged from before the design note."""
+
+    name           = "Discord"
+    env_var        = "DISCORD_WEBHOOK_URL"
+    success_status = 204  # Discord answers 204 No Content on success
+
+    def build_payload(
+        self, url: str, status_detail: str, timestamp: str, kind: AlertKind
+    ) -> dict:
+        """
+        Colour-coded Discord embed.
+
+        Green for recoveries, red for failures, amber for degradations. Amber
+        is a distinct signal on purpose: a degraded service is not down, and
+        paging it red trains the on-call to distrust red. The colour carries
+        the triage.
+        """
+        if kind is AlertKind.RECOVERY:
+            title        = "✅  Service Recovered"
+            color        = 0x00C853  # green-A700
+            status_label = "🟢  Current Status"
+        elif kind is AlertKind.DEGRADED:
+            title        = "⚠️  Service Degraded — Up But Hurting"
+            color        = 0xFFB300  # amber-600
+            status_label = "🟡  Degradation Detail"
+        else:
+            title        = "🚨  Infrastructure Alert — Health Check Failed"
+            color        = 0xFF0000  # red
+            status_label = "📛  Failure Detail"
+
+        return {
+            "username"  : "SRE Health Checker",
+            "avatar_url": "https://i.imgur.com/4M34hi2.png",
+            "embeds": [
+                {
+                    "title" : title,
+                    "color" : color,
+                    "fields": [
+                        {
+                            "name"  : "🌐  Target URL",
+                            "value" : f"`{url}`",
+                            "inline": False,
+                        },
+                        {
+                            "name"  : status_label,
+                            "value" : f"`{status_detail}`",
+                            "inline": True,
+                        },
+                        {
+                            "name"  : "🕐  Timestamp (UTC)",
+                            "value" : f"`{timestamp}`",
+                            "inline": True,
+                        },
+                    ],
+                    "footer": {
+                        "text": "Async SRE Health Monitor • alerts on state-change only"
+                    },
+                }
+            ],
+        }
+
+
+class SlackNotifier(Notifier):
+    """
+    Slack Incoming Webhook channel.
+
+    Slack has no embed colour on the message itself — the colour lives on an
+    attachment wrapping the blocks, which is why the structure differs from
+    Discord's rather than being the same dict with different keys. Forcing one
+    shared builder would produce a worse message on both sides.
+
+    ``text`` is set even though ``blocks`` carries the content: Slack uses it
+    as the notification preview on mobile and desktop, and omitting it shows
+    the user an empty push notification — which, for a channel that exists to
+    catch the alert the other channel might miss, defeats the purpose.
+    """
+
+    name           = "Slack"
+    env_var        = "SLACK_WEBHOOK_URL"
+    success_status = 200  # Slack answers 200 with a plain "ok" body
+
+    def build_payload(
+        self, url: str, status_detail: str, timestamp: str, kind: AlertKind
+    ) -> dict:
+        if kind is AlertKind.RECOVERY:
+            title        = "✅  Service Recovered"
+            color        = "#00C853"  # same green as the Discord embed
+            status_label = "Current Status"
+        elif kind is AlertKind.DEGRADED:
+            title        = "⚠️  Service Degraded — Up But Hurting"
+            color        = "#FFB300"  # same amber
+            status_label = "Degradation Detail"
+        else:
+            title        = "🚨  Infrastructure Alert — Health Check Failed"
+            color        = "#FF0000"  # same red
+            status_label = "Failure Detail"
+
+        return {
+            "text": f"{title} — {url}",  # mobile push preview
+            "attachments": [
+                {
+                    "color": color,
+                    "blocks": [
+                        {
+                            "type": "header",
+                            "text": {"type": "plain_text", "text": title, "emoji": True},
+                        },
+                        {
+                            "type": "section",
+                            "fields": [
+                                {"type": "mrkdwn", "text": f"*Target URL*\n`{url}`"},
+                                {
+                                    "type": "mrkdwn",
+                                    "text": f"*{status_label}*\n`{status_detail}`",
+                                },
+                                {"type": "mrkdwn", "text": f"*Timestamp (UTC)*\n`{timestamp}`"},
+                            ],
+                        },
+                        {
+                            "type": "context",
+                            "elements": [
+                                {
+                                    "type": "mrkdwn",
+                                    "text": "Async SRE Health Monitor • alerts on state-change only",
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+
+#: Every channel vigil-sre knows how to deliver on. A channel whose env var
+#: is unset is skipped at dispatch time, so adding one here is inert until
+#: the operator configures it.
+ALL_NOTIFIERS: tuple[type[Notifier], ...] = (DiscordNotifier, SlackNotifier)
+
+
+def active_notifiers() -> list[Notifier]:
+    """
+    Instantiate the channels that are actually configured.
+
+    Presence of the environment variable is the switch — there is no separate
+    config file to keep in sync with .env, and no way for a channel to be
+    "enabled" while missing the webhook it needs.
+    """
+    return [cls() for cls in ALL_NOTIFIERS if cls().webhook_url() is not None]
+
+
+async def dispatch_alert(
+    session      : aiohttp.ClientSession,
+    url          : str,
+    status_detail: str,
+    kind         : AlertKind,
+    notifiers    : list[Notifier] | None = None,
+) -> None:
+    """
+    Deliver one alert on every configured channel, in parallel.
+
+    Never raises — this sits on the alert-critical path and must not be able
+    to fail a probe that already succeeded.
+
+    Args:
+        session:       Shared aiohttp.ClientSession for the run.
+        url:           Target whose state just changed.
+        status_detail: Human-readable reason, already redacted upstream (a
+                       ${VAR} content assertion never reaches here in the
+                       clear — see an earlier release).
+        kind:          Which state change this is.
+        notifiers:     Override for tests, so a test never depends on the
+                       ambient environment to decide which channels exist.
+                       Defaults to whatever .env configures.
+    """
+    channels = active_notifiers() if notifiers is None else notifiers
+
+    if not channels:
+        logger.critical(
+            "No alert channels configured (set %s) — %s alert for %s is LOST. "
+            "event_type=metric metric=alerts_lost_all_channels_total value=1 "
+            "reason=no_channels",
+            " or ".join(cls.env_var for cls in ALL_NOTIFIERS), kind.value, url,
+        )
+        return
+
+    results = await asyncio.gather(
+        *(c.send(session, url, status_detail, kind) for c in channels),
+        return_exceptions=True,
+    )
+
+    # An exception here means a notifier broke its own never-raise contract.
+    # Log it as the defect it is rather than letting it read as a normal
+    # delivery failure — and keep going, because the other channel's result
+    # still matters.
+    for channel, result in zip(channels, results):
+        if isinstance(result, BaseException):
+            logger.error(
+                "%s notifier raised %s — this is a bug in that notifier, not a "
+                "delivery failure: %r",
+                channel.name, type(result).__name__, result,
+            )
+
+    if not any(result is True for result in results):
+        # The only line here that means "an alert was generated and no human
+        # will hear about it". Per-channel losses are diagnosis; this is the
+        # one that should page.
+        logger.critical(
+            "%s alert for %s was LOST on ALL %d channel(s). event_type=metric "
+            "metric=alerts_lost_all_channels_total value=1 reason=all_failed",
+            kind.value.capitalize(), url, len(channels),
+        )

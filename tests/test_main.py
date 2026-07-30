@@ -29,6 +29,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
@@ -46,7 +47,6 @@ from main import (
     StateManager,
     Target,
     _ProbeFailure,
-    _build_discord_payload,
     _exit_code,
     _probe_once,
     _probe_with_backoff,
@@ -54,7 +54,12 @@ from main import (
     check_url,
     load_targets,
     run_health_checks,
-    send_discord_alert,
+)
+from notifiers import (
+    AlertKind,
+    DiscordNotifier,
+    SlackNotifier,
+    dispatch_alert,
 )
 
 # A healthy default sample for check_url tests: fast RTT, no h2 question,
@@ -691,16 +696,20 @@ async def test_backoff_all_fail() -> None:
 
 
 # =============================================================================
-# E. _build_discord_payload()
+# E. Payload builders (per channel)
+#
+# Both builders are pure — no clock, no network — which is the whole reason
+# they are separate from send(): the wire format of every channel stays
+# testable without touching a socket.
 # =============================================================================
 
 
 def test_discord_payload_failure() -> None:
-    payload = _build_discord_payload(
+    payload = DiscordNotifier().build_payload(
         url=TARGET_URL,
         status_detail="HTTP 503",
         timestamp="2026-01-01T00:00:00Z",
-        is_recovery=False,
+        kind=AlertKind.FAILURE,
     )
     embed = payload["embeds"][0]
     assert embed["color"] == 0xFF0000
@@ -708,11 +717,11 @@ def test_discord_payload_failure() -> None:
 
 
 def test_discord_payload_recovery() -> None:
-    payload = _build_discord_payload(
+    payload = DiscordNotifier().build_payload(
         url=TARGET_URL,
         status_detail="Service is UP",
         timestamp="2026-01-01T00:00:00Z",
-        is_recovery=True,
+        kind=AlertKind.RECOVERY,
     )
     embed = payload["embeds"][0]
     assert embed["color"] == 0x00C853
@@ -720,11 +729,11 @@ def test_discord_payload_recovery() -> None:
 
 
 def test_discord_payload_fields() -> None:
-    payload = _build_discord_payload(
+    payload = DiscordNotifier().build_payload(
         url=TARGET_URL,
         status_detail="HTTP 503",
         timestamp="2026-01-01T00:00:00Z",
-        is_recovery=False,
+        kind=AlertKind.FAILURE,
     )
     fields = payload["embeds"][0]["fields"]
     field_values = [f["value"] for f in fields]
@@ -732,14 +741,61 @@ def test_discord_payload_fields() -> None:
     assert any("2026-01-01T00:00:00Z" in v for v in field_values)
 
 
+@pytest.mark.parametrize("kind,color", [
+    (AlertKind.FAILURE,  "#FF0000"),
+    (AlertKind.RECOVERY, "#00C853"),
+    (AlertKind.DEGRADED, "#FFB300"),
+])
+def test_slack_payload_colour_matches_discord_semantics(kind: AlertKind, color: str) -> None:
+    """The triage colour must mean the same thing on both channels — an alert
+    that is amber on Discord and red on Slack teaches two different reflexes
+    for one event."""
+    payload = SlackNotifier().build_payload(
+        url=TARGET_URL,
+        status_detail="detail",
+        timestamp="2026-01-01T00:00:00Z",
+        kind=kind,
+    )
+    assert payload["attachments"][0]["color"] == color
+
+
+def test_slack_payload_carries_url_detail_and_timestamp() -> None:
+    payload = SlackNotifier().build_payload(
+        url=TARGET_URL,
+        status_detail="HTTP 503",
+        timestamp="2026-01-01T00:00:00Z",
+        kind=AlertKind.FAILURE,
+    )
+    blocks = payload["attachments"][0]["blocks"]
+    rendered = json.dumps(blocks)
+    assert TARGET_URL in rendered
+    assert "HTTP 503" in rendered
+    assert "2026-01-01T00:00:00Z" in rendered
+
+
+def test_slack_payload_sets_text_for_the_mobile_push_preview() -> None:
+    """Slack shows `text` as the push notification. Omitting it delivers an
+    empty push — which defeats the point of a channel whose job is catching
+    the alert the other channel might bury."""
+    payload = SlackNotifier().build_payload(
+        url=TARGET_URL,
+        status_detail="HTTP 503",
+        timestamp="2026-01-01T00:00:00Z",
+        kind=AlertKind.FAILURE,
+    )
+    assert payload["text"]
+    assert TARGET_URL in payload["text"]
+
+
 # =============================================================================
-# E2. send_discord_alert() — webhook delivery retry (an earlier release)
+# E2. Notifier.send() — webhook delivery retry (an earlier release, the design note)
 #
 # An alert fires on a state transition only — there is no next-run retry the
 # way probes have. asyncio.sleep is mocked so retries don't add real wall time.
 # =============================================================================
 
-WEBHOOK_URL = "https://discord.com/api/webhooks/test/token"
+WEBHOOK_URL       = "https://discord.com/api/webhooks/test/token"
+SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/TEST/TEST/token"
 
 
 async def test_webhook_204_first_try_no_retry(monkeypatch, caplog) -> None:
@@ -747,12 +803,12 @@ async def test_webhook_204_first_try_no_retry(monkeypatch, caplog) -> None:
     not just that no exception was raised. A function that silently returned
     without posting would pass a sleep-count-only assertion just as well."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
-    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with patch("notifiers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, status=204)
             async with aiohttp.ClientSession() as session:
                 with caplog.at_level("INFO"):
-                    await send_discord_alert(session, TARGET_URL, "Service is UP", is_recovery=True)
+                    await DiscordNotifier().send(session, TARGET_URL, "Service is UP", AlertKind.RECOVERY)
         mock_sleep.assert_not_called()
     assert any("alert sent" in r.message for r in caplog.records)
 
@@ -761,12 +817,12 @@ async def test_webhook_429_then_204_retries_once(monkeypatch) -> None:
     """A 429 (rate-limited) with no Retry-After header must fall back to the
     linear backoff schedule, and succeed on the 2nd attempt."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
-    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with patch("notifiers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, status=429)
             mock.post(WEBHOOK_URL, status=204)
             async with aiohttp.ClientSession() as session:
-                await send_discord_alert(session, TARGET_URL, "HTTP 503")
+                await DiscordNotifier().send(session, TARGET_URL, "HTTP 503", AlertKind.FAILURE)
         mock_sleep.assert_called_once_with(1.0)
 
 
@@ -774,12 +830,12 @@ async def test_webhook_429_honors_retry_after_header(monkeypatch) -> None:
     """A 429 with a Retry-After header must sleep for exactly that long,
     not the linear backoff schedule — Discord is telling us the real wait."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
-    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with patch("notifiers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, status=429, headers={"Retry-After": "5"})
             mock.post(WEBHOOK_URL, status=204)
             async with aiohttp.ClientSession() as session:
-                await send_discord_alert(session, TARGET_URL, "HTTP 503")
+                await DiscordNotifier().send(session, TARGET_URL, "HTTP 503", AlertKind.FAILURE)
         mock_sleep.assert_called_once_with(5.0)
 
 
@@ -787,12 +843,12 @@ async def test_webhook_429_retry_after_is_capped(monkeypatch) -> None:
     """A Retry-After longer than the cap must be clamped — a single 429 must
     not be allowed to stall the whole run indefinitely."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
-    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with patch("notifiers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, status=429, headers={"Retry-After": "999"})
             mock.post(WEBHOOK_URL, status=204)
             async with aiohttp.ClientSession() as session:
-                await send_discord_alert(session, TARGET_URL, "HTTP 503")
+                await DiscordNotifier().send(session, TARGET_URL, "HTTP 503", AlertKind.FAILURE)
         mock_sleep.assert_called_once_with(30.0)
 
 
@@ -800,28 +856,28 @@ async def test_webhook_429_malformed_retry_after_falls_back(monkeypatch) -> None
     """An unparseable Retry-After must not crash the retry loop — fall back
     to the linear backoff schedule instead."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
-    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with patch("notifiers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, status=429, headers={"Retry-After": "not-a-number"})
             mock.post(WEBHOOK_URL, status=204)
             async with aiohttp.ClientSession() as session:
-                await send_discord_alert(session, TARGET_URL, "HTTP 503")
+                await DiscordNotifier().send(session, TARGET_URL, "HTTP 503", AlertKind.FAILURE)
         mock_sleep.assert_called_once_with(1.0)
 
 
 async def test_webhook_5xx_exhausts_retries_alert_lost(monkeypatch, caplog) -> None:
     """3 consecutive 500s: retried twice, then abandoned — the alert is LOST,
-    logged as such (not silently or as if it succeeded), but send_discord_alert
+    logged as such (not silently or as if it succeeded), but Notifier.send()
     must never raise for the caller (check_url)."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
-    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with patch("notifiers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, status=500)
             mock.post(WEBHOOK_URL, status=500)
             mock.post(WEBHOOK_URL, status=500)
             async with aiohttp.ClientSession() as session:
                 with caplog.at_level("ERROR"):
-                    await send_discord_alert(session, TARGET_URL, "HTTP 503")  # must not raise
+                    await DiscordNotifier().send(session, TARGET_URL, "HTTP 503", AlertKind.FAILURE)  # must not raise
         assert mock_sleep.call_count == 2
         assert mock_sleep.call_args_list == [call(1.0), call(2.0)]
     assert any("LOST" in r.message for r in caplog.records)
@@ -831,12 +887,12 @@ async def test_webhook_400_non_retryable_no_retry(monkeypatch, caplog) -> None:
     """A 400 (malformed payload) will not heal on retry — one POST, no sleep,
     and the log must say why it was abandoned rather than retried."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
-    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with patch("notifiers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, status=400)
             async with aiohttp.ClientSession() as session:
                 with caplog.at_level("ERROR"):
-                    await send_discord_alert(session, TARGET_URL, "HTTP 503")
+                    await DiscordNotifier().send(session, TARGET_URL, "HTTP 503", AlertKind.FAILURE)
         mock_sleep.assert_not_called()
     assert any("non-retryable" in r.message for r in caplog.records)
 
@@ -845,26 +901,167 @@ async def test_webhook_timeout_retries_then_gives_up(monkeypatch, caplog) -> Non
     """A TimeoutError on every attempt must retry twice then give up cleanly,
     logging the alert as LOST rather than swallowing the failure silently."""
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", WEBHOOK_URL)
-    with patch("main.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with patch("notifiers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with aioresponses() as mock:
             mock.post(WEBHOOK_URL, exception=asyncio.TimeoutError())
             mock.post(WEBHOOK_URL, exception=asyncio.TimeoutError())
             mock.post(WEBHOOK_URL, exception=asyncio.TimeoutError())
             async with aiohttp.ClientSession() as session:
                 with caplog.at_level("ERROR"):
-                    await send_discord_alert(session, TARGET_URL, "HTTP 503")  # must not raise
+                    await DiscordNotifier().send(session, TARGET_URL, "HTTP 503", AlertKind.FAILURE)  # must not raise
         assert mock_sleep.call_count == 2
     assert any("LOST" in r.message for r in caplog.records)
+
+
+async def test_send_returns_false_when_channel_is_not_configured(monkeypatch) -> None:
+    """An unconfigured channel is a choice, not an error — it returns False
+    without posting, and dispatch_alert is what decides whether that mattered."""
+    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+    async with aiohttp.ClientSession() as session:
+        delivered = await SlackNotifier().send(
+            session, TARGET_URL, "HTTP 503", AlertKind.FAILURE
+        )
+    assert delivered is False
+
+
+async def test_slack_send_accepts_200_not_204(monkeypatch) -> None:
+    """Slack answers 200 where Discord answers 204. Treating both channels as
+    204-means-success would mark every successful Slack delivery as a failure,
+    retry it twice, and report the alert LOST while the message sat in the
+    channel."""
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", SLACK_WEBHOOK_URL)
+    with patch("notifiers.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with aioresponses() as mock:
+            mock.post(SLACK_WEBHOOK_URL, status=200, body="ok")
+            async with aiohttp.ClientSession() as session:
+                delivered = await SlackNotifier().send(
+                    session, TARGET_URL, "HTTP 503", AlertKind.FAILURE
+                )
+        mock_sleep.assert_not_called()
+    assert delivered is True
+
+
+# =============================================================================
+# E3. dispatch_alert() — the redundancy that justifies the whole phase
+#
+# The point of this phase is not "two channels exist". It is that one channel
+# failing cannot stop the other from delivering, and that the operator finds
+# out when NO channel delivered. Those are the properties tested here.
+# =============================================================================
+
+
+async def test_dispatch_delivers_to_every_configured_channel() -> None:
+    """Both channels get the same alert from one transition — no routing, no
+    choosing. The duplication IS the feature."""
+    discord, slack = DiscordNotifier(), SlackNotifier()
+    with patch.object(DiscordNotifier, "send", new_callable=AsyncMock, return_value=True) as d_send:
+        with patch.object(SlackNotifier, "send", new_callable=AsyncMock, return_value=True) as s_send:
+            async with aiohttp.ClientSession() as session:
+                await dispatch_alert(
+                    session, TARGET_URL, "HTTP 503", AlertKind.FAILURE,
+                    notifiers=[discord, slack],
+                )
+    d_send.assert_awaited_once()
+    s_send.assert_awaited_once()
+
+
+async def test_dispatch_one_channel_down_does_not_stop_the_other(caplog) -> None:
+    """THE test this phase exists for: Slack fails every attempt, Discord must
+    still deliver, and nothing may be logged as a total loss."""
+    with patch.object(DiscordNotifier, "send", new_callable=AsyncMock, return_value=True) as d_send:
+        with patch.object(SlackNotifier, "send", new_callable=AsyncMock, return_value=False):
+            async with aiohttp.ClientSession() as session:
+                with caplog.at_level("CRITICAL"):
+                    await dispatch_alert(
+                        session, TARGET_URL, "HTTP 503", AlertKind.FAILURE,
+                        notifiers=[DiscordNotifier(), SlackNotifier()],
+                    )
+    d_send.assert_awaited_once()
+    assert not any("alerts_lost_all_channels_total" in r.message for r in caplog.records)
+
+
+async def test_dispatch_logs_the_metric_that_pages_when_every_channel_fails(caplog) -> None:
+    """Per-channel losses are diagnosis. This one line means 'an alert was
+    generated and no human will hear about it' — the only one that should page."""
+    with patch.object(DiscordNotifier, "send", new_callable=AsyncMock, return_value=False):
+        with patch.object(SlackNotifier, "send", new_callable=AsyncMock, return_value=False):
+            async with aiohttp.ClientSession() as session:
+                with caplog.at_level("CRITICAL"):
+                    await dispatch_alert(
+                        session, TARGET_URL, "HTTP 503", AlertKind.FAILURE,
+                        notifiers=[DiscordNotifier(), SlackNotifier()],
+                    )
+    assert any(
+        "event_type=metric metric=alerts_lost_all_channels_total value=1" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_dispatch_with_zero_channels_configured_reports_the_loss(caplog) -> None:
+    """Running with no webhook at all must be loud. Silence here looks exactly
+    like 'nothing was wrong', which is the failure mode this project has now
+    been bitten by three separate times."""
+    async with aiohttp.ClientSession() as session:
+        with caplog.at_level("CRITICAL"):
+            await dispatch_alert(
+                session, TARGET_URL, "HTTP 503", AlertKind.FAILURE, notifiers=[],
+            )
+    assert any(
+        "alerts_lost_all_channels_total" in r.message and "no_channels" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_dispatch_survives_a_notifier_that_breaks_its_never_raise_contract(caplog) -> None:
+    """send() must never raise, but that is a convention a future notifier
+    author can break. The gather makes the guarantee structural: a raising
+    notifier is logged as the bug it is, and the healthy channel still
+    delivers."""
+    with patch.object(DiscordNotifier, "send", new_callable=AsyncMock, return_value=True) as d_send:
+        with patch.object(SlackNotifier, "send", new_callable=AsyncMock,
+                          side_effect=RuntimeError("notifier bug")):
+            async with aiohttp.ClientSession() as session:
+                with caplog.at_level("ERROR"):
+                    await dispatch_alert(   # must not raise
+                        session, TARGET_URL, "HTTP 503", AlertKind.FAILURE,
+                        notifiers=[DiscordNotifier(), SlackNotifier()],
+                    )
+    d_send.assert_awaited_once()
+    assert any("bug in that notifier" in r.message for r in caplog.records)
+
+
+async def test_dispatch_runs_channels_concurrently_not_sequentially() -> None:
+    """Sequential dispatch would double the worst case to 150s against a 60s
+    run budget (the design note). Two channels that each sleep must finish in
+    about one sleep, not two."""
+    async def slow_send(*args, **kwargs):
+        await asyncio.sleep(0.20)
+        return True
+
+    with patch.object(DiscordNotifier, "send", new=slow_send):
+        with patch.object(SlackNotifier, "send", new=slow_send):
+            async with aiohttp.ClientSession() as session:
+                start = time.monotonic()
+                await dispatch_alert(
+                    session, TARGET_URL, "HTTP 503", AlertKind.FAILURE,
+                    notifiers=[DiscordNotifier(), SlackNotifier()],
+                )
+                elapsed = time.monotonic() - start
+
+    assert elapsed < 0.35, (
+        f"dispatch took {elapsed:.2f}s for two 0.20s channels — that is "
+        f"sequential, and sequential blows the run budget under Retry-After."
+    )
 
 
 # =============================================================================
 # F. check_url() — full orchestration pipeline
 #
-# check_url() is where probe + state + Discord alert are wired together.
+# check_url() is where probe + state + alert dispatch are wired together.
 # These tests verify that the CORRECT alert is fired (or suppressed) based
 # on the state transition, not just that no exception was raised.
-# send_discord_alert is mocked — we are not testing the webhook call here,
-# we are testing whether check_url DECIDES to call it, and with what args.
+# dispatch_alert is mocked — we are not testing webhook delivery here, we are
+# testing whether check_url DECIDES to alert, and with which AlertKind.
 # =============================================================================
 
 
@@ -877,7 +1074,7 @@ async def test_check_url_up_no_transition(tmp_path: Path) -> None:
         mock.get(TARGET_URL, status=200)
         async with aiohttp.ClientSession() as session:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                with patch("main.dispatch_alert", new_callable=AsyncMock) as mock_alert:
                     await check_url(TARGET_URL, session, sm)
     mock_alert.assert_not_called()
 
@@ -891,11 +1088,11 @@ async def test_check_url_up_transition_fires_recovery_alert(tmp_path: Path) -> N
         mock.get(TARGET_URL, status=200)
         async with aiohttp.ClientSession() as session:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                with patch("main.dispatch_alert", new_callable=AsyncMock) as mock_alert:
                     await check_url(TARGET_URL, session, sm)
 
     mock_alert.assert_called_once()
-    assert mock_alert.call_args.kwargs["is_recovery"] is True
+    assert mock_alert.call_args.kwargs["kind"] is AlertKind.RECOVERY
 
 
 async def test_check_url_down_transition_fires_failure_alert(tmp_path: Path) -> None:
@@ -916,11 +1113,11 @@ async def test_check_url_down_transition_fires_failure_alert(tmp_path: Path) -> 
             mock.get(TARGET_URL, status=503)
             async with aiohttp.ClientSession() as session:
                 with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                    with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                    with patch("main.dispatch_alert", new_callable=AsyncMock) as mock_alert:
                         await check_url(TARGET_URL, session, sm)
 
     mock_alert.assert_called_once()
-    assert mock_alert.call_args.kwargs["is_recovery"] is False
+    assert mock_alert.call_args.kwargs["kind"] is AlertKind.FAILURE
 
 
 async def test_check_url_down_no_transition_suppresses_alert(tmp_path: Path) -> None:
@@ -935,7 +1132,7 @@ async def test_check_url_down_no_transition_suppresses_alert(tmp_path: Path) -> 
             mock.get(TARGET_URL, status=503)
             async with aiohttp.ClientSession() as session:
                 with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                    with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                    with patch("main.dispatch_alert", new_callable=AsyncMock) as mock_alert:
                         await check_url(TARGET_URL, session, sm)
 
     mock_alert.assert_not_called()
@@ -957,13 +1154,13 @@ async def test_check_url_content_check_failure_routes_to_down(tmp_path: Path) ->
         with patch("main.asyncio.sleep", new_callable=AsyncMock):
             async with aiohttp.ClientSession() as session:
                 with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                    with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                    with patch("main.dispatch_alert", new_callable=AsyncMock) as mock_alert:
                         await check_url(
                             TARGET_URL, session, sm, expect_substring='"status":"ok"'
                         )
 
     mock_alert.assert_called_once()
-    assert mock_alert.call_args.kwargs["is_recovery"] is False
+    assert mock_alert.call_args.kwargs["kind"] is AlertKind.FAILURE
 
     data = json.loads(state_file.read_text(encoding="utf-8"))
     assert data["targets"][TARGET_URL]["status"] == "DOWN"
@@ -986,7 +1183,7 @@ async def test_check_url_redacts_env_var_secret_end_to_end(tmp_path: Path) -> No
         with patch("main.asyncio.sleep", new_callable=AsyncMock):
             async with aiohttp.ClientSession() as session:
                 with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                    with patch("main.send_discord_alert", new_callable=AsyncMock):
+                    with patch("main.dispatch_alert", new_callable=AsyncMock):
                         await check_url(
                             TARGET_URL, session, sm,
                             expect_substring=real_secret,
@@ -1012,7 +1209,7 @@ async def test_check_url_up_persists_diagnostics(tmp_path: Path) -> None:
         mock.get(TARGET_URL, status=200, body=b"x" * 1024)
         async with aiohttp.ClientSession() as session:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock):
+                with patch("main.dispatch_alert", new_callable=AsyncMock):
                     await check_url(TARGET_URL, session, sm)
 
     data = json.loads(state_file.read_text(encoding="utf-8"))
@@ -1130,11 +1327,11 @@ async def test_check_url_degraded_fires_amber_alert(tmp_path: Path) -> None:
         mock.get(TARGET_URL, status=200, body=b"x" * 1024)
         async with aiohttp.ClientSession() as session:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_SLOW_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                with patch("main.dispatch_alert", new_callable=AsyncMock) as mock_alert:
                     await check_url(TARGET_URL, session, sm)
 
     mock_alert.assert_called_once()
-    assert mock_alert.call_args.kwargs["is_degraded"] is True
+    assert mock_alert.call_args.kwargs["kind"] is AlertKind.DEGRADED
 
     data = json.loads(state_file.read_text(encoding="utf-8"))
     assert data["targets"][TARGET_URL]["status"] == "DEGRADED"
@@ -1154,12 +1351,12 @@ async def test_check_url_degraded_rtt_override_stays_up(tmp_path: Path) -> None:
         mock.get(TARGET_URL, status=200, body=b"x" * 1024)
         async with aiohttp.ClientSession() as session:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_SLOW_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                with patch("main.dispatch_alert", new_callable=AsyncMock) as mock_alert:
                     result = await check_url(TARGET_URL, session, sm, degraded_rtt_ms=400.0)
 
     assert result.status == "UP"
     mock_alert.assert_called_once()
-    assert mock_alert.call_args.kwargs["is_recovery"] is True
+    assert mock_alert.call_args.kwargs["kind"] is AlertKind.RECOVERY
 
     data = json.loads(state_file.read_text(encoding="utf-8"))
     assert data["targets"][TARGET_URL]["status"] == "UP"
@@ -1174,7 +1371,7 @@ async def test_check_url_degraded_no_transition_suppresses_alert(tmp_path: Path)
         mock.get(TARGET_URL, status=200, body=b"x" * 1024)
         async with aiohttp.ClientSession() as session:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_SLOW_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                with patch("main.dispatch_alert", new_callable=AsyncMock) as mock_alert:
                     await check_url(TARGET_URL, session, sm)
 
     mock_alert.assert_not_called()
@@ -1189,11 +1386,11 @@ async def test_check_url_degraded_to_up_fires_recovery(tmp_path: Path) -> None:
         mock.get(TARGET_URL, status=200, body=b"x" * 1024)
         async with aiohttp.ClientSession() as session:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock) as mock_alert:
+                with patch("main.dispatch_alert", new_callable=AsyncMock) as mock_alert:
                     await check_url(TARGET_URL, session, sm)
 
     mock_alert.assert_called_once()
-    assert mock_alert.call_args.kwargs["is_recovery"] is True
+    assert mock_alert.call_args.kwargs["kind"] is AlertKind.RECOVERY
 
 
 async def test_state_set_degraded_transition(tmp_path: Path) -> None:
@@ -1205,12 +1402,11 @@ async def test_state_set_degraded_transition(tmp_path: Path) -> None:
 
 def test_discord_payload_degraded() -> None:
     """Degraded embed must be amber and titled 'Degraded', distinct from red/green."""
-    payload = _build_discord_payload(
+    payload = DiscordNotifier().build_payload(
         url=TARGET_URL,
         status_detail="HIGH_RTT_NEEDS_EDGE (rtt_ms=300)",
         timestamp="2026-01-01T00:00:00Z",
-        is_recovery=False,
-        is_degraded=True,
+        kind=AlertKind.DEGRADED,
     )
     embed = payload["embeds"][0]
     assert embed["color"] == 0xFFB300
@@ -1235,7 +1431,7 @@ async def test_check_url_returns_up_status(tmp_path: Path) -> None:
         mock.get(TARGET_URL, status=200, body=b"x" * 1024)
         async with aiohttp.ClientSession() as session:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock):
+                with patch("main.dispatch_alert", new_callable=AsyncMock):
                     result = await check_url(TARGET_URL, session, sm)
     assert result.status == "UP"
     assert result.error is None
@@ -1248,7 +1444,7 @@ async def test_check_url_returns_degraded_status(tmp_path: Path) -> None:
         mock.get(TARGET_URL, status=200, body=b"x" * 1024)
         async with aiohttp.ClientSession() as session:
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_SLOW_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock):
+                with patch("main.dispatch_alert", new_callable=AsyncMock):
                     result = await check_url(TARGET_URL, session, sm)
     assert result.status == "DEGRADED"
     assert result.error is not None
@@ -1267,7 +1463,7 @@ async def test_check_url_returns_down_status_when_confirmed(tmp_path: Path) -> N
             mock.get(TARGET_URL, status=503)
             async with aiohttp.ClientSession() as session:
                 with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                    with patch("main.send_discord_alert", new_callable=AsyncMock):
+                    with patch("main.dispatch_alert", new_callable=AsyncMock):
                         result = await check_url(TARGET_URL, session, sm)
     assert result.status == "DOWN"
     assert result.error == "HTTP 503 (expected 200)"
@@ -1291,7 +1487,7 @@ async def test_check_url_returns_preserved_status_during_hysteresis_pending(tmp_
             mock.get(TARGET_URL, status=503)
             async with aiohttp.ClientSession() as session:
                 with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                    with patch("main.send_discord_alert", new_callable=AsyncMock):
+                    with patch("main.dispatch_alert", new_callable=AsyncMock):
                         result = await check_url(TARGET_URL, session, sm)
     assert result.status == "UP"
     assert result.error == "HTTP 503 (expected 200)"
@@ -1334,7 +1530,7 @@ async def test_run_health_checks_returns_down_count(tmp_path) -> None:
             mock.get(down_url, status=503)
             mock.get(down_url, status=503)
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock):
+                with patch("main.dispatch_alert", new_callable=AsyncMock):
                     down_count = await run_health_checks(
                         targets=[up_url, down_url],
                         state_path=tmp_path / "state.json",
@@ -1359,7 +1555,7 @@ async def test_run_health_checks_writes_outcomes_to_history_db(tmp_path) -> None
             mock.get(down_url, status=503)
             mock.get(down_url, status=503)
             with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
-                with patch("main.send_discord_alert", new_callable=AsyncMock):
+                with patch("main.dispatch_alert", new_callable=AsyncMock):
                     await run_health_checks(
                         targets=[up_url, down_url],
                         state_path=tmp_path / "state.json",

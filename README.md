@@ -118,6 +118,8 @@ platform engineer six months from now.
 
 - Docker and Docker Compose
 - A Discord Webhook URL (Server Settings > Integrations > Webhooks)
+- Optionally a Slack Incoming Webhook — alerts go to both at once, see
+  "Multi-channel alerting"
 - Two minutes of focused attention
 
 ---
@@ -130,8 +132,9 @@ platform engineer six months from now.
 cp .env.example .env
 ```
 
-Open `.env` and replace the placeholder with your real Discord Webhook URL. Do not
-commit this file. It is in `.gitignore` for a reason.
+Open `.env` and replace the placeholder with your real Discord Webhook URL. Add
+`SLACK_WEBHOOK_URL` too if you want the second channel — every alert goes to every
+configured channel. Do not commit this file. It is in `.gitignore` for a reason.
 
 ### 2. Configure targets
 
@@ -163,7 +166,7 @@ services:
       - ./history.db:/app/history.db
     restart: unless-stopped
     command: >
-      sh -c "while true; do python main.py; sleep 60; done"
+      sh -c "while true; do python main.py || exit 1; sleep 60; done"
 ```
 
 ```bash
@@ -188,7 +191,8 @@ docker compose down
 
 The default `targets.yaml` includes `https://httpbin.org/status/503` and a
 non-existent domain. On first run, both will transition from an unknown state to
-DOWN, and two Discord alerts will fire. This is not a misconfiguration. It is a
+DOWN, and two alerts will fire on every configured channel. This is not a
+misconfiguration. It is a
 smoke test. Confirm the alerts arrive, then replace those entries with your own
 infrastructure.
 
@@ -201,6 +205,7 @@ infrastructure.
 ├── main.py              Core service logic — async orchestrator
 ├── diagnostics.py       Latency/BDP diagnostic engine — phase timings + findings
 ├── history.py           SQLite historical persistence — isolated from the alert path
+├── notifiers.py         Multi-channel alert delivery — Discord + Slack, in parallel
 ├── targets.yaml         URL configuration — edit freely, no restarts required
 ├── Dockerfile           Multi-stage, non-root, health-checked production image
 ├── docker-compose.yml   Standard deployment manifest
@@ -208,7 +213,7 @@ infrastructure.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               156-test suite covering probes, state, alerts, diagnostics, history
+├── tests/               190-test suite covering probes, state, alerts, diagnostics, history
 ├── .github/             CI: pytest, then docker build + run a real health-check cycle
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
@@ -223,9 +228,10 @@ infrastructure.
 
 We do not ship what we cannot prove works.
 
-156 automated tests cover every component in isolation: target loading (including
+190 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
-intervals, Discord payload construction, the complete orchestration pipeline —
+intervals, per-channel payload construction and delivery, the complete
+orchestration pipeline —
 including all four paths through the alert decision logic — the full diagnostic
 engine, where every rule is tested on both sides of its threshold, and the
 historical persistence layer, including forcing internal writes to fail to prove
@@ -466,6 +472,49 @@ failure mode than refusing to start.
 
 ---
 
+## Multi-channel alerting
+
+An alert can be delivered perfectly and still fail. The POST returns 204, Discord
+accepts it, the message is in the channel — and the on-call never sees it, because
+it landed under forty other notifications, or the phone deferred it, or a
+notification setting nobody remembers configuring silenced that app. Nothing failed.
+Delivery worked and attention did not, and no retry policy has anything to retry.
+
+So every alert goes to every configured channel, simultaneously:
+
+```bash
+# .env — configure one, or both
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+```
+
+**There are no routing rules, and that is the design.** A rule that sends an alert
+to only one place puts back exactly the single point of failure the second channel
+was added to remove. The duplication is the feature. An unconfigured channel is
+skipped silently; configuring none means every alert is lost, and vigil-sre says so
+loudly rather than staying quiet about it.
+
+Delivery is parallel, not sequential, and the reason is arithmetic rather than
+elegance. Worst case per channel is three attempts at a 5 s timeout plus two 30 s
+capped `Retry-After` sleeps: 75 s. Two channels sequentially is 150 s against a
+60 s run budget — a guaranteed overrun. In parallel it stays at 75 s, which is what
+one channel already cost.
+
+Channels are isolated from each other and from the probe. A channel that is down,
+rate-limited, or outright buggy cannot delay a healthy one and cannot fail the
+check that triggered the alert. Adding a channel — PagerDuty, email — is one
+subclass of `Notifier` supplying three things: its environment variable, its
+payload shape, and which HTTP status means success. That last one is not a
+formality: Discord answers 204 and Slack answers 200, and a channel that assumed
+its sibling's success code would report every successful delivery as a permanent
+failure.
+
+The metric worth alerting on is `alerts_lost_all_channels_total`. Per-channel
+losses are diagnosis; that one means an alert was generated and no human is going
+to hear about it.
+
+---
+
 ## Dependency Philosophy
 
 The `requirements.txt` contains exactly three entries: `aiohttp`, `PyYAML`, and
@@ -521,11 +570,15 @@ or a host-level cron entry. This is intentional. Embedding a scheduler couples t
 policy to application logic. They are separate concerns and should remain that way.
 However, it does mean the operator must own that configuration explicitly.
 
-**Single alerting channel**
-Alerts go to Discord. Full stop. There is no routing logic, no severity tiering, no
-escalation path. A P0 database outage and a non-critical staging endpoint returning
-503 produce identical notification behaviour. At this scale, that is acceptable. At
-the next scale, it is not.
+**No severity tiering or escalation path**
+Every alert reaches every configured channel with the same urgency. A P0 database
+outage and a non-critical staging endpoint returning 503 produce identical
+notification behaviour. At this scale, that is acceptable. At the next scale, it is
+not.
+
+Note what is *not* on this list any more: the single alerting channel. Alerts now go
+to Discord and Slack in parallel, and the absence of routing between them is a
+decision, not a gap — see "Multi-channel alerting" above.
 
 **Probe logic does not evaluate response body content**
 The checker performs an HTTP GET, evaluates the response code, and — as of the
@@ -583,12 +636,16 @@ environments, `APScheduler` with an `AsyncIOScheduler` integrates directly into 
 existing event loop without threading concerns. Either path requires fewer than
 twenty lines of new code.
 
-**When you need alert routing: introduce a notification abstraction layer**
-The `send_discord_alert()` function is the single point where all alert output
-exits the system. Replacing it with a `Notifier` base class and concrete
-implementations for Discord, PagerDuty, Slack, and email is a standard strategy
-pattern application. Severity tiers and routing rules live in the YAML configuration
-alongside the targets.
+**Notification abstraction layer: done — `notifiers.py`**
+This ceiling has been broken. A `Notifier` base class owns the delivery policy and
+concrete channels supply only what differs: the environment variable holding their
+webhook, their payload shape, and which HTTP status means success. Adding PagerDuty
+or email is one subclass and one entry in `ALL_NOTIFIERS`.
+
+What was *not* built is routing, and that is deliberate — see "Multi-channel
+alerting". Severity tiers remain a real ceiling: when a P0 must escalate differently
+from a staging blip, tiers belong in the YAML alongside the targets, and the
+`AlertKind` enum is where that distinction would attach.
 
 **Richer probe results: done — `_probe_once()` returns `ProbePhases`**
 This ceiling has been broken. `_probe_once()` now returns a `ProbePhases` dataclass

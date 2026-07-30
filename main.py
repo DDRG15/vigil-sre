@@ -69,6 +69,10 @@ from history import (
     CheckOutcome,
     HistoryRecorder,
 )
+from notifiers import (
+    AlertKind,
+    dispatch_alert,
+)
 
 # ---------------------------------------------------------------------------
 # Bootstrap — load .env before anything reads os.getenv()
@@ -143,12 +147,9 @@ DOWN_CONFIRMATIONS: int = 2
 
 STATE_SCHEMA_VERSION: int = 2   # bump whenever state.json's on-disk shape changes
 
-# Webhook delivery retry: alerts fire on state transitions ONLY, so a webhook
-# POST that dies on a transient Discord 429/5xx has no second chance next
-# run — the alert is gone. Retrying delivery here is the monitor's one job.
-WEBHOOK_RETRY_ATTEMPTS  : int   = 3     # total attempts (1 original + 2 retries)
-WEBHOOK_RETRY_BASE_S    : float = 1.0   # linear backoff: 1 s, then 2 s between attempts
-WEBHOOK_RETRY_AFTER_CAP_S: float = 30.0 # cap on an honoured Retry-After value
+# Webhook delivery retry now lives in notifiers.py alongside the Notifier
+# base class that applies it — see WEBHOOK_RETRY_ATTEMPTS / _BASE_S /
+# _AFTER_CAP_S there. It moved with the code it governs (the design note).
 
 # If a full run takes longer than this, the docker-compose `sleep 60` loop
 # (or an equivalent cron/systemd-timer interval) is scheduling overlapping
@@ -704,192 +705,6 @@ class StateManager:
             return changed
 
 
-# ---------------------------------------------------------------------------
-# Discord alerting  (async)
-# ---------------------------------------------------------------------------
-
-def _build_discord_payload(
-    url          : str,
-    status_detail: str,
-    timestamp    : str,
-    is_recovery  : bool,
-    is_degraded  : bool = False,
-) -> dict:
-    """
-    Construct a colour-coded Discord embed payload.
-
-    Green for recoveries, red for failures, amber for degradations. Amber is
-    a distinct signal on purpose: a degraded service is not down, and paging
-    it red trains the on-call to distrust red. The colour carries the triage.
-
-    Args:
-        url:           Monitored URL.
-        status_detail: E.g. "HTTP 503", "Timeout (>5s)", "Service is UP", or a
-                       degradation reason like "HIGH_RTT_NEEDS_EDGE (...)".
-        timestamp:     ISO-8601 UTC string.
-        is_recovery:   Green recovery embed.
-        is_degraded:   Amber degradation embed. Takes precedence over the
-                       failure styling; ignored when is_recovery is True.
-
-    Returns:
-        Dict ready to be JSON-serialised and POSTed to Discord.
-    """
-    if is_recovery:
-        title        = "✅  Service Recovered"
-        color        = 0x00C853  # green-A700
-        status_label = "🟢  Current Status"
-    elif is_degraded:
-        title        = "⚠️  Service Degraded — Up But Hurting"
-        color        = 0xFFB300  # amber-600
-        status_label = "🟡  Degradation Detail"
-    else:
-        title        = "🚨  Infrastructure Alert — Health Check Failed"
-        color        = 0xFF0000  # red
-        status_label = "📛  Failure Detail"
-
-    return {
-        "username"  : "SRE Health Checker",
-        "avatar_url": "https://i.imgur.com/4M34hi2.png",
-        "embeds": [
-            {
-                "title" : title,
-                "color" : color,
-                "fields": [
-                    {
-                        "name"  : "🌐  Target URL",
-                        "value" : f"`{url}`",
-                        "inline": False,
-                    },
-                    {
-                        "name"  : status_label,
-                        "value" : f"`{status_detail}`",
-                        "inline": True,
-                    },
-                    {
-                        "name"  : "🕐  Timestamp (UTC)",
-                        "value" : f"`{timestamp}`",
-                        "inline": True,
-                    },
-                ],
-                "footer": {
-                    "text": "Async SRE Health Monitor • alerts on state-change only"
-                },
-            }
-        ],
-    }
-
-
-async def send_discord_alert(
-    session      : aiohttp.ClientSession,
-    url          : str,
-    status_detail: str,
-    is_recovery  : bool = False,
-    is_degraded  : bool = False,
-) -> None:
-    """
-    Dispatch a Discord Webhook POST using the shared aiohttp session, with
-    retry on transient failures.
-
-    The function is a no-op (CRITICAL log) when DISCORD_WEBHOOK_URL is absent.
-    It never raises — all network errors are caught and logged so a broken
-    webhook never masks the underlying probe result.
-
-    Retry policy
-    ------------
-    Alerts fire on state transitions ONLY — there is no second chance next
-    run if this POST dies. So timeouts, connection errors, HTTP 429
-    (rate-limited), and HTTP 5xx (Discord-side outage) are retried up to
-    WEBHOOK_RETRY_ATTEMPTS times with linear backoff (1 s, then 2 s). A
-    non-retryable 4xx (malformed payload, bad webhook token, wrong content
-    type) will not heal on retry — it is logged once and abandoned
-    immediately, since hammering a permanently-broken webhook only delays
-    the next probe cycle for no gain.
-
-    Args:
-        session:       Shared aiohttp.ClientSession for the run.
-        url:           Target whose state just changed.
-        status_detail: Human-readable failure/degradation reason or "Service is UP".
-        is_recovery:   True → green recovery embed.
-        is_degraded:   True → amber degradation embed (ignored if is_recovery).
-    """
-    webhook_url: str | None = os.getenv("DISCORD_WEBHOOK_URL")
-    if not webhook_url:
-        logger.critical(
-            "DISCORD_WEBHOOK_URL is not set — alert suppressed for %s.", url
-        )
-        return
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    payload   = _build_discord_payload(
-        url=url, status_detail=status_detail, timestamp=timestamp,
-        is_recovery=is_recovery, is_degraded=is_degraded,
-    )
-    kind = "recovery" if is_recovery else "degraded" if is_degraded else "failure"
-
-    for attempt in range(1, WEBHOOK_RETRY_ATTEMPTS + 1):
-        is_last_attempt = attempt == WEBHOOK_RETRY_ATTEMPTS
-        try:
-            async with session.post(
-                webhook_url,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S),
-            ) as resp:
-                if resp.status == 204:
-                    logger.info("Discord %s alert sent for %s.", kind, url)
-                    return
-
-                retryable = resp.status == 429 or resp.status >= 500
-                if not retryable:
-                    logger.error(
-                        "Discord Webhook returned non-retryable HTTP %s for "
-                        "%s alert on %s — abandoning (will not heal on retry).",
-                        resp.status, kind, url,
-                    )
-                    return
-                if is_last_attempt:
-                    logger.error(
-                        "Discord %s alert LOST for %s: all %d attempts "
-                        "returned HTTP %s.",
-                        kind, url, WEBHOOK_RETRY_ATTEMPTS, resp.status,
-                    )
-                    return
-
-                sleep_s = WEBHOOK_RETRY_BASE_S * attempt
-                if resp.status == 429:
-                    # Discord tells us exactly how long to back off after a
-                    # rate limit — ignoring it and retrying on our own linear
-                    # schedule risks hitting the limit again immediately,
-                    # burning attempts and losing the alert for no reason.
-                    retry_after = resp.headers.get("Retry-After")
-                    try:
-                        if retry_after is not None:
-                            sleep_s = min(float(retry_after), WEBHOOK_RETRY_AFTER_CAP_S)
-                    except ValueError:
-                        pass  # malformed header — fall back to linear backoff
-
-                logger.warning(
-                    "Discord webhook attempt %d/%d returned HTTP %s for %s "
-                    "alert on %s — retrying in %.1fs",
-                    attempt, WEBHOOK_RETRY_ATTEMPTS, resp.status, kind, url, sleep_s,
-                )
-                await asyncio.sleep(sleep_s)
-
-        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-            if is_last_attempt:
-                logger.error(
-                    "Discord %s alert LOST for %s: all %d attempts raised %s: %s",
-                    kind, url, WEBHOOK_RETRY_ATTEMPTS, type(exc).__name__, exc,
-                )
-                return
-
-            sleep_s = WEBHOOK_RETRY_BASE_S * attempt
-            logger.warning(
-                "Discord webhook attempt %d/%d raised %s for %s alert on %s "
-                "— retrying in %.1fs",
-                attempt, WEBHOOK_RETRY_ATTEMPTS, type(exc).__name__, kind, url, sleep_s,
-            )
-            await asyncio.sleep(sleep_s)
-
 
 # ---------------------------------------------------------------------------
 # Async probe with manual exponential-backoff retry loop
@@ -1281,8 +1096,8 @@ async def check_url(
             transitioned = await state.set_degraded(url, reason, diagnostics=diagnostics)
             if transitioned:
                 logger.warning("🟡  STATE CHANGE → DEGRADED  %s | %s", url, reason)
-                await send_discord_alert(
-                    session, url, status_detail=reason, is_degraded=True
+                await dispatch_alert(
+                    session, url, status_detail=reason, kind=AlertKind.DEGRADED
                 )
             else:
                 logger.info("🟡  Still DEGRADED (alert suppressed)  %s | %s", url, reason)
@@ -1294,8 +1109,8 @@ async def check_url(
             transitioned = await state.set_up(url, diagnostics=diagnostics)
             if transitioned:
                 logger.info("🟢  STATE CHANGE → UP    %s", url)
-                await send_discord_alert(
-                    session, url, status_detail="Service is UP", is_recovery=True
+                await dispatch_alert(
+                    session, url, status_detail="Service is UP", kind=AlertKind.RECOVERY
                 )
             else:
                 logger.info("✅  OK (no change)       %s", url)
@@ -1309,8 +1124,8 @@ async def check_url(
         transitioned = await state.set_down(url, error=exc.detail)
         if transitioned:
             logger.error("🔴  STATE CHANGE → DOWN  %s | %s", url, exc.detail)
-            await send_discord_alert(
-                session, url, status_detail=exc.detail, is_recovery=False
+            await dispatch_alert(
+                session, url, status_detail=exc.detail, kind=AlertKind.FAILURE
             )
         else:
             # Covers two cases: already-confirmed DOWN (repeat, alert already
