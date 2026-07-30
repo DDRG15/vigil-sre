@@ -42,7 +42,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TypedDict
@@ -68,6 +68,9 @@ from history import (
     HISTORY_DB_FILE,
     CheckOutcome,
     HistoryRecorder,
+    _retention_days_from_env,
+    latency_percentiles,
+    uptime_pct,
 )
 from notifiers import (
     AlertKind,
@@ -1332,6 +1335,80 @@ async def run_health_checks(
     return down_count
 
 
+REPORT_WINDOWS_DAYS: tuple[int, ...] = (1, 7, 30)
+
+
+def _generate_report(
+    targets       : list[Target],
+    history_path  : Path = HISTORY_DB_FILE,
+    retention_days: int | None = None,
+    now           : datetime | None = None,
+) -> str:
+    """
+    Render the --report table: uptime% per target over every window in
+    REPORT_WINDOWS_DAYS that fits inside the configured retention, plus TTFB
+    p50/p95 over the widest window shown.
+
+    A window longer than the actual retention is never displayed. Retention
+    already deleted anything older than HISTORY_RETENTION_DAYS, so a "30d
+    uptime" column when retention is 7 would either show a number quietly
+    computed from 7 days of data under a 30-day label, or (worse) look
+    identical to the 7d column and read as a bug. Neither is honest, so the
+    column is omitted instead — retention is stated once in the header, not
+    re-litigated per cell.
+
+    Args:
+        targets:        Targets to report on (normally load_targets()).
+        history_path:   Path to history.db.
+        retention_days: Override for tests; defaults to the same env-driven
+                         value HistoryRecorder itself would use.
+        now:            Override for tests; defaults to the real current time.
+    """
+    if retention_days is None:
+        retention_days = _retention_days_from_env()
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    windows = [w for w in REPORT_WINDOWS_DAYS if w <= retention_days] or [retention_days]
+    widest  = max(windows)
+
+    def since(days: int) -> str:
+        return (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    col_width = 12
+    header = (
+        "Target".ljust(40)
+        + "".join(f"Up {w}d".rjust(col_width) for w in windows)
+        + "p50 TTFB".rjust(col_width) + "p95 TTFB".rjust(col_width)
+    )
+    lines = [
+        f"vigil-sre history report — retention: {retention_days}d "
+        f"(windows beyond retention are not shown)",
+        "",
+        header,
+        "-" * len(header),
+    ]
+
+    for target in targets:
+        row = target.url.ljust(40)
+        for w in windows:
+            pct = uptime_pct(history_path, target.url, since(w))
+            cell = "no data" if pct is None else f"{pct:.1f}%"
+            row += cell.rjust(col_width)
+
+        percentiles = latency_percentiles(history_path, target.url, since(widest))
+        if percentiles is None:
+            row += "no data".rjust(col_width) + "no data".rjust(col_width)
+        else:
+            row += (
+                f"{percentiles['p50_ttfb_ms']:.0f}ms".rjust(col_width)
+                + f"{percentiles['p95_ttfb_ms']:.0f}ms".rjust(col_width)
+            )
+        lines.append(row)
+
+    return "\n".join(lines)
+
+
 def _exit_code(strict: bool, down_count: int) -> int:
     """
     Compute the process exit code for a completed run.
@@ -1350,6 +1427,12 @@ def _exit_code(strict: bool, down_count: int) -> int:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    if "--report" in sys.argv:
+        # Mutually exclusive with a normal run: report and exit, probe
+        # nothing. Reads history.db only — no session, no targets probed.
+        print(_generate_report(load_targets()))
+        sys.exit(0)
+
     strict = "--strict" in sys.argv
     # STATE_FILE_PATH lets a container deployment point state.json at a
     # bind-mounted DIRECTORY (see docker-compose.yml) instead of the bare

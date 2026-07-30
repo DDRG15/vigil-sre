@@ -329,3 +329,91 @@ class HistoryRecorder:
                 "metric=history_write_failures_total value=1 reason=prune",
                 exc,
             )
+
+
+# --------------------------------------------------------------------- Reporting
+#
+# Read-only aggregates for the --report CLI flag (an earlier release). These are plain
+# functions, not HistoryRecorder methods: they never write, so they don't
+# need the disabled-on-init-failure state machine that guards the write
+# path, and keeping them separate makes that boundary visible at a glance.
+#
+# Both open and close their own connection rather than reusing a shared one
+# — --report is a one-shot CLI invocation, not a long-lived process, so
+# there is no connection to amortise the cost across.
+
+def uptime_pct(db_path: Path, url: str, since: str) -> float | None:
+    """
+    Percentage of *url*'s probes since *since* (an ISO-8601 UTC string,
+    inclusive) that were not DOWN. Returns None when the window has zero
+    rows for this target — the caller must render that as "no data", never
+    as 0%, which would misreport a target nobody has probed yet as a target
+    that was down for the entire window.
+
+    DEGRADED counts as up. This mirrors the semantics already established
+    everywhere else in this project: a DEGRADED alert is titled "Up But
+    Hurting" (main.py's DiscordNotifier payload), and diagnostics.py treats
+    DEGRADED as a performance signal, not an availability one. Uptime is the
+    availability SLI; latency_percentiles() below is the performance SLI.
+    Counting DEGRADED as down would make "slow but reachable" indistinguishable
+    from "unreachable", collapsing two different signals into one number.
+
+    Returns None (not a crash) when history.db has no schema yet — running
+    --report before the first probe cycle has ever recorded anything is a
+    real sequence (a freshly deployed instance, or an operator checking the
+    report before the first `sleep 60` loop iteration), and "no data" is the
+    honest answer, not a stack trace.
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        row = con.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN status != 'DOWN' THEN 1 ELSE 0 END) "
+            "FROM probe_results WHERE url = ? AND checked_at >= ?",
+            (url, since),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # no such table -- history.db predates any recorded run
+    finally:
+        con.close()
+    total, up = row
+    if not total:
+        return None
+    return (up / total) * 100.0
+
+
+def latency_percentiles(db_path: Path, url: str, since: str) -> dict[str, float] | None:
+    """
+    p50/p95 TTFB (milliseconds) for *url* since *since*. Returns None when
+    there are no rows with a non-NULL ttfb_ms in the window — a target that
+    was DOWN for the entire window has nothing to measure, and a fabricated
+    0ms reads as suspiciously fast rather than as absent.
+
+    PERCENT_RANK() is a SQLite window function (3.25+, confirmed present in
+    the runtime this project targets) — the same query shape the design note measured
+    at 118ms over 20,000 rows before choosing SQLite over a heavier engine.
+
+    Returns None (not a crash) when history.db has no schema yet — see
+    uptime_pct()'s docstring for why that is a real, expected sequence.
+    """
+    con = sqlite3.connect(db_path)
+    try:
+        row = con.execute(
+            """
+            SELECT MAX(CASE WHEN pr <= 0.50 THEN ttfb_ms END) AS p50,
+                   MAX(CASE WHEN pr <= 0.95 THEN ttfb_ms END) AS p95
+            FROM (
+                SELECT ttfb_ms, PERCENT_RANK() OVER (ORDER BY ttfb_ms) AS pr
+                FROM probe_results
+                WHERE url = ? AND checked_at >= ? AND ttfb_ms IS NOT NULL
+            )
+            """,
+            (url, since),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # no such table -- history.db predates any recorded run
+    finally:
+        con.close()
+    p50, p95 = row
+    if p50 is None:
+        return None
+    return {"p50_ttfb_ms": p50, "p95_ttfb_ms": p95}

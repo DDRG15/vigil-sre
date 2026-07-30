@@ -6,8 +6,9 @@ Coverage:
   B. StateManager              — 10 tests  (async) — includes invariant checks
   C. _probe_once()             —  6 tests  (async, aioresponses mock)
   D. _probe_with_backoff()     —  3 tests  (async, sleep call count verified)
-  E. _build_discord_payload()  —  3 tests  (sync)
+  E. Payload builders          —  7 tests  (sync, Discord + Slack, an earlier release)
   F. check_url() pipeline      —  5 tests  (async, full orchestration)
+  I2. _generate_report()       —  6 tests  (an earlier release, incl. subprocess end-to-end)
   J. Logging configuration     —  3 tests  (sync) — an earlier release log rotation, incl. subprocess wiring check
 
 Run: pytest tests/ -v
@@ -30,6 +31,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
@@ -41,7 +43,7 @@ from aioresponses import CallbackResult, aioresponses
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main
-from diagnostics import ConnectionSample
+from diagnostics import ConnectionSample, ProbePhases
 
 from main import (
     StateManager,
@@ -1601,6 +1603,140 @@ def test_exit_code_strict_zero_down_is_zero() -> None:
 def test_exit_code_strict_with_down_is_one() -> None:
     assert _exit_code(strict=True, down_count=1) == 1
     assert _exit_code(strict=True, down_count=3) == 1
+
+
+# =============================================================================
+# I2. _generate_report() / --report (an earlier release)
+#
+# The risk this section guards against is arithmetic and honesty about the
+# retention window, not exceptions -- see tests/test_history.py section F for
+# the hand-calculated uptime_pct()/latency_percentiles() checks this builds on.
+# =============================================================================
+
+
+async def test_generate_report_shows_no_data_for_a_target_with_no_history(tmp_path: Path) -> None:
+    """A target that exists in targets.yaml but has never been probed must
+    read 'no data' in every column -- not 0%, which would misreport it as
+    having been down for the entire window."""
+    db_path = tmp_path / "history.db"
+    main.HistoryRecorder(db_path)  # schema only, no rows
+    report = main._generate_report(
+        [Target(url=TARGET_URL)], history_path=db_path, retention_days=30,
+        now=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+    assert TARGET_URL in report
+    assert "no data" in report
+
+
+async def test_generate_report_with_no_history_db_at_all_shows_no_data(tmp_path: Path) -> None:
+    """Reproduced live: `--report` on a freshly deployed instance, before the
+    first probe cycle has ever run, points at a history.db with no schema at
+    all. Confirmed this crashed with 'sqlite3.OperationalError: no such table'
+    before the fix -- must read 'no data', not a traceback."""
+    db_path = tmp_path / "history.db"  # never touched -- no HistoryRecorder call
+    report = main._generate_report(
+        [Target(url=TARGET_URL)], history_path=db_path, retention_days=30,
+        now=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+    assert TARGET_URL in report
+    assert "no data" in report
+
+
+async def test_generate_report_shows_seeded_uptime_and_percentiles(tmp_path: Path) -> None:
+    """Numbers in the rendered table must match a hand-seeded, hand-calculated
+    dataset -- not just 'a table got printed'."""
+    db_path = tmp_path / "history.db"
+    rec = main.HistoryRecorder(db_path)
+    now = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    checked_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    outcomes = [
+        main.CheckOutcome(
+            url=TARGET_URL, status="UP", checked_at=checked_at,
+            phases=ProbePhases(
+                url=TARGET_URL, http_status=200, ttfb_ms=100.0,
+                transfer_ms=1.0, body_bytes=100, rtt_ms=10.0,
+            ),
+        )
+        for _ in range(9)
+    ] + [main.CheckOutcome(url=TARGET_URL, status="DOWN", checked_at=checked_at)]
+    await rec.record_run(checked_at, outcomes)
+
+    report = main._generate_report(
+        [Target(url=TARGET_URL)], history_path=db_path, retention_days=30, now=now,
+    )
+    assert "90.0%" in report   # 9/10 non-DOWN
+    assert "100ms" in report  # p50 == p95 == 100 when 9 of 10 rows are 100ms
+
+
+async def test_generate_report_omits_windows_beyond_retention(tmp_path: Path) -> None:
+    """HISTORY_RETENTION_DAYS=1 must not print an 'Up 30d' column -- claiming
+    30 days of visibility when only 1 day is actually retained misreports
+    what the data can support."""
+    db_path = tmp_path / "history.db"
+    main.HistoryRecorder(db_path, retention_days=1)
+    report = main._generate_report(
+        [Target(url=TARGET_URL)], history_path=db_path, retention_days=1,
+        now=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+    assert "Up 1d" in report
+    assert "Up 7d" not in report
+    assert "Up 30d" not in report
+    assert "retention: 1d" in report
+
+
+async def test_generate_report_never_opens_an_http_session(tmp_path: Path) -> None:
+    """--report is strictly read-only over history.db. It must never
+    construct an aiohttp.ClientSession -- doing so would mean this 'read a
+    report' code path accidentally probed a live target."""
+    db_path = tmp_path / "history.db"
+    main.HistoryRecorder(db_path)
+    with patch("aiohttp.ClientSession") as mock_session:
+        main._generate_report(
+            [Target(url=TARGET_URL)], history_path=db_path, retention_days=30,
+            now=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        )
+    mock_session.assert_not_called()
+
+
+def test_report_flag_end_to_end_exits_zero_without_probing(tmp_path: Path) -> None:
+    """Full entry point: `python main.py --report` against a real, seeded
+    history.db must print the table and exit 0 -- and must return in well
+    under one probe timeout, which is what it would take if it had ignored
+    the flag and attempted a normal run against a nonexistent target."""
+    db_path = tmp_path / "history.db"
+    rec = main.HistoryRecorder(db_path)
+    checked_at = "2026-07-30T00:00:00Z"
+    asyncio.run(rec.record_run(checked_at, [
+        main.CheckOutcome(
+            url=TARGET_URL, status="UP", checked_at=checked_at,
+            phases=ProbePhases(
+                url=TARGET_URL, http_status=200, ttfb_ms=100.0,
+                transfer_ms=1.0, body_bytes=100, rtt_ms=10.0,
+            ),
+        )
+    ]))
+    (tmp_path / "targets.yaml").write_text(
+        f"targets:\n  - {TARGET_URL}\n", encoding="utf-8"
+    )
+
+    project_root = Path(__file__).resolve().parent.parent
+    start = time.monotonic()
+    result = subprocess.run(
+        [sys.executable, str(project_root / "main.py"), "--report"],
+        cwd=str(tmp_path),
+        env={**os.environ, "PYTHONPATH": str(project_root)},
+        capture_output=True, text=True, timeout=60,
+    )
+    elapsed = time.monotonic() - start
+
+    assert result.returncode == 0, result.stderr
+    assert TARGET_URL in result.stdout
+    assert "90.0%" not in result.stdout  # sanity: this run is 1/1 UP, not the other test's data
+    assert "100.0%" in result.stdout
+    assert elapsed < 5.0, (
+        f"--report took {elapsed:.1f}s -- a real probe attempt (REQUEST_TIMEOUT_S=5, "
+        f"3 retries) would take far longer, suggesting the flag was ignored."
+    )
 
 
 # =============================================================================

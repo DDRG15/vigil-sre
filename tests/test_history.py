@@ -7,6 +7,7 @@ Coverage:
   C. prune()                      — 4 tests
   D. _retention_days_from_env()   — 4 tests
   E. Metric contract (caplog)     — 3 tests
+  F. uptime_pct() / latency_percentiles() (an earlier release) — 10 tests
 
 Reviewer notes
 --------------
@@ -38,6 +39,8 @@ from history import (
     CheckOutcome,
     HistoryRecorder,
     _retention_days_from_env,
+    latency_percentiles,
+    uptime_pct,
 )
 
 URL = "https://example.com"
@@ -338,3 +341,136 @@ async def test_prune_logs_rows_pruned_metric(tmp_path: Path, caplog) -> None:
         "event_type=metric metric=history_rows_pruned_total value=1" in r.message
         for r in caplog.records
     )
+
+
+# =============================================================================
+# F. uptime_pct() / latency_percentiles() (an earlier release — --report)
+#
+# The risk this section guards against is arithmetic, not exceptions: a
+# wrong uptime number looks exactly like a right one until a human trusts it
+# and gets burned. Every assertion below is checked against a value computed
+# by hand, not against whatever the implementation happens to produce.
+# =============================================================================
+
+OLD_CUTOFF = "2020-01-01T00:00:00Z"
+
+
+async def test_uptime_pct_hand_calculated(tmp_path: Path) -> None:
+    """7 UP + 2 DEGRADED + 1 DOWN out of 10 rows must read exactly 90.0 —
+    not approximately, not rounded early."""
+    db_path = tmp_path / "history.db"
+    rec = HistoryRecorder(db_path)
+    statuses = ["UP"] * 7 + ["DEGRADED"] * 2 + ["DOWN"] * 1
+    outcomes = [
+        CheckOutcome(url=URL, status=s, checked_at="2026-07-30T00:00:00Z",
+                     phases=_phases() if s != "DOWN" else None)
+        for s in statuses
+    ]
+    await rec.record_run("2026-07-30T00:00:00Z", outcomes)
+    assert uptime_pct(db_path, URL, OLD_CUTOFF) == 90.0
+
+
+async def test_uptime_pct_degraded_counts_as_up(tmp_path: Path) -> None:
+    """Decision this module documents explicitly: DEGRADED is an availability
+    success (up and hurting), not a down. All-DEGRADED must read 100%, not 0%."""
+    db_path = tmp_path / "history.db"
+    rec = HistoryRecorder(db_path)
+    outcomes = [
+        CheckOutcome(url=URL, status="DEGRADED", checked_at="2026-07-30T00:00:00Z", phases=_phases())
+        for _ in range(5)
+    ]
+    await rec.record_run("2026-07-30T00:00:00Z", outcomes)
+    assert uptime_pct(db_path, URL, OLD_CUTOFF) == 100.0
+
+
+async def test_uptime_pct_no_rows_returns_none_not_zero(tmp_path: Path) -> None:
+    """A target with zero rows in the window must read as 'no data' upstream,
+    never as 0% -- 0% reads as 'down the entire window', which is a stronger
+    and false claim about a target nobody has probed yet."""
+    db_path = tmp_path / "history.db"
+    HistoryRecorder(db_path)  # only initialises the schema, writes nothing
+    assert uptime_pct(db_path, URL, OLD_CUTOFF) is None
+
+
+async def test_uptime_pct_no_schema_yet_returns_none_not_a_crash(tmp_path: Path) -> None:
+    """Reproduced live: running --report before HistoryRecorder has ever been
+    constructed (a freshly deployed instance, or a check before the first
+    probe cycle) points at a history.db with no schema at all -- 'no such
+    table', not just 'no rows'. That must read as no data too, not a
+    traceback surfaced straight to the operator's terminal."""
+    db_path = tmp_path / "history.db"  # never touched -- no schema, maybe no file
+    assert uptime_pct(db_path, URL, OLD_CUTOFF) is None
+
+
+async def test_latency_percentiles_no_schema_yet_returns_none_not_a_crash(tmp_path: Path) -> None:
+    db_path = tmp_path / "history.db"
+    assert latency_percentiles(db_path, URL, OLD_CUTOFF) is None
+
+
+async def test_uptime_pct_excludes_rows_before_since(tmp_path: Path) -> None:
+    """A row outside the requested window must not count toward the
+    percentage at all -- not as up, not as down."""
+    db_path = tmp_path / "history.db"
+    rec = HistoryRecorder(db_path)
+    await rec.record_run("2020-01-01T00:00:00Z", [
+        CheckOutcome(url=URL, status="DOWN", checked_at="2020-01-01T00:00:00Z")
+    ])
+    await rec.record_run("2026-07-30T00:00:00Z", [
+        CheckOutcome(url=URL, status="UP", checked_at="2026-07-30T00:00:00Z", phases=_phases())
+    ])
+    # Window starts after the 2020 DOWN row -- only the 2026 UP row counts.
+    assert uptime_pct(db_path, URL, "2026-01-01T00:00:00Z") == 100.0
+
+
+async def test_latency_percentiles_hand_calculated(tmp_path: Path) -> None:
+    """20 rows with ttfb_ms = 1..20ms. PERCENT_RANK over n=20 puts p50 (rank
+    <=0.50) at the 10th-ranked value and p95 (rank <=0.95) at the 19th --
+    computed by hand, not by trusting the query to be self-consistent."""
+    db_path = tmp_path / "history.db"
+    rec = HistoryRecorder(db_path)
+    outcomes = [
+        CheckOutcome(url=URL, status="UP", checked_at="2026-07-30T00:00:00Z",
+                     phases=_phases(ttfb_ms=float(ms)))
+        for ms in range(1, 21)
+    ]
+    await rec.record_run("2026-07-30T00:00:00Z", outcomes)
+    result = latency_percentiles(db_path, URL, OLD_CUTOFF)
+    assert result == {"p50_ttfb_ms": 10.0, "p95_ttfb_ms": 19.0}
+
+
+async def test_latency_percentiles_no_rows_returns_none(tmp_path: Path) -> None:
+    db_path = tmp_path / "history.db"
+    HistoryRecorder(db_path)
+    assert latency_percentiles(db_path, URL, OLD_CUTOFF) is None
+
+
+async def test_latency_percentiles_ignores_down_rows_with_null_ttfb(tmp_path: Path) -> None:
+    """A DOWN row has phases=None -> ttfb_ms NULL in the schema. It must not
+    be treated as 0ms (impossibly fast) or crash the window function -- it
+    is simply absent from the sample."""
+    db_path = tmp_path / "history.db"
+    rec = HistoryRecorder(db_path)
+    outcomes = [CheckOutcome(url=URL, status="DOWN", checked_at="2026-07-30T00:00:00Z")]
+    outcomes += [
+        CheckOutcome(url=URL, status="UP", checked_at="2026-07-30T00:00:00Z",
+                     phases=_phases(ttfb_ms=50.0))
+        for _ in range(3)
+    ]
+    await rec.record_run("2026-07-30T00:00:00Z", outcomes)
+    result = latency_percentiles(db_path, URL, OLD_CUTOFF)
+    assert result == {"p50_ttfb_ms": 50.0, "p95_ttfb_ms": 50.0}
+
+
+async def test_latency_percentiles_excludes_rows_before_since(tmp_path: Path) -> None:
+    db_path = tmp_path / "history.db"
+    rec = HistoryRecorder(db_path)
+    await rec.record_run("2020-01-01T00:00:00Z", [
+        CheckOutcome(url=URL, status="UP", checked_at="2020-01-01T00:00:00Z",
+                     phases=_phases(ttfb_ms=9999.0))
+    ])
+    await rec.record_run("2026-07-30T00:00:00Z", [
+        CheckOutcome(url=URL, status="UP", checked_at="2026-07-30T00:00:00Z",
+                     phases=_phases(ttfb_ms=50.0))
+    ])
+    result = latency_percentiles(db_path, URL, "2026-01-01T00:00:00Z")
+    assert result == {"p50_ttfb_ms": 50.0, "p95_ttfb_ms": 50.0}

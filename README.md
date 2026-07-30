@@ -213,7 +213,7 @@ infrastructure.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               190-test suite covering probes, state, alerts, diagnostics, history
+├── tests/               206-test suite covering probes, state, alerts, diagnostics, history
 ├── .github/             CI: pytest, then docker build + run a real health-check cycle
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
@@ -228,7 +228,7 @@ infrastructure.
 
 We do not ship what we cannot prove works.
 
-190 automated tests cover every component in isolation: target loading (including
+206 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -413,10 +413,36 @@ FROM (SELECT url, ttfb_ms, rtt_ms,
       FROM probe_results)
 GROUP BY url;
 
--- Uptime % per target
-SELECT url, 100.0 * SUM(status = 'UP') / COUNT(*) AS uptime_pct
+-- Uptime % per target — DEGRADED counts as up (it is "up and hurting", not down;
+-- see "Reading the history: --report" below for why)
+SELECT url, 100.0 * SUM(status != 'DOWN') / COUNT(*) AS uptime_pct
 FROM probe_results GROUP BY url;
 ```
+
+### Reading the history: `--report`
+
+```bash
+python main.py --report
+```
+
+Prints a table — uptime % and TTFB p50/p95 per target, for every window (1d/7d/30d)
+that fits inside `HISTORY_RETENTION_DAYS` — and exits. It never probes anything: it
+is a pure read over `history.db`, safe to run as often as you want, including from
+a second, unrelated cron job that only builds reports.
+
+**DEGRADED counts as up.** Uptime is an availability question; a DEGRADED target
+answered every request, just slowly. Folding it into "down" would make "up and
+hurting" indistinguishable from "unreachable" — two different signals collapsed
+into one number. Latency percentiles are where "hurting" actually shows up.
+
+**A window longer than the configured retention is never shown.** If
+`HISTORY_RETENTION_DAYS=7`, there is no `Up 30d` column, because there is no 30
+days of data to compute it from — the alternative is a column that quietly means
+something other than what its header says.
+
+**A target with no probes yet in the window reads `no data`, never `0%`.** Zero
+percent is a claim that the target was down for the entire window; a target
+nobody has probed yet has made no such claim.
 
 ### Isolation boundary: history can fail; alerting cannot
 
