@@ -176,6 +176,47 @@ def test_load_targets_boolean_override_exits(tmp_path: Path, field: str) -> None
         load_targets(f)
 
 
+@pytest.mark.parametrize("bad", ["0", "-5"])
+def test_load_targets_non_positive_timeout_exits(tmp_path: Path, bad: str) -> None:
+    """aiohttp treats ClientTimeout(total=0) (and negatives) as NO timeout at
+    all: a target that hangs would freeze the whole run's asyncio.gather
+    forever, and every other target with it. (audit finding)"""
+    f = tmp_path / "targets.yaml"
+    f.write_text(f"targets:\n  - url: https://x.com\n    timeout_s: {bad}\n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        load_targets(f)
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("timeout_s", "0"), ("timeout_s", "-5"),
+    ("degraded_ttfb_ms", "0"), ("degraded_ttfb_ms", "-1"),
+    ("degraded_rtt_ms", "0"), ("degraded_rtt_ms", "-100"),
+    ("expected_status", "999"), ("expected_status", "-1"),
+])
+def test_load_targets_out_of_range_override_exits(tmp_path: Path, field: str, bad: str) -> None:
+    """_validated_numeric_field checked type but not range: a threshold of 0
+    or below fires on every healthy probe (SLOW_RESPONSE against a 12ms
+    response with degraded_ttfb_ms=0, reproduced live), producing exactly the
+    chronic false positives per-target overrides exist to eliminate -- the
+    anti-alert-fatigue feature generating alert fatigue."""
+    f = tmp_path / "targets.yaml"
+    f.write_text(f"targets:\n  - url: https://x.com\n    {field}: {bad}\n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        load_targets(f)
+
+
+def test_load_targets_warns_when_timeout_blows_the_run_budget(tmp_path: Path, caplog) -> None:
+    """timeout_s=30 has a worst case of 96s (3 attempts + backoff) against
+    RUN_BUDGET_S=60s -- not rejected (a legitimately slow endpoint is a valid
+    use case), but the operator must see what a full outage on this target
+    costs the rest of the run."""
+    f = tmp_path / "targets.yaml"
+    f.write_text("targets:\n  - url: https://x.com\n    timeout_s: 30\n", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        load_targets(f)
+    assert any("RUN_BUDGET_S" in r.message for r in caplog.records)
+
+
 def test_load_targets_resolves_env_var_expect_substring(tmp_path: Path, monkeypatch) -> None:
     """${VAR_NAME} in expect_substring (an earlier release) resolves from the environment
     at load time: the real value is used for matching, and expect_substring_display
@@ -516,6 +557,18 @@ async def test_probe_once_503() -> None:
             with pytest.raises(_ProbeFailure) as exc_info:
                 await _probe_once(session, TARGET_URL)
     assert "503" in exc_info.value.detail
+
+
+async def test_probe_once_status_mismatch_names_the_expectation() -> None:
+    """'HTTP 200' as a DOWN reason is undecipherable at 3am on a target whose
+    expected_status is an override (an earlier release) -- the message must name what
+    was expected, not just what came back. (audit finding)"""
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200)
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(_ProbeFailure) as exc_info:
+                await _probe_once(session, TARGET_URL, expected_status=204)
+    assert "expected 204" in exc_info.value.detail
 
 
 async def test_probe_once_404() -> None:
@@ -1217,7 +1270,7 @@ async def test_check_url_returns_down_status_when_confirmed(tmp_path: Path) -> N
                     with patch("main.send_discord_alert", new_callable=AsyncMock):
                         result = await check_url(TARGET_URL, session, sm)
     assert result.status == "DOWN"
-    assert result.error == "HTTP 503"
+    assert result.error == "HTTP 503 (expected 200)"
     assert result.phases is None
 
 
@@ -1241,7 +1294,7 @@ async def test_check_url_returns_preserved_status_during_hysteresis_pending(tmp_
                     with patch("main.send_discord_alert", new_callable=AsyncMock):
                         result = await check_url(TARGET_URL, session, sm)
     assert result.status == "UP"
-    assert result.error == "HTTP 503"
+    assert result.error == "HTTP 503 (expected 200)"
 
 
 def test_state_current_status_reflects_persisted_value(tmp_path: Path) -> None:

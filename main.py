@@ -274,17 +274,25 @@ def _resolve_expect_substring(raw: str, path: Path, url: str) -> tuple[str, str 
 
 
 def _validated_numeric_field(
-    entry: dict, key: str, path: Path, *, numeric_types: tuple[type, ...]
+    entry: dict, key: str, path: Path, *,
+    numeric_types: tuple[type, ...],
+    minimum: int | float | None = None,
+    maximum: int | float | None = None,
 ) -> int | float | None:
     """
-    Return entry[key] if absent or already a plain number of an allowed
-    type, else exit with a message naming the fix.
+    Return entry[key] if absent, or a plain number of an allowed type within
+    the allowed range; otherwise exit with a message naming the fix.
 
     ``bool`` is explicitly rejected even though it is a subtype of ``int`` in
     Python — YAML's ``true``/``false`` must never silently become 1/0 for a
-    numeric override. Same failure mode as the unvalidated expect_substring
-    that crashed a probe every run before it was caught at load time: fail
-    fast here instead of downstream inside the probe loop.
+    numeric override.
+
+    Range matters as much as type. aiohttp reads ClientTimeout(total=0) as
+    "no timeout at all", so a timeout_s of 0 turns a bounded probe into one
+    that hangs forever on an unresponsive target — freezing the whole run's
+    asyncio.gather and every other target with it. A threshold of 0 or less
+    fires on every healthy probe, producing exactly the chronic false
+    positives per-target overrides exist to eliminate.
     """
     value = entry.get(key)
     if value is None:
@@ -294,6 +302,20 @@ def _validated_numeric_field(
             "'%s' target %r has a non-numeric %s (%r). Remove any quotes so "
             "YAML parses it as a number, e.g.  %s: 10.",
             path, entry.get("url"), key, value, key,
+        )
+        sys.exit(1)
+    if minimum is not None and value < minimum:
+        logger.critical(
+            "'%s' target %r has %s=%r, below the minimum of %s. Values at or "
+            "below zero disable the protection this field configures instead "
+            "of tightening it.",
+            path, entry.get("url"), key, value, minimum,
+        )
+        sys.exit(1)
+    if maximum is not None and value > maximum:
+        logger.critical(
+            "'%s' target %r has %s=%r, above the maximum of %s.",
+            path, entry.get("url"), key, value, maximum,
         )
         sys.exit(1)
     return value
@@ -363,17 +385,38 @@ def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
             if expect is not None:
                 expect, expect_display = _resolve_expect_substring(expect, path, str(entry["url"]))
             expected_status = _validated_numeric_field(
-                entry, "expected_status", path, numeric_types=(int,)
+                entry, "expected_status", path, numeric_types=(int,),
+                minimum=100, maximum=599,
             )
             timeout_s = _validated_numeric_field(
-                entry, "timeout_s", path, numeric_types=(int, float)
+                entry, "timeout_s", path, numeric_types=(int, float),
+                minimum=0.1,
             )
             degraded_ttfb_ms = _validated_numeric_field(
-                entry, "degraded_ttfb_ms", path, numeric_types=(int, float)
+                entry, "degraded_ttfb_ms", path, numeric_types=(int, float),
+                minimum=0.1,
             )
             degraded_rtt_ms = _validated_numeric_field(
-                entry, "degraded_rtt_ms", path, numeric_types=(int, float)
+                entry, "degraded_rtt_ms", path, numeric_types=(int, float),
+                minimum=0.1,
             )
+            if timeout_s is not None:
+                # Not an abort: a legitimately slow endpoint is a valid use
+                # case for a longer timeout_s, but the operator needs to see
+                # what it costs -- a full outage on this target now stretches
+                # the whole run past RUN_BUDGET_S, risking overlapping runs.
+                worst_case_s = (
+                    timeout_s * RETRY_ATTEMPTS
+                    + RETRY_BACKOFF_BASE ** 1 + RETRY_BACKOFF_BASE ** 2
+                )
+                if worst_case_s > RUN_BUDGET_S:
+                    logger.warning(
+                        "'%s' target %r has timeout_s=%s: worst case %.0fs "
+                        "(%d attempts + backoff) exceeds RUN_BUDGET_S=%.0fs, so "
+                        "a full outage on this target stretches the whole run.",
+                        path, entry["url"], timeout_s, worst_case_s,
+                        RETRY_ATTEMPTS, RUN_BUDGET_S,
+                    )
             targets.append(Target(
                 url=str(entry["url"]),
                 expect_substring=expect,
@@ -941,7 +984,7 @@ async def _probe_once(
             trace_request_ctx=trace_ctx,
         ) as resp:
             if resp.status != expected_status:
-                raise _ProbeFailure(f"HTTP {resp.status}")
+                raise _ProbeFailure(f"HTTP {resp.status} (expected {expected_status})")
 
             # On a redirect chain, the TraceConfig hooks overwrite dns_ms/
             # connect_total_ms on every hop and keep only the last one, but
