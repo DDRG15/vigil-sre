@@ -40,3 +40,5 @@ Thumbs.db
 
 # Protocolo SDD interno — privado, nunca al repo publico
 .claude/
+CLAUDE.md
+INSTRUCCIONES.md
