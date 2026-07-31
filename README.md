@@ -213,7 +213,7 @@ infrastructure.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               256-test suite covering probes, state, alerts, diagnostics, history
+├── tests/               265-test suite covering probes, state, alerts, diagnostics, history
 ├── .github/             CI: pytest, then docker build + run a real health-check cycle
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
@@ -228,7 +228,7 @@ infrastructure.
 
 We do not ship what we cannot prove works.
 
-256 automated tests cover every component in isolation: target loading (including
+265 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -530,6 +530,48 @@ every time the service recovers or the container restarts.
 leave the old threshold recorded forever, and the *next* expiry would skip its
 30-day warning — the monitor going quiet exactly at the notice that gives you
 the most room to act.
+
+---
+
+## Who watches the watchman
+
+Every failure mode above is one this service can report on itself. There is
+exactly one it cannot: its own death. If the process crashes, the container
+enters a restart loop, or the host powers off, nobody is left to send the
+alert — and total silence is indistinguishable from everything being fine.
+That is the failure mode this project has now been bitten by three separate
+times in its own audits, and it is structural: no healthcheck inside a box
+survives the box going away.
+
+```bash
+# .env — point at any watchdog that expects a ping on a schedule
+HEARTBEAT_URL=https://hc-ping.com/your-uuid-here
+```
+
+vigil-sre pings once per **completed run**. The watchdog alerts when the
+pings stop.
+
+**It pings whether or not targets are down.** This watches the monitor, not
+the targets — the same distinction that makes a bare `python main.py` exit 0
+while a target is down. Gating the heartbeat on target health would make a
+genuine outage also trip the watchdog, paging *"your monitor is dead"* on top
+of the real incident, at the exact moment the on-call is least able to tell
+the two apart.
+
+**The ping is the last thing a run does**, after probes, alerts, state and
+history. Pinging any earlier would tell the watchdog "alive and well" about a
+cycle that had not finished — the one lie a dead-man's switch must never be
+able to tell.
+
+**A failed ping is logged and forgotten, never retried.** The next run is 60
+seconds away and watchdog grace periods are minutes, so a single missed ping
+self-heals long before it matters. A watchdog that is down cannot take the
+real monitoring with it.
+
+Set the watchdog's expected period to your run interval (60s in the shipped
+`docker-compose.yml`) with a grace period of a few cycles. Leave
+`HEARTBEAT_URL` unset to disable it entirely — unconfigured is silent, not an
+error.
 
 ---
 

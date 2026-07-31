@@ -172,6 +172,11 @@ STATE_SCHEMA_VERSION: int = 4   # bump whenever state.json's on-disk shape chang
 # were never supposed to overlap in the first place.
 RUN_BUDGET_S: float = 60.0
 
+# Dead-man's switch ping timeout. Deliberately short and never retried: the
+# next run is 60s away and watchdog grace periods are minutes, so a missed
+# ping self-heals. Spending run budget on it would defeat the purpose.
+HEARTBEAT_TIMEOUT_S: float = 5.0
+
 
 # ---------------------------------------------------------------------------
 # YAML target loader
@@ -1356,6 +1361,68 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown_event: as
 # Main async entry point
 # ---------------------------------------------------------------------------
 
+async def _send_heartbeat(down_count: int) -> None:
+    """
+    Ping the external dead-man's switch to say this run completed (an earlier release).
+
+    Who watches the watchman: every other failure mode in this service is one
+    it can report on itself. This one is not. If the process dies, the
+    container crash-loops, or the host powers off, nobody is left to send an
+    alert about it — and total silence looks exactly like "everything is
+    fine". An external watchdog (healthchecks.io or equivalent) inverts that:
+    it expects a ping on a schedule and alerts when one stops arriving.
+
+    Two decisions worth being explicit about:
+
+    **The ping fires on run COMPLETION, not on all-targets-healthy.** Targets
+    being DOWN is this monitor's normal operating condition — the same
+    reasoning that makes a bare `python main.py` exit 0 with targets down.
+    Gating the heartbeat on target health would make a genuine outage ALSO
+    trip the watchdog, paging "your monitor is dead" on top of the real
+    incident, at the exact moment the on-call is least able to tell the two
+    apart. This watches the monitor, not the targets.
+
+    **A failed ping is not retried.** The next run is 60 seconds away and
+    watchdog grace periods are measured in minutes, so a single missed ping
+    self-heals long before it matters. Retrying would spend run budget on a
+    signal that repairs itself — and the whole point of this function is to
+    cost the run as close to nothing as possible.
+
+    Never raises. A watchdog that is down must not be able to take the real
+    monitoring with it — the same isolation boundary HistoryRecorder holds.
+    """
+    url = os.getenv("HEARTBEAT_URL")
+    if not url:
+        return  # not configured is a choice, not an error
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                json={"down_count": down_count},
+                timeout=aiohttp.ClientTimeout(total=HEARTBEAT_TIMEOUT_S),
+            ) as resp:
+                if resp.status < 400:
+                    logger.info(
+                        "Heartbeat sent. event_type=metric "
+                        "metric=heartbeat_sent_total value=1"
+                    )
+                    return
+                logger.warning(
+                    "Heartbeat returned HTTP %s — the dead-man's switch may "
+                    "fire even though this run completed. event_type=metric "
+                    "metric=heartbeat_failures_total value=1 reason=http_%s",
+                    resp.status, resp.status,
+                )
+    except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+        logger.warning(
+            "Heartbeat failed (%s: %s) — the dead-man's switch may fire even "
+            "though this run completed. event_type=metric "
+            "metric=heartbeat_failures_total value=1 reason=%s",
+            type(exc).__name__, exc, type(exc).__name__,
+        )
+
+
 def _warn_if_over_budget(duration_s: float) -> None:
     """
     Log a WARNING when a completed run's wall-clock duration exceeded
@@ -1502,6 +1569,13 @@ async def run_health_checks(
         up_count, degraded_count, down_count, duration_s, state_path.resolve(),
     )
     logger.info("=" * 64)
+
+    # Last thing in the run, on purpose: everything that makes this a COMPLETE
+    # cycle -- probes, alerts, state, history -- has already happened. Pinging
+    # any earlier would tell the watchdog "alive and well" about a cycle that
+    # had not finished, which is the one lie a dead-man's switch must never be
+    # able to tell.
+    await _send_heartbeat(down_count)
 
     return down_count
 

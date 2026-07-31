@@ -1983,6 +1983,107 @@ def test_report_flag_end_to_end_exits_zero_without_probing(tmp_path: Path) -> No
 
 
 # =============================================================================
+# K. Dead-man's switch (an earlier release)
+#
+# The property under test is not "does it ping" but "does it ping about the
+# right thing". A heartbeat that fires before a run finishes, or that stays
+# silent because a target is down, is worse than no heartbeat at all: it
+# either lies about liveness or pages for the wrong incident.
+# =============================================================================
+
+HEARTBEAT_URL = "https://hc-ping.com/test-uuid"
+
+
+async def test_heartbeat_pings_after_a_completed_run(monkeypatch) -> None:
+    monkeypatch.setenv("HEARTBEAT_URL", HEARTBEAT_URL)
+    with aioresponses() as mock:
+        mock.post(HEARTBEAT_URL, status=200)
+        await main._send_heartbeat(down_count=0)
+        assert len(mock.requests) == 1
+
+
+async def test_heartbeat_pings_even_when_targets_are_down(monkeypatch) -> None:
+    """The dead-man's switch watches the MONITOR, not the targets. Gating it
+    on target health would make a genuine outage also trip the watchdog --
+    paging 'your monitor is dead' on top of the real incident, exactly when
+    the on-call is least able to tell the two apart."""
+    monkeypatch.setenv("HEARTBEAT_URL", HEARTBEAT_URL)
+    with aioresponses() as mock:
+        mock.post(HEARTBEAT_URL, status=200)
+        await main._send_heartbeat(down_count=5)
+        assert len(mock.requests) == 1
+
+
+async def test_heartbeat_is_silent_when_unconfigured(monkeypatch, caplog) -> None:
+    """Not configured is a choice, not an error -- no request, no warning."""
+    monkeypatch.delenv("HEARTBEAT_URL", raising=False)
+    with aioresponses() as mock:
+        with caplog.at_level("WARNING"):
+            await main._send_heartbeat(down_count=0)
+    assert len(mock.requests) == 0
+    assert not any("eartbeat" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("failure", [
+    {"status": 500},
+    {"status": 404},
+    {"exception": asyncio.TimeoutError()},
+    {"exception": aiohttp.ClientConnectionError("watchdog unreachable")},
+])
+async def test_heartbeat_failure_never_propagates(monkeypatch, caplog, failure) -> None:
+    """A watchdog that is down must not take the real monitoring with it --
+    the same isolation boundary HistoryRecorder holds."""
+    monkeypatch.setenv("HEARTBEAT_URL", HEARTBEAT_URL)
+    with aioresponses() as mock:
+        mock.post(HEARTBEAT_URL, **failure)
+        with caplog.at_level("WARNING"):
+            await main._send_heartbeat(down_count=0)   # must not raise
+    assert any(
+        "metric=heartbeat_failures_total value=1" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_heartbeat_is_not_retried(monkeypatch) -> None:
+    """One attempt only. The next run is 60s away and watchdog grace periods
+    are minutes, so a missed ping self-heals; retrying would spend run budget
+    on a signal that repairs itself."""
+    monkeypatch.setenv("HEARTBEAT_URL", HEARTBEAT_URL)
+    with aioresponses() as mock:
+        mock.post(HEARTBEAT_URL, status=500)
+        await main._send_heartbeat(down_count=0)
+        assert len(mock.requests) == 1
+
+
+async def test_run_health_checks_pings_the_heartbeat_last(tmp_path: Path, monkeypatch) -> None:
+    """End-to-end ordering: the ping must land AFTER history has been written,
+    because that is what makes the cycle complete. Pinging earlier would tell
+    the watchdog 'alive and well' about a run that had not finished."""
+    monkeypatch.setenv("HEARTBEAT_URL", HEARTBEAT_URL)
+    order: list[str] = []
+
+    async def _record(*args, **kwargs):
+        order.append("history")
+
+    async def _heartbeat(*args, **kwargs):
+        order.append("heartbeat")
+
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200)
+        with patch("main.sample_connection", new_callable=AsyncMock, return_value=_HEALTHY_SAMPLE):
+            with patch("main.dispatch_alert", new_callable=AsyncMock):
+                with patch.object(main.HistoryRecorder, "record_run", _record):
+                    with patch("main._send_heartbeat", _heartbeat):
+                        await run_health_checks(
+                            targets=[TARGET_URL],
+                            state_path=tmp_path / "state.json",
+                            history_path=tmp_path / "history.db",
+                        )
+
+    assert order == ["history", "heartbeat"]
+
+
+# =============================================================================
 # J. Logging configuration (an earlier release)
 #
 # main.py wires RotatingFileHandler up via logging.basicConfig() at import
