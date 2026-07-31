@@ -586,7 +586,7 @@ Jinja2 + HTMX while this was still hypothetical. By the time it was built, it
 was two routes and two templates: FastAPI would have bought routing and
 validation nothing here needs while dragging in four more packages, and HTMX
 would have bought interactivity that came to ten lines of `fetch`. Three
-dependencies after many releases. The exit is written down: the day this grows
+dependencies. The exit is written down: the day this grows
 filtering, silencing or acknowledgement, both earn their place.
 
 ---
@@ -638,8 +638,8 @@ Every failure mode above is one this service can report on itself. There is
 exactly one it cannot: its own death. If the process crashes, the container
 enters a restart loop, or the host powers off, nobody is left to send the
 alert — and total silence is indistinguishable from everything being fine.
-That is the failure mode this project has now been bitten by three separate
-times in its own audits, and it is structural: no healthcheck inside a box
+That is the failure mode this project has been bitten by more than once, and
+it is structural: no healthcheck inside a box
 survives the box going away.
 
 ```bash

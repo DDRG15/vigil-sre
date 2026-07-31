@@ -48,11 +48,10 @@ jobs:
       - name: Verify the image can import every entrypoint it ships
         # A `docker build` succeeding proves nothing about whether the app can
         # start -- a build that COPYs three of six modules is a perfectly
-        # successful build. This step existed and would have caught the an earlier release
-        # break on the day it landed; it never ran, because CI had not run
-        # unpushed. Both entrypoints are named now, not just main: the image
-        # went a long time unable to import notifiers, api or dashboard while
-        # `import main` alone was the whole check.
+        # successful build, and this step is what catches it. Every entrypoint
+        # is named, not just main: an earlier revision shipped an image that
+        # could not import notifiers, api or dashboard while `import main`
+        # alone was the whole check.
         run: |
           docker run --rm --entrypoint python vigil-sre -c "import main; print('main OK')"
           docker run --rm --entrypoint python vigil-sre -c "import api, dashboard, notifiers; print('api OK')"

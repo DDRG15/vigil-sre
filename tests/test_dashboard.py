@@ -1,5 +1,5 @@
 """
-tests/test_dashboard.py — Test suite for dashboard.py (an earlier release).
+tests/test_dashboard.py — Test suite for dashboard.py.
 
 Coverage:
   A. freshness()   — the four levels, and the boundaries between them
@@ -142,7 +142,7 @@ def test_missing_history_renders_a_dash_not_a_zero() -> None:
 
 
 def test_a_non_dict_state_entry_does_not_break_the_page() -> None:
-    """One malformed row must not cost the other five. The audit of an earlier release
+    """One malformed row must not cost the other five. An earlier audit
     found api.read_state could surface a stray scalar; the renderer should
     survive it either way."""
     markup = render_rows({URL: "not a dict"}, {}, 10)  # type: ignore[dict-item]
@@ -151,8 +151,8 @@ def test_a_non_dict_state_entry_does_not_break_the_page() -> None:
 
 def test_a_non_string_status_does_not_crash_the_page() -> None:
     """The test above covers a whole entry being non-dict. It does not cover a
-    single mistyped FIELD inside an otherwise valid record, which is the gap the
-    a later audit found: `status in COLOURS` raises TypeError on an unhashable
+    single mistyped FIELD inside an otherwise valid record, which is the gap a
+    later audit found: `status in COLOURS` raises TypeError on an unhashable
     value instead of falling through to UNKNOWN, and that exception escapes
     do_GET's `except sqlite3.Error` -- so the operator loses the view of all six
     targets over one bad field in one of them."""
@@ -184,7 +184,7 @@ def test_page_is_self_contained() -> None:
 
 
 def test_dead_data_dims_the_rows() -> None:
-    """The design decision of this phase, asserted as a property of the
+    """The design decision here, asserted as a property of the
     output. When the data may be hours old, green must stop looking
     reassuring -- so the row container carries the level that dims it."""
     fresh_page = render_page({URL: _state()}, {}, RUN_INTERVAL_S)

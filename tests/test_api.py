@@ -1,5 +1,5 @@
 """
-tests/test_api.py — Test suite for api.py (an earlier release, read-only JSON endpoint).
+tests/test_api.py — Test suite for api.py (read-only JSON endpoint).
 
 Coverage:
   A. read_state()        — both on-disk shapes, missing file, garbage
@@ -107,7 +107,7 @@ def test_read_state_survives_corrupt_json(tmp_path: Path) -> None:
 
 
 def test_read_state_agrees_with_statemanager_on_a_malformed_file(tmp_path: Path) -> None:
-    """Found by the an audit. A hand-edited state.json with
+    """Found by an audit. A hand-edited state.json with
     schema_version but no targets key made this function fall back to the
     whole object, serving schema_version itself as if it were a monitored
     URL — a dashboard iterating the map would then read a status off an
@@ -181,7 +181,7 @@ def test_history_payload_no_data_is_null_not_zero(tmp_path: Path) -> None:
 
 
 def test_api_and_report_agree_exactly(tmp_path: Path) -> None:
-    """THE test of this phase. A CLI and an API deriving the same figure from
+    """THE test here. A CLI and an API deriving the same figure from
     the same rows and printing different numbers is a credibility bug that no
     individually-passing test would catch, because each side is self-consistent.
     So this compares one against the other."""
@@ -244,7 +244,7 @@ def test_status_endpoint_serves_state(live_server) -> None:
 
 
 def test_status_endpoint_logs_the_staleness_metric(live_server, caplog) -> None:
-    """Found by the an audit: the design note named
+    """Found by an audit: the design note named
     api_stale_state_seconds as the metric that matters, and the code returned
     it in the body but never logged it. A number only visible to whoever
     happens to look is no defence against 'nobody is looking', which is

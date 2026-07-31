@@ -8,7 +8,7 @@ Coverage:
   D. confidence gating      —  bandwidth rules stay silent on small samples
   E. measure_tcp_rtt()      —  real local server (hit) + closed port (None)
   F. phases_to_dict()       —  serialization shape + None survival
-  G. cert_alert_threshold() —  the suppression rule, case by case (an earlier release)
+  G. cert_alert_threshold() —  the suppression rule, case by case
 
 Run: pytest tests/ -v
 
@@ -257,7 +257,7 @@ def test_every_rule_emits_its_named_constant_not_a_stray_literal() -> None:
         tls_cert_days_left=3, h2_supported=False, alpn_protocol="http/1.1",
     ))
     emitted = _codes(findings)
-    assert emitted  # sanity: this phase mix must fire something
+    assert emitted  # sanity: this mix must fire something
     assert emitted <= ALL_DIAGNOSIS_CODES
 
 
@@ -418,7 +418,7 @@ def test_http2_silent_when_untested() -> None:
 
 
 # =============================================================================
-# G2. Per-target threshold overrides (an earlier release)
+# G2. Per-target threshold overrides
 # =============================================================================
 
 
@@ -501,7 +501,7 @@ def test_degraded_reason_ignores_cert_and_http2() -> None:
 
 
 # =============================================================================
-# G. cert_alert_threshold() / is_cert_healthy() — the suppression rule (an earlier release)
+# G. cert_alert_threshold() / is_cert_healthy() — the suppression rule
 #
 # Pure functions on purpose: the whole rule is exercised here with plain
 # calls, no probe, no state file, no webhook. The property under test is not

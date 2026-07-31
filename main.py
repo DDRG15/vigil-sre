@@ -152,7 +152,7 @@ STATUS_DEGRADED: str = "DEGRADED"   # probe succeeded but a performance finding 
 # still alert on their very first run.
 DOWN_CONFIRMATIONS: int = 2
 
-# v4 added cert_last_seen_days (an earlier release audit fix). v3 added cert_alerted_days.
+# v4 added cert_last_seen_days. v3 added cert_alerted_days.
 # Both bumps are
 # documentary, not functional: _load_sync only checks whether schema_version
 # EXISTS, never its value, and UrlState is total=False — so a v2 file loads
@@ -162,7 +162,7 @@ STATE_SCHEMA_VERSION: int = 4   # bump whenever state.json's on-disk shape chang
 
 # Webhook delivery retry now lives in notifiers.py alongside the Notifier
 # base class that applies it — see WEBHOOK_RETRY_ATTEMPTS / _BASE_S /
-# _AFTER_CAP_S there. It moved with the code it governs (the design note).
+# _AFTER_CAP_S there. It moved with the code it governs.
 
 # If a full run takes longer than this, the docker-compose `sleep 60` loop
 # (or an equivalent cron/systemd-timer interval) is scheduling overlapping
@@ -1105,12 +1105,12 @@ async def _maybe_alert_cert_expiry(
 ) -> None:
     """
     Fire a certificate-expiry alert if this run crossed a threshold, and stay
-    silent on every run that did not (the design note, an earlier release).
+    silent on every run that did not.
 
     This is the one alert in the system that does NOT come from a state
     transition: a certificate 20 days from expiry leaves the service
     perfectly UP, so nothing in the UP/DEGRADED/DOWN machine would ever
-    mention it. diagnostics.py has measured tls_cert_days_left since an earlier release
+    mention it. diagnostics.py has measured tls_cert_days_left from the start
     and deliberately excludes CERT_EXPIRING from the codes that degrade a
     target — which meant that until now the finding was logged, persisted,
     and read by nobody. This function is the missing channel.
@@ -1139,8 +1139,8 @@ async def _maybe_alert_cert_expiry(
     # The second exists because a cert renewed to anything under 30 days
     # never satisfies the first, and without it a target that already alerted
     # at the 7-day threshold stays silent forever — through the next full
-    # decay and through the certificate actually expiring. Found by the review
-    # audit of this phase, reproduced across three simulated renewal cycles.
+    # decay and through the certificate actually expiring. Reproduced across
+    # three simulated renewal cycles.
     if is_cert_renewed(days, last_seen) and stored is not None:
         logger.info(
             "🔐  Certificate renewed for %s (%d days left, was %d) — clearing "
@@ -1363,7 +1363,7 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown_event: as
 
 async def _send_heartbeat(down_count: int) -> None:
     """
-    Ping the external dead-man's switch to say this run completed (an earlier release).
+    Ping the external dead-man's switch to say this run completed.
 
     Who watches the watchman: every other failure mode in this service is one
     it can report on itself. This one is not. If the process dies, the

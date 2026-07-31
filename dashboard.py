@@ -1,5 +1,5 @@
 """
-dashboard.py — the HTML view over vigil-sre's own JSON (the design note, an earlier release).
+dashboard.py — the HTML view over vigil-sre's own JSON.
 
 Why no FastAPI, no Jinja2, no HTMX
 ------------------------------------
@@ -20,7 +20,7 @@ Escaping is structural, not remembered
 Target URLs and last_error land inside HTML, so a target named
 `https://x.com/<script>` in targets.yaml is an XSS vector. html.escape is
 enough, but calling it at every interpolation point is discipline, and this
-project has decided twice already (an earlier release D4, an earlier release D3) that a remembered
+project has decided twice already that a remembered
 guarantee is a broken one. So every value reaches the page through _row(),
 which escapes on the way in, and nothing is interpolated by any other path.
 

@@ -1,5 +1,5 @@
 """
-tests/test_history.py — Test suite for history.py (an earlier release persistence layer).
+tests/test_history.py — Test suite for history.py (persistence layer).
 
 Coverage:
   A. Schema / construction        — 3 tests
@@ -7,7 +7,7 @@ Coverage:
   C. prune()                      — 4 tests
   D. _retention_days_from_env()   — 4 tests
   E. Metric contract (caplog)     — 3 tests
-  F. uptime_pct() / latency_percentiles() (an earlier release + audit fixes) — 17 tests
+  F. uptime_pct() / latency_percentiles() — 17 tests
 
 Reviewer notes
 --------------
@@ -412,7 +412,7 @@ async def test_uptime_pct_raises_on_a_locked_database_instead_of_saying_no_data(
     tmp_path: Path,
 ) -> None:
     """'Nothing recorded yet' and 'I could not read it' are different claims.
-    Reproduced during the an earlier release audit: running --report while the probe
+    Reproduced in practice: running --report while the probe
     loop held a write lock reported 'no data' for a target with 100% uptime
     and real rows, sending the operator hunting a persistence bug in a
     healthy system. Only 'no such table' may be swallowed."""

@@ -1,5 +1,5 @@
 """
-api.py — read-only JSON endpoint over vigil-sre's state and history (the design note).
+api.py — read-only JSON endpoint over vigil-sre's state and history.
 
 Why a separate process, and not a thread inside main.py
 ---------------------------------------------------------
@@ -22,8 +22,9 @@ reader could corrupt the writer's history.
 
 Why no WAL, measured rather than assumed
 ------------------------------------------
-the design note dropped WAL with a condition attached: revisit when a real concurrent
-reader exists. This is that reader, so the design note measured instead of inheriting.
+An earlier revision dropped WAL with a condition attached: revisit when a
+real concurrent reader exists. This is that reader, so the question was
+measured here instead of inherited.
 On 43,200 rows — 30 real days at one run per minute across six targets — the
 writer holds its lock 203 ms once every 60,000 ms (a 0.34% duty cycle), and
 the most expensive query here costs under 1 ms. A poll has roughly a 0.34%
@@ -102,7 +103,7 @@ def stale_seconds(targets: dict, now: datetime | None = None) -> float | None:
     This is the number that separates "the dashboard is alive" from "the
     dashboard is showing the past". If the probe process dies, this endpoint
     keeps answering 200 with data that looks perfectly well-formed and is
-    simply old — the degraded-and-silent failure this phase must not have.
+    simply old — the degraded-and-silent failure this must not have.
     Returns None when there is nothing to age.
     """
     now = now or datetime.now(timezone.utc)
@@ -125,7 +126,7 @@ def history_payload(db_path: Path, window: str, targets: list[str]) -> dict:
     """
     Uptime and TTFB percentiles per target over *window*.
 
-    Reuses an earlier release's aggregates verbatim rather than re-deriving them. Writing
+    Reuses the --report aggregates verbatim rather than re-deriving them. Writing
     the same query twice is exactly how a CLI and an API end up reporting
     different numbers for the same data, and the test suite asserts the two
     agree rather than asserting each agrees with itself.
@@ -221,7 +222,7 @@ class _Handler(BaseHTTPRequestHandler):
                 stale   = stale_seconds(targets)
                 self._log_metric("status")
                 if stale is not None:
-                    # The one metric the design note named as the one that
+                    # The one metric here that actually matters: returning it
                     # matters. Returning it only in the body would leave it
                     # visible to whoever happens to look and invisible to
                     # every alerting pipeline — and "nobody is looking" is
@@ -290,7 +291,7 @@ def serve(
     Build the server. The caller decides whether to serve_forever().
 
     Threading is safe here because every request opens and closes its own
-    SQLite connection — the pattern an earlier release's aggregates already use — so no
+    SQLite connection — the pattern the --report aggregates already use — so no
     connection is ever shared across threads.
     """
     handler = type("_BoundHandler", (_Handler,), {

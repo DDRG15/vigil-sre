@@ -1,24 +1,23 @@
 """
-tests/test_deployment.py — the packaging layer no phase audit ever opened.
+tests/test_deployment.py — guards on the packaging layer.
 
 Why this file exists
 --------------------
-Every phase audited its own diff, and many releases came out clean that way. But
-a diff does not contain the files that SHOULD have changed and did not, and the
-Dockerfile is exactly that: a file to touch each time a module is born, which no
-audit of a new module had any reason to open.
+Reviewing a change against its own diff catches a lot, but a diff does not
+contain the files that SHOULD have changed and did not. The Dockerfile is
+exactly that kind of file: it has to be touched every time a module is born,
+and nothing about writing that module points at it.
 
-The cost was a CRITICAL. `COPY main.py diagnostics.py history.py ./` went five
-phases without gaining notifiers.py, so the image could not import its own
-entrypoint from an earlier release onward — a crash-loop behind a build that succeeded
-every single time, because copying three of six files is a successful copy.
+The cost of missing it is an image that cannot import its own entrypoint. A
+`COPY` list naming three modules while the package holds six is a perfectly
+successful build — nothing fails until the container runs.
 
-CI has a step that would have caught it on day one. It never ran: CI had not run. So the guard belongs where it runs on every `pytest tests/` too, not
-only where it runs on push.
+CI covers this too, but CI only runs on push. The guard belongs where it also
+runs on every `pytest tests/`.
 
-These assert against the deployment files as text. That is deliberate — they
-must fail in the same commit a module goes uncopied, not in the audit five
-phases later, and they must not need Docker to be installed or running.
+These assert against the deployment files as text. That is deliberate: they
+must fail in the same commit a module goes uncopied, and they must not need
+Docker to be installed or running.
 """
 
 from __future__ import annotations
@@ -34,10 +33,10 @@ def _read(name: str) -> str:
 
 
 def test_the_image_copies_every_module_the_app_imports() -> None:
-    """The an earlier release CRITICAL, in one assertion.
+    """The packaging CRITICAL, in one assertion.
 
-    A per-file COPY list desynchronises silently: it happened in an earlier release, was
-    fixed by naming the missing file, and happened again in an earlier release because
+    A per-file COPY list desynchronises silently: it happened once, was
+    fixed by naming the missing file, and happened again later because
     naming files is a step somebody has to remember. Either the Dockerfile
     copies the package wholesale, or it names every module that exists -- and
     this test is what notices when neither is true.
@@ -65,8 +64,8 @@ def test_the_image_never_bakes_in_operational_data() -> None:
 
 
 def test_compose_actually_runs_the_api() -> None:
-    """an earlier release's implementation plan, step 4, called for a separate compose
-    service. It shipped without one, so two whole phases -- the JSON API and
+    """The implementation plan, step 4, called for a separate compose
+    service. It shipped without one, so two whole features -- the JSON API and
     the dashboard on top of it -- existed only in the test suite. Passing tests
     say nothing about whether anything is running."""
     compose = _read("docker-compose.yml")

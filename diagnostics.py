@@ -608,7 +608,7 @@ def cert_alert_threshold(
 ) -> int | None:
     """
     Decide whether an expiring certificate warrants an alert right now, and
-    at which threshold — or None for silence (the design note, an earlier release).
+    at which threshold — or None for silence.
 
     Pure by design: the whole suppression rule lives here, so the table of
     cases below is testable with plain calls — no probe, no state file, no
@@ -658,7 +658,7 @@ def cert_alert_threshold(
     if already_alerted_at is None or threshold < already_alerted_at:
         return threshold
 
-    # Known limitation (the design note): a partial renewal landing back inside the
+    # Known limitation: a partial renewal landing back inside the
     # 7-30 day band does not re-alert, because 30 < 7 is false. Defensible —
     # the operator already got the critical — and rare enough not to
     # complicate the rule. Documented, not forgotten.
@@ -676,8 +676,8 @@ def is_cert_renewed(days_left: int | None, last_seen_days: int | None) -> bool:
     PKI issuing 14-day certs.
 
     is_cert_healthy() cannot cover that case: it asks "is this certificate
-    comfortable" and a 25-day cert is not, so it never fires the reset. Found
-    by the an audit: without this signal, a target that has
+    comfortable" and a 25-day cert is not, so it never fires the reset.
+    Without this signal, a target that has
     already alerted at the 7-day threshold and then renews to anything below
     30 days is silenced permanently — through the next full decay, and
     through the certificate actually expiring, with no alert at any point.

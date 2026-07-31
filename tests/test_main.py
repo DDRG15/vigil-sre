@@ -8,7 +8,7 @@ Coverage:
   D. _probe_with_backoff()     —  3 tests  (async, sleep call count verified)
   E. Payload builders          —  7 tests  (sync, Discord + Slack, an earlier release)
   F. check_url() pipeline      —  5 tests  (async, full orchestration)
-  I2. _generate_report()       —  6 tests  (an earlier release, incl. subprocess end-to-end)
+  I2. _generate_report()       —  6 tests  (incl. subprocess end-to-end)
   J. Logging configuration     —  3 tests  (sync) — an earlier release log rotation, incl. subprocess wiring check
 
 Run: pytest tests/ -v
@@ -87,7 +87,7 @@ def test_load_targets_valid(tmp_path: Path) -> None:
 
 def test_load_targets_mixed_string_and_object(tmp_path: Path) -> None:
     """String and object entries can coexist; only the object form carries
-    expect_substring — this is the an earlier release content-assertion schema."""
+    expect_substring — this is the content-assertion schema."""
     f = tmp_path / "targets.yaml"
     f.write_text(
         "targets:\n"
@@ -127,7 +127,7 @@ def test_load_targets_non_string_expect_substring_exits(tmp_path: Path) -> None:
 
 
 def test_load_targets_valid_overrides(tmp_path: Path) -> None:
-    """The 4 per-target override fields (an earlier release) must parse into Target as-is."""
+    """The 4 per-target override fields must parse into Target as-is."""
     f = tmp_path / "targets.yaml"
     f.write_text(
         "targets:\n"
@@ -147,7 +147,7 @@ def test_load_targets_valid_overrides(tmp_path: Path) -> None:
 
 def test_load_targets_overrides_are_optional(tmp_path: Path) -> None:
     """An entry with no override fields must default every one to None —
-    retro-compatible with every targets.yaml written before an earlier release."""
+    retro-compatible with every targets.yaml written earlier."""
     f = tmp_path / "targets.yaml"
     f.write_text("targets:\n  - url: https://api.com/health\n", encoding="utf-8")
     result = load_targets(f)
@@ -188,7 +188,9 @@ def test_load_targets_boolean_override_exits(tmp_path: Path, field: str) -> None
 def test_load_targets_non_positive_timeout_exits(tmp_path: Path, bad: str) -> None:
     """aiohttp treats ClientTimeout(total=0) (and negatives) as NO timeout at
     all: a target that hangs would freeze the whole run's asyncio.gather
-    forever, and every other target with it. (audit finding)"""
+    forever, and every other target with it. (HIGH finding:
+    reproduced against a real socket that accepts the connection and never
+    responds -- timeout_s=5 cuts at 5.8s, timeout_s=0 never cuts.)"""
     f = tmp_path / "targets.yaml"
     f.write_text(f"targets:\n  - url: https://x.com\n    timeout_s: {bad}\n", encoding="utf-8")
     with pytest.raises(SystemExit):
@@ -226,7 +228,7 @@ def test_load_targets_warns_when_timeout_blows_the_run_budget(tmp_path: Path, ca
 
 
 def test_load_targets_resolves_env_var_expect_substring(tmp_path: Path, monkeypatch) -> None:
-    """${VAR_NAME} in expect_substring (an earlier release) resolves from the environment
+    """${VAR_NAME} in expect_substring resolves from the environment
     at load time: the real value is used for matching, and expect_substring_display
     carries a safe placeholder instead — never the secret itself."""
     monkeypatch.setenv("HEALTH_TOKEN", "super-secret-value")
@@ -272,7 +274,8 @@ def test_load_targets_empty_env_var_in_expect_substring_exits(tmp_path: Path, mo
     """A variable that IS set but resolves to "" must also fail fast: "" is
     contained in every byte string, so the content assertion would silently
     become a no-op that reports UP over any body, including an error page --
-    the exact case the assertion exists to catch. (audit finding)"""
+    the exact case the assertion exists to catch. (HIGH finding: found
+    via reproduction against the real _probe_once, not traced by eye.)"""
     monkeypatch.setenv("HEALTH_TOKEN", "")
     f = tmp_path / "targets.yaml"
     f.write_text(
@@ -476,7 +479,7 @@ async def test_state_persists_across_restart(tmp_path: Path) -> None:
 
 
 # =============================================================================
-# B2. Flap hysteresis + schema v2 (an earlier release)
+# B2. Flap hysteresis + schema v2
 # =============================================================================
 
 
@@ -569,8 +572,8 @@ async def test_probe_once_503() -> None:
 
 async def test_probe_once_status_mismatch_names_the_expectation() -> None:
     """'HTTP 200' as a DOWN reason is undecipherable at 3am on a target whose
-    expected_status is an override (an earlier release) -- the message must name what
-    was expected, not just what came back. (audit finding)"""
+    expected_status is an override -- the message must name what
+    was expected, not just what came back. (MEDIUM finding.)"""
     with aioresponses() as mock:
         mock.get(TARGET_URL, status=200)
         async with aiohttp.ClientSession() as session:
@@ -631,7 +634,7 @@ async def test_probe_once_content_check_fails() -> None:
 
 
 async def test_probe_once_content_check_failure_redacts_secret() -> None:
-    """When expect_substring_display is set (an earlier release, ${VAR_NAME} secrets),
+    """When expect_substring_display is set (${VAR_NAME} secrets),
     a failed content check must report the placeholder, never the real
     secret -- this is the one point of redaction every downstream sink
     (logs, alerts, state.json, history.db) inherits from."""
@@ -791,7 +794,7 @@ def test_slack_payload_sets_text_for_the_mobile_push_preview() -> None:
 
 
 # =============================================================================
-# E2. Notifier.send() — webhook delivery retry (an earlier release, the design note)
+# E2. Notifier.send() — webhook delivery retry (the design note)
 #
 # An alert fires on a state transition only — there is no next-run retry the
 # way probes have. asyncio.sleep is mocked so retries don't add real wall time.
@@ -949,7 +952,8 @@ async def test_send_never_writes_the_webhook_url_to_a_log(monkeypatch, caplog) -
     aiohttp puts the whole URL into its error message. Without redaction that
     token lands in health_checker.log -- which rotates at 10 MiB x 5 backups,
     so it is a live, reusable credential sitting on disk for anyone who reads
-    the file and fixes the scheme. (audit finding)"""
+    the file and fixes the scheme. (SEC finding:
+    reproduced against a real log file before the fix.)"""
     typo_url = "htps://hooks.slack.com/services/T0REAL/B0REAL/tOkEnRealQueSiSirve"
     monkeypatch.setenv("SLACK_WEBHOOK_URL", typo_url)
     with patch("notifiers.asyncio.sleep", new_callable=AsyncMock):
@@ -968,7 +972,7 @@ async def test_send_never_writes_the_webhook_url_to_a_log(monkeypatch, caplog) -
 # =============================================================================
 # E3. dispatch_alert() — the redundancy that justifies the whole phase
 #
-# The point of this phase is not "two channels exist". It is that one channel
+# The point here is not "two channels exist". It is that one channel
 # failing cannot stop the other from delivering, and that the operator finds
 # out when NO channel delivered. Those are the properties tested here.
 # =============================================================================
@@ -990,7 +994,7 @@ async def test_dispatch_delivers_to_every_configured_channel() -> None:
 
 
 async def test_dispatch_one_channel_down_does_not_stop_the_other(caplog) -> None:
-    """THE test this phase exists for: Slack fails every attempt, Discord must
+    """THE test this exists for: Slack fails every attempt, Discord must
     still deliver, and nothing may be logged as a total loss."""
     with patch.object(DiscordNotifier, "send", new_callable=AsyncMock, return_value=True) as d_send:
         with patch.object(SlackNotifier, "send", new_callable=AsyncMock, return_value=False):
@@ -1123,7 +1127,7 @@ async def test_check_url_down_transition_fires_failure_alert(tmp_path: Path) -> 
     """URL was UP, already has one strike → probe fails all retries → the
     2nd strike reaches DOWN_CONFIRMATIONS and the failure alert fires.
 
-    The strike is pre-seeded here because flap hysteresis (an earlier release) requires
+    The strike is pre-seeded here because flap hysteresis requires
     DOWN_CONFIRMATIONS consecutive failed runs from a healthy state before
     confirming DOWN — a single failure from UP no longer alerts immediately."""
     sm = StateManager(tmp_path / "state.json")
@@ -1192,7 +1196,7 @@ async def test_check_url_content_check_failure_routes_to_down(tmp_path: Path) ->
 
 
 async def test_check_url_redacts_env_var_secret_end_to_end(tmp_path: Path) -> None:
-    """The redaction contract (an earlier release) survives the full pipeline: a target
+    """The redaction contract survives the full pipeline: a target
     configured with an env-var-backed expect_substring must never leak the
     real secret into state.json, even though the secret IS what the probe
     matched against — only the ${VAR_NAME} placeholder should land on disk."""
@@ -1363,7 +1367,7 @@ async def test_check_url_degraded_fires_amber_alert(tmp_path: Path) -> None:
 
 
 async def test_check_url_degraded_rtt_override_stays_up(tmp_path: Path) -> None:
-    """The exact case that motivated an earlier release: an RTT (300ms) that trips the
+    """The exact case that motivated the per-target overrides: an RTT (300ms) that trips the
     global default (100ms) must stay UP when the target declares a higher
     degraded_rtt_ms override — a legitimately-distant target (this is what
     google/github/cloudflare looked like from the operator's own network in
@@ -1438,7 +1442,7 @@ def test_discord_payload_degraded() -> None:
 
 
 # =============================================================================
-# G2. Certificate expiry alerting (an earlier release)
+# G2. Certificate expiry alerting
 #
 # The risk here is not "does it alert" -- alerting once is trivial. It is
 # "does it STOP alerting": a certificate sits below its warning threshold for
@@ -1490,7 +1494,7 @@ async def test_cert_alert_fires_once_when_crossing_the_warning_threshold(tmp_pat
 
 
 async def test_cert_alert_is_suppressed_on_the_second_run(tmp_path: Path) -> None:
-    """THE test of this phase. Alerting once is easy; a certificate stays
+    """THE test here. Alerting once is easy; a certificate stays
     below 30 days for weeks, and every run after the first must be silent or
     the feature becomes the alert fatigue it was built to prevent."""
     sm = StateManager(tmp_path / "state.json")
@@ -1537,7 +1541,7 @@ async def test_renewal_clears_the_stored_threshold(tmp_path: Path) -> None:
 
 
 async def test_short_lived_renewal_does_not_cause_permanent_silence(tmp_path: Path) -> None:
-    """Regression for the HIGH the an audit of this phase found.
+    """Regression for the HIGH an audit found.
 
     A certificate whose renewals always land BELOW 30 days (short-lived cert
     programs, internal PKI with a 14-day TTL, or a panic renewal right after
@@ -1563,7 +1567,7 @@ async def test_short_lived_renewal_does_not_cause_permanent_silence(tmp_path: Pa
 async def test_a_decaying_cert_is_not_mistaken_for_a_renewal(tmp_path: Path) -> None:
     """The renewal signal is a RISE in days_left. Ordinary decay must never
     look like one, or the suppression collapses and every run re-alerts —
-    the opposite failure, and the one this phase was built to prevent."""
+    the opposite failure, and the one this was built to prevent."""
     sm = StateManager(tmp_path / "state.json")
     await _run_check_with_cert(sm, days_left=25)      # first WARN
     kinds: list = []
@@ -1644,7 +1648,7 @@ def test_cert_payload_colour_carries_the_triage(kind: AlertKind, color: int) -> 
 
 
 def test_an_unhandled_alert_kind_raises_instead_of_rendering_as_a_failure() -> None:
-    """Before an earlier release the builders ended in a bare `else`, so a new AlertKind
+    """Earlier the builders ended in a bare `else`, so a new AlertKind
     silently rendered as a red 'Health Check Failed' -- a false statement
     about the service, in the channel people trust. Loud beats wrong."""
     class _FakeKind:
@@ -1659,7 +1663,7 @@ def test_an_unhandled_alert_kind_raises_instead_of_rendering_as_a_failure() -> N
 
 
 # =============================================================================
-# H. check_url() return value + StateManager.current_status() (an earlier release)
+# H. check_url() return value + StateManager.current_status()
 #
 # --strict inspects the status check_url reports, so what it returns must be
 # exactly what state.json ends up holding — including the hysteresis-pending
@@ -1668,7 +1672,7 @@ def test_an_unhandled_alert_kind_raises_instead_of_rendering_as_a_failure() -> N
 
 
 async def test_check_url_returns_up_status(tmp_path: Path) -> None:
-    """check_url returns a CheckOutcome (an earlier release), not a bare string — status
+    """check_url returns a CheckOutcome, not a bare string — status
     is the field that used to be the whole return value; phases/error are
     the new fields history persistence needs."""
     sm = StateManager(tmp_path / "state.json")
@@ -1750,7 +1754,7 @@ async def test_state_current_status_after_set_up(tmp_path: Path) -> None:
 
 
 # =============================================================================
-# I. run_health_checks() down-count + _exit_code() (an earlier release)
+# I. run_health_checks() down-count + _exit_code()
 # =============================================================================
 
 
@@ -1760,7 +1764,7 @@ async def test_run_health_checks_returns_down_count(tmp_path) -> None:
 
     Uses run_health_checks' state_path=/history_path= parameters to isolate
     both files in tmp_path, instead of monkeypatching constructor defaults
-    (audit nitpick, an earlier release review: a monkeypatch silently stops working
+    (audit nitpick: a monkeypatch silently stops working
     the moment a constructor is called with an explicit path anywhere, and a
     test that isolates itself by parameter can't have that failure mode).
     Without history_path= here, this test would silently write a real
@@ -1788,7 +1792,7 @@ async def test_run_health_checks_returns_down_count(tmp_path) -> None:
 async def test_run_health_checks_writes_outcomes_to_history_db(tmp_path) -> None:
     """End-to-end: a real run must persist one probe_results row per target
     into history.db, findings linked correctly, tagged with the same
-    run_started_at — this is the whole point of an earlier release."""
+    run_started_at — this is the whole point of the persistence layer."""
     up_url   = "https://up.example.test"
     down_url = "https://down.example.test"
     history_path = tmp_path / "history.db"
@@ -1849,7 +1853,7 @@ def test_exit_code_strict_with_down_is_one() -> None:
 
 
 # =============================================================================
-# I2. _generate_report() / --report (an earlier release)
+# I2. _generate_report() / --report
 #
 # The risk this section guards against is arithmetic and honesty about the
 # retention window, not exceptions -- see tests/test_history.py section F for
@@ -1983,7 +1987,7 @@ def test_report_flag_end_to_end_exits_zero_without_probing(tmp_path: Path) -> No
 
 
 # =============================================================================
-# K. Dead-man's switch (an earlier release)
+# K. Dead-man's switch
 #
 # The property under test is not "does it ping" but "does it ping about the
 # right thing". A heartbeat that fires before a run finishes, or that stays
@@ -2084,7 +2088,7 @@ async def test_run_health_checks_pings_the_heartbeat_last(tmp_path: Path, monkey
 
 
 # =============================================================================
-# J. Logging configuration (an earlier release)
+# J. Logging configuration
 #
 # main.py wires RotatingFileHandler up via logging.basicConfig() at import
 # time, but basicConfig() is a documented no-op once the root logger already
@@ -2107,12 +2111,12 @@ def test_main_wires_rotating_file_handler_in_a_clean_interpreter(tmp_path: Path)
     interpreter proves it, rather than asserting against a synthetic
     RotatingFileHandler built by the test itself. Without this, changing
     maxBytes=LOG_MAX_BYTES to maxBytes=0 (rotation silently disabled, the
-    exact bug an earlier release fixes) passes every other test in this file.
+    exact bug this fixes) passes every other test in this file.
 
     Runs with cwd=tmp_path on purpose: importing main creates
     health_checker.log in the current directory, and a test that forgets to
     isolate a file path has bitten this project twice already (state_path in
-    an earlier release, history_path in an earlier release)."""
+    one release, history_path in another)."""
     project_root = Path(__file__).resolve().parent.parent
     code = (
         "import json, logging, main;"
@@ -2139,7 +2143,7 @@ def test_main_wires_rotating_file_handler_in_a_clean_interpreter(tmp_path: Path)
 
 
 def test_rotating_file_handler_actually_rotates(tmp_path: Path) -> None:
-    """A plain FileHandler(mode='a') never rotates -- the bug an earlier release fixes.
+    """A plain FileHandler(mode='a') never rotates -- the bug this fixes.
     Proves RotatingFileHandler, the class main.py now wires up, genuinely
     creates a backup file once the size threshold is crossed (small
     thresholds here so the test stays fast; main.py's real 10 MiB/5-backup

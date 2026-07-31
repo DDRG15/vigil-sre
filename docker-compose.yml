@@ -18,7 +18,7 @@ services:
     command: >
       sh -c "while true; do python main.py || exit 1; sleep 60; done"
 
-  # The read-only API and the dashboard it serves (the design note, the design note). A separate
+  # The read-only API and the dashboard it serves. A separate
   # service and not a thread inside health-checker, because health-checker is not
   # a long-lived process: it runs one cycle and exits, and the loop above restarts
   # it every 60 seconds. An HTTP server living in there would die every minute.

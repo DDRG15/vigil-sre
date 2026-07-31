@@ -1,5 +1,5 @@
 """
-notifiers.py — Multi-channel alert delivery for vigil-sre (the design note, an earlier release).
+notifiers.py — Multi-channel alert delivery for vigil-sre.
 
 Why more than one channel
 --------------------------
@@ -30,7 +30,7 @@ Measured against this module's own constants: worst case per channel is
 3 attempts x 5 s timeout + two 30 s capped Retry-After sleeps = 75 s.
 Dispatching two channels sequentially is 150 s against a RUN_BUDGET_S of
 60 s — a guaranteed overrun of 2.5x. In parallel it is max(75, 75) = 75 s,
-which is what a single channel already costs today. See the design note.
+which is what a single channel already costs today.
 
 Python  : 3.11+
 Depends : aiohttp (already required by the probe), stdlib otherwise.
@@ -57,8 +57,8 @@ WEBHOOK_RETRY_BASE_S     : float = 1.0   # linear backoff: 1 s, then 2 s
 WEBHOOK_RETRY_AFTER_CAP_S: float = 30.0  # cap on an honoured Retry-After value
 
 # Deliberately independent from the probe's REQUEST_TIMEOUT_S even though both
-# are 5 s today. They were coupled only by history; an earlier release already made the
-# probe timeout per-target configurable while this one stayed global, so they
+# are 5 s today. They were coupled only by history; the
+# probe timeout is already per-target configurable while this one stayed global, so they
 # are different concerns that happened to share a number.
 WEBHOOK_TIMEOUT_S: float = 5.0
 
@@ -72,14 +72,14 @@ def _redact(text: str, webhook: str | None) -> str:
 
     aiohttp puts the FULL request URL into the message of its URL-shaped
     errors (InvalidUrlClientError, NonHttpUrlClientError). Reproduced during
-    the an earlier release audit: a webhook whose scheme was typo'd — "htps://" —
+    practice: a webhook whose scheme was typo'd — "htps://" —
     lands verbatim in health_checker.log, token included, and that token
     still works for anyone who reads the file and fixes the scheme. The log
     rotates at 10 MiB x 5 backups, so it is a live credential sitting on disk
     for a long time.
 
     Redacting at the logging boundary rather than at each call site is the
-    same rule an earlier release applied to expect_substring: one place to get right,
+    same rule applied to expect_substring: one place to get right,
     and every sink downstream inherits it.
     """
     if not webhook:
@@ -97,9 +97,9 @@ class AlertKind(Enum):
     already existed implicitly — the old code recomputed it as a string on
     every call — so naming it here formalises what was already there.
 
-    an earlier release added the two CERT_EXPIRING members by appending them, with no
+    The two CERT_EXPIRING members were appended later, with no
     signature change anywhere in the call chain — which was the point of
-    naming this concept in an earlier release.
+    naming this concept.
 
     Why two cert members instead of one plus a severity argument: every
     member maps 1:1 to a visual treatment in each channel's payload, and the
@@ -124,7 +124,7 @@ class Notifier(abc.ABC):
     Subclasses supply what genuinely differs per channel — the env var
     holding the webhook, the payload shape, and what HTTP status means
     success — and inherit the delivery policy. That policy is not generic
-    boilerplate: it was designed in an earlier release and corrected by an audit (honour
+    boilerplate: it was designed early and later corrected (honour
     Discord's Retry-After instead of overriding it with our own backoff), so
     it lives in exactly one place where a fix reaches every channel at once.
     """
@@ -275,7 +275,7 @@ class Notifier(abc.ABC):
 
 
 class DiscordNotifier(Notifier):
-    """Discord Webhook channel. Payload unchanged from before the design note."""
+    """Discord Webhook channel. Payload unchanged."""
 
     name           = "Discord"
     env_var        = "DISCORD_WEBHOOK_URL"
@@ -470,7 +470,7 @@ async def dispatch_alert(
         url:           Target whose state just changed.
         status_detail: Human-readable reason, already redacted upstream (a
                        ${VAR} content assertion never reaches here in the
-                       clear — see an earlier release).
+                       clear).
         kind:          Which state change this is.
         notifiers:     Override for tests, so a test never depends on the
                        ambient environment to decide which channels exist.

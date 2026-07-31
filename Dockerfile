@@ -70,8 +70,8 @@ WORKDIR /app
 COPY --from=builder /install/lib/python3.11/site-packages /app/site-packages
 
 # Copy every application module. NOT one COPY per file: that list silently
-# desynchronised twice — once in an earlier release, and again in an earlier release, where the image
-# went a long time unable to start because `notifiers.py` was never added to it.
+# desynchronised twice, and the second time left the image unable to start at
+# all, because a new module was never added to it.
 # A build copying three of six files is a perfectly successful build, so nothing
 # fails until the container runs. Copying the package and filtering through
 # .dockerignore inverts the failure mode: forgetting to exclude something bakes

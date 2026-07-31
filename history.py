@@ -333,7 +333,7 @@ class HistoryRecorder:
 
 # --------------------------------------------------------------------- Reporting
 #
-# Read-only aggregates for the --report CLI flag (an earlier release). These are plain
+# Read-only aggregates for the --report CLI flag. These are plain
 # functions, not HistoryRecorder methods: they never write, so they don't
 # need the disabled-on-init-failure state machine that guards the write
 # path, and keeping them separate makes that boundary visible at a glance.
@@ -350,7 +350,7 @@ def _is_missing_schema(exc: sqlite3.OperationalError) -> bool:
     instance, before the first probe cycle recorded anything. Every other
     OperationalError is a failure to READ, not an absence of data — most
     importantly "database is locked", which happens when --report runs while
-    the probe loop is mid-write (reproduced during the an earlier release audit: the
+    the probe loop is mid-write (reproduced in practice: the
     report showed "no data" for a target with 100% uptime and 30 days of
     rows). Collapsing the two turns "I could not read it" into the silent,
     confident claim "there is nothing there", and sends an operator hunting
@@ -366,7 +366,7 @@ def _connect_read_only(db_path: Path) -> sqlite3.Connection:
     sqlite3's URI mode=ro makes a write physically impossible rather than
     merely unintended — an INSERT on this connection fails with "attempt to
     write a readonly database". Both callers below are pure aggregates, and
-    the api.py process (an earlier release) runs alongside a live writer, so turning
+    the api.py process runs alongside a live writer, so turning
     "should not write" into "cannot write" removes any path by which a reader
     could corrupt the writer's history.
 
@@ -374,7 +374,7 @@ def _connect_read_only(db_path: Path) -> sqlite3.Connection:
     against a missing file raises "unable to open database file", and so does
     a permissions problem. The first is "no data yet"; the second is a real
     failure that must surface. Guessing between them from a string is how the
-    an earlier release audit's locked-database bug happened.
+    locked-database bug happened.
     """
     return sqlite3.connect(
         f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=CONNECT_TIMEOUT_S
@@ -442,7 +442,7 @@ def latency_percentiles(db_path: Path, url: str, since: str) -> dict[str, float]
 
     The distinction is not academic. PERCENT_RANK is (rank-1)/(n-1), so the
     highest row always evaluates to exactly 1.0 and `pr <= 0.95` structurally
-    excludes the maximum — measured during the an earlier release audit: with 10
+    excludes the maximum — measured directly: with 10
     samples of 1..10ms it reported p95 = 9 instead of 10, and with 2 samples
     it reported the MINIMUM. The bias is systematic and always in the
     flattering direction, understating the latency tail in a tool whose only
