@@ -359,6 +359,28 @@ def _is_missing_schema(exc: sqlite3.OperationalError) -> bool:
     return "no such table" in str(exc).lower()
 
 
+def _connect_read_only(db_path: Path) -> sqlite3.Connection:
+    """
+    Open history.db for reading and let the driver enforce that.
+
+    sqlite3's URI mode=ro makes a write physically impossible rather than
+    merely unintended — an INSERT on this connection fails with "attempt to
+    write a readonly database". Both callers below are pure aggregates, and
+    the api.py process (an earlier release) runs alongside a live writer, so turning
+    "should not write" into "cannot write" removes any path by which a reader
+    could corrupt the writer's history.
+
+    Existence is checked by the caller, not inferred from the error: mode=ro
+    against a missing file raises "unable to open database file", and so does
+    a permissions problem. The first is "no data yet"; the second is a real
+    failure that must surface. Guessing between them from a string is how the
+    an earlier release audit's locked-database bug happened.
+    """
+    return sqlite3.connect(
+        f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=CONNECT_TIMEOUT_S
+    )
+
+
 def uptime_pct(db_path: Path, url: str, since: str) -> float | None:
     """
     Percentage of *url*'s probes since *since* (an ISO-8601 UTC string,
@@ -382,7 +404,9 @@ def uptime_pct(db_path: Path, url: str, since: str) -> float | None:
     honest answer, not a stack trace. Any OTHER read failure is raised: see
     _is_missing_schema for why the two must not look alike.
     """
-    con = sqlite3.connect(db_path, timeout=CONNECT_TIMEOUT_S)
+    if not db_path.exists():
+        return None  # nothing recorded yet -- see _connect_read_only
+    con = _connect_read_only(db_path)
     try:
         row = con.execute(
             "SELECT COUNT(*), SUM(CASE WHEN status != 'DOWN' THEN 1 ELSE 0 END) "
@@ -429,7 +453,9 @@ def latency_percentiles(db_path: Path, url: str, since: str) -> dict[str, float]
     uptime_pct()'s docstring for why that is a real, expected sequence, and
     _is_missing_schema for why every other read failure is raised instead.
     """
-    con = sqlite3.connect(db_path, timeout=CONNECT_TIMEOUT_S)
+    if not db_path.exists():
+        return None  # nothing recorded yet -- see _connect_read_only
+    con = _connect_read_only(db_path)
     try:
         row = con.execute(
             """
