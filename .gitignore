@@ -37,3 +37,6 @@ Thumbs.db
 
 # Archives
 *.zip
+
+# Protocolo SDD interno — privado, nunca al repo publico
+.claude/
