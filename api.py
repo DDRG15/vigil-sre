@@ -82,9 +82,15 @@ def read_state(state_path: Path) -> dict:
         return {}
     if not isinstance(raw, dict):
         return {}
-    # Same two on-disk shapes StateManager understands: v2+ nests the targets
-    # under a key, legacy v1 WAS the flat mapping.
-    return raw.get("targets", raw) if "schema_version" in raw else raw
+    # Mirrors StateManager._load_sync exactly, including its fallback: v2+
+    # nests targets under a key, and a MISSING key means no targets — not
+    # "treat the wrapper as a target". Falling back to `raw` here (as an
+    # earlier version did) served schema_version itself as if it were a
+    # monitored URL, which a dashboard iterating the map would then try to
+    # read a status off. Legacy v1 WAS the flat mapping.
+    if "schema_version" in raw:
+        return raw.get("targets", {})
+    return raw
 
 
 def stale_seconds(targets: dict, now: datetime | None = None) -> float | None:
@@ -170,10 +176,22 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if route == "/api/status":
                 targets = read_state(self.state_path)
+                stale   = stale_seconds(targets)
                 self._log_metric("status")
+                if stale is not None:
+                    # The one metric the design note named as the one that
+                    # matters. Returning it only in the body would leave it
+                    # visible to whoever happens to look and invisible to
+                    # every alerting pipeline — and "nobody is looking" is
+                    # precisely the condition it exists to detect.
+                    logger.info(
+                        "event_type=metric metric=api_stale_state_seconds "
+                        "endpoint=status value=%.1f",
+                        stale,
+                    )
                 self._respond(200, {
                     "targets"      : targets,
-                    "stale_seconds": stale_seconds(targets),
+                    "stale_seconds": stale,
                 })
                 return
 

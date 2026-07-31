@@ -106,6 +106,19 @@ def test_read_state_survives_corrupt_json(tmp_path: Path) -> None:
     assert read_state(f) == {}
 
 
+def test_read_state_agrees_with_statemanager_on_a_malformed_file(tmp_path: Path) -> None:
+    """Found by the an audit. A hand-edited state.json with
+    schema_version but no targets key made this function fall back to the
+    whole object, serving schema_version itself as if it were a monitored
+    URL — a dashboard iterating the map would then read a status off an
+    integer. StateManager falls back to {} on the same input, and this
+    function's own docstring claims to mirror it; now it does."""
+    f = tmp_path / "state.json"
+    f.write_text(json.dumps({"schema_version": 4, "notes": "stray key"}), encoding="utf-8")
+    assert read_state(f) == {}
+    assert read_state(f) == main.StateManager(f)._state
+
+
 # =============================================================================
 # B. stale_seconds()
 # =============================================================================
@@ -228,6 +241,23 @@ def test_status_endpoint_serves_state(live_server) -> None:
     assert status == 200
     assert body["targets"][URL]["status"] == "UP"
     assert body["stale_seconds"] is not None
+
+
+def test_status_endpoint_logs_the_staleness_metric(live_server, caplog) -> None:
+    """Found by the an audit: the design note named
+    api_stale_state_seconds as the metric that matters, and the code returned
+    it in the body but never logged it. A number only visible to whoever
+    happens to look is no defence against 'nobody is looking', which is
+    exactly the condition it exists to detect — a dashboard serving
+    yesterday's data with a 200."""
+    with caplog.at_level("INFO"):
+        status, body = _get(live_server, "/api/status")
+    assert status == 200
+    assert any(
+        "metric=api_stale_state_seconds" in r.message
+        and f"value={body['stale_seconds']:.1f}" in r.message
+        for r in caplog.records
+    )
 
 
 def test_history_endpoint_serves_aggregates(live_server) -> None:

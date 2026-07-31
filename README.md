@@ -206,6 +206,7 @@ infrastructure.
 ├── diagnostics.py       Latency/BDP diagnostic engine — phase timings + findings
 ├── history.py           SQLite historical persistence — isolated from the alert path
 ├── notifiers.py         Multi-channel alert delivery — Discord + Slack, in parallel
+├── api.py               Read-only JSON endpoint — separate process, never writes
 ├── targets.yaml         URL configuration — edit freely, no restarts required
 ├── Dockerfile           Multi-stage, non-root, health-checked production image
 ├── docker-compose.yml   Standard deployment manifest
@@ -213,7 +214,7 @@ infrastructure.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               265-test suite covering probes, state, alerts, diagnostics, history
+├── tests/               287-test suite covering probes, state, alerts, diagnostics, history
 ├── .github/             CI: pytest, then docker build + run a real health-check cycle
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
@@ -228,7 +229,7 @@ infrastructure.
 
 We do not ship what we cannot prove works.
 
-265 automated tests cover every component in isolation: target loading (including
+287 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -530,6 +531,47 @@ every time the service recovers or the container restarts.
 leave the old threshold recorded forever, and the *next* expiry would skip its
 30-day warning — the monitor going quiet exactly at the notice that gives you
 the most room to act.
+
+---
+
+## Read-only JSON endpoint
+
+`--report` answers questions in a terminal. This answers them over HTTP, so
+something else can ask — a dashboard, a status page, a script that does not want
+to parse a table.
+
+```bash
+python api.py                          # 127.0.0.1:8787
+
+curl localhost:8787/api/status         # current state per target + staleness
+curl localhost:8787/api/history?window=7d   # uptime % and TTFB p50/p95
+```
+
+**It is a separate process, and that was not a preference.** `main.py` runs one
+cycle and exits — an HTTP server inside it would die every sixty seconds. The
+welcome consequence is that this endpoint cannot slow down, block, or crash a
+probe run, because it is not in one.
+
+**It cannot write, and that is enforced by SQLite rather than by intent.** Every
+connection opens with `mode=ro`, so an accidental `INSERT` fails with *attempt to
+write a readonly database*. It runs beside a live writer; "should not write" is a
+weaker guarantee than "cannot".
+
+**It binds to loopback.** The list of monitored URLs, when they fail, and with
+what error is an operational map. Publishing it should take a deliberate act, so
+`API_HOST` exists but you have to write it — and doing so logs a warning, because
+there is no authentication in front of it yet.
+
+**`stale_seconds` is the field to watch.** If the probe process dies, this
+endpoint keeps answering `200` with data that is perfectly well-formed and simply
+old — a green dashboard fed by yesterday. That number is also emitted as
+`api_stale_state_seconds` in the logs, because a value only visible to whoever
+happens to look is no defence against nobody looking.
+
+The figures come from the same functions `--report` uses, and the test suite
+asserts the two agree with *each other* rather than each with a fixture. A CLI and
+an API deriving the same number from the same rows and printing different answers
+is the kind of bug where both sides pass their own tests.
 
 ---
 
