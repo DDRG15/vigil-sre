@@ -64,6 +64,7 @@ from diagnostics import (
     degraded_reason,
     host_port_from_url,
     is_cert_healthy,
+    is_cert_renewed,
     phases_to_dict,
     sample_connection,
 )
@@ -151,12 +152,13 @@ STATUS_DEGRADED: str = "DEGRADED"   # probe succeeded but a performance finding 
 # still alert on their very first run.
 DOWN_CONFIRMATIONS: int = 2
 
-# v3 added the optional cert_alerted_days field (an earlier release). The bump is
+# v4 added cert_last_seen_days (an earlier release audit fix). v3 added cert_alerted_days.
+# Both bumps are
 # documentary, not functional: _load_sync only checks whether schema_version
 # EXISTS, never its value, and UrlState is total=False — so a v2 file loads
 # under v3 with the field simply absent, which is exactly the correct default
 # ("never cert-alerted"). There is no migration step to run or forget.
-STATE_SCHEMA_VERSION: int = 3   # bump whenever state.json's on-disk shape changes
+STATE_SCHEMA_VERSION: int = 4   # bump whenever state.json's on-disk shape changes
 
 # Webhook delivery retry now lives in notifiers.py alongside the Notifier
 # base class that applies it — see WEBHOOK_RETRY_ATTEMPTS / _BASE_S /
@@ -477,6 +479,7 @@ class UrlState(TypedDict, total=False):
     diagnostics         : dict   # last latency/BDP breakdown; on UP and DEGRADED probes
     consecutive_failures: int    # failed runs in a row since last healthy state; absent/0 when healthy
     cert_alerted_days   : int    # threshold (30 or 7) this target was last cert-alerted at
+    cert_last_seen_days : int    # previous run's tls_cert_days_left — a RISE means renewal
 
 
 #: Fields that describe something ORTHOGONAL to the current status, and must
@@ -492,7 +495,7 @@ class UrlState(TypedDict, total=False):
 #:
 #: consecutive_failures is deliberately NOT here — it is state ABOUT the
 #: status and must reset when the target recovers.
-_CARRY_FORWARD_FIELDS: tuple[str, ...] = ("cert_alerted_days",)
+_CARRY_FORWARD_FIELDS: tuple[str, ...] = ("cert_alerted_days", "cert_last_seen_days")
 
 
 def _carry_forward(previous: UrlState | None, record: UrlState) -> UrlState:
@@ -749,15 +752,21 @@ class StateManager:
             return changed
 
 
-    async def record_cert_alert(self, url: str, threshold_days: int | None) -> None:
+    async def record_cert_alert(
+        self,
+        url           : str,
+        threshold_days: int | None,
+        *,
+        last_seen_days: int | None = None,
+    ) -> None:
         """
-        Persist the certificate threshold this target was last alerted at, or
-        clear it when *threshold_days* is None (the certificate was renewed).
+        Persist the certificate threshold this target was last alerted at
+        (None clears it), and the days_left observed this run.
 
         Separate from the status writers on purpose: certificate expiry is
         orthogonal to whether the service is up right now, so it does not
-        belong in set_up/set_degraded/set_down's decision logic. It survives
-        those writers via _carry_forward.
+        belong in set_up/set_degraded/set_down's decision logic. Both fields
+        survive those writers via _carry_forward.
 
         A no-op when the record does not exist yet — the status writer always
         runs first in check_url, so that only happens if a caller inverts the
@@ -771,12 +780,19 @@ class StateManager:
                 record.pop("cert_alerted_days", None)  # type: ignore[misc]
             else:
                 record["cert_alerted_days"] = threshold_days
+            if last_seen_days is not None:
+                record["cert_last_seen_days"] = last_seen_days
             self._write_sync()
 
     def cert_alerted_days(self, url: str) -> int | None:
         """The threshold this target was last cert-alerted at, or None."""
         record = self._state.get(url)
         return record.get("cert_alerted_days") if record else None
+
+    def cert_last_seen_days(self, url: str) -> int | None:
+        """The tls_cert_days_left observed on this target's previous run."""
+        record = self._state.get(url)
+        return record.get("cert_last_seen_days") if record else None
 
 
 
@@ -1106,22 +1122,42 @@ async def _maybe_alert_cert_expiry(
     one layer down.
     """
     days = phases.tls_cert_days_left
+    if days is None:
+        return  # no TLS, so no certificate to have an opinion about
+
+    last_seen = state.cert_last_seen_days(url)
+    stored    = state.cert_alerted_days(url)
+
+    # Two independent reset signals, because one is not enough:
+    #   - is_cert_healthy: the certificate is comfortably far out again.
+    #   - is_cert_renewed: days_left ROSE, which only happens on replacement.
+    # The second exists because a cert renewed to anything under 30 days
+    # never satisfies the first, and without it a target that already alerted
+    # at the 7-day threshold stays silent forever — through the next full
+    # decay and through the certificate actually expiring. Found by the review
+    # audit of this phase, reproduced across three simulated renewal cycles.
+    if is_cert_renewed(days, last_seen) and stored is not None:
+        logger.info(
+            "🔐  Certificate renewed for %s (%d days left, was %d) — clearing "
+            "alert suppression.", url, days, last_seen,
+        )
+        stored = None
 
     if is_cert_healthy(days):
-        # Renewed (or never close to expiry). Forget any stored threshold so
-        # the NEXT expiry alerts from 30 days out again — without this, a
-        # renewed certificate keeps its old threshold forever and the monitor
-        # goes quiet exactly at the notice that gives the most room to act.
-        if state.cert_alerted_days(url) is not None:
-            logger.info("🔐  Certificate renewed for %s (%d days left).", url, days)
-            await state.record_cert_alert(url, None)
+        await state.record_cert_alert(url, None, last_seen_days=days)
         return
 
-    threshold = cert_alert_threshold(days, state.cert_alerted_days(url))
+    threshold = cert_alert_threshold(days, stored)
+
+    # Persist only when something actually moved. days_left changes about once
+    # a day, so on the ~1,440 runs in between this writes nothing at all.
+    if threshold is not None or days != last_seen or stored != state.cert_alerted_days(url):
+        await state.record_cert_alert(
+            url, threshold if threshold is not None else stored, last_seen_days=days,
+        )
+
     if threshold is None:
         return  # already alerted in this band — silence is the feature
-
-    await state.record_cert_alert(url, threshold)
 
     critical = threshold == CERT_CRIT_DAYS
     detail   = f"tls_cert_days_left={days} (alerting below {threshold})"

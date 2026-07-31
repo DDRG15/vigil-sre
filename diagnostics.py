@@ -665,6 +665,30 @@ def cert_alert_threshold(
     return None
 
 
+def is_cert_renewed(days_left: int | None, last_seen_days: int | None) -> bool:
+    """
+    True when this run's days_left is HIGHER than the previous run's.
+
+    Certificate lifetime only ever decreases with the calendar, so an
+    increase means one thing: the certificate was replaced. This is the only
+    renewal signal available for a certificate whose NEW validity period is
+    itself under CERT_WARN_DAYS — short-lived cert programs, or an internal
+    PKI issuing 14-day certs.
+
+    is_cert_healthy() cannot cover that case: it asks "is this certificate
+    comfortable" and a 25-day cert is not, so it never fires the reset. Found
+    by the an audit: without this signal, a target that has
+    already alerted at the 7-day threshold and then renews to anything below
+    30 days is silenced permanently — through the next full decay, and
+    through the certificate actually expiring, with no alert at any point.
+    """
+    return (
+        days_left is not None
+        and last_seen_days is not None
+        and days_left > last_seen_days
+    )
+
+
 def is_cert_healthy(days_left: int | None) -> bool:
     """
     True when a certificate is far enough out that any stored alert threshold

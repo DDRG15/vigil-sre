@@ -1536,6 +1536,43 @@ async def test_renewal_clears_the_stored_threshold(tmp_path: Path) -> None:
     assert alerts[0].kwargs["kind"] is AlertKind.CERT_EXPIRING_WARN
 
 
+async def test_short_lived_renewal_does_not_cause_permanent_silence(tmp_path: Path) -> None:
+    """Regression for the HIGH the an audit of this phase found.
+
+    A certificate whose renewals always land BELOW 30 days (short-lived cert
+    programs, internal PKI with a 14-day TTL, or a panic renewal right after
+    the critical alert) never satisfies is_cert_healthy, so before the fix
+    the stored threshold stayed pinned at 7 forever. The target went silent
+    permanently — through the next full decay AND through the certificate
+    actually expiring, with days_left negative and every TLS handshake in
+    production failing.
+
+    Three consecutive short-lived cycles must produce three WARN and three
+    CRIT, not two alerts total."""
+    sm = StateManager(tmp_path / "state.json")
+    kinds: list = []
+    for _ in range(3):
+        for day in range(25, -3, -1):   # 25 down through actual expiry
+            mock_alert = await _run_check_with_cert(sm, days_left=day)
+            kinds += [c.kwargs["kind"] for c in _cert_alerts(mock_alert)]
+
+    assert kinds.count(AlertKind.CERT_EXPIRING_WARN) == 3
+    assert kinds.count(AlertKind.CERT_EXPIRING_CRIT) == 3
+
+
+async def test_a_decaying_cert_is_not_mistaken_for_a_renewal(tmp_path: Path) -> None:
+    """The renewal signal is a RISE in days_left. Ordinary decay must never
+    look like one, or the suppression collapses and every run re-alerts —
+    the opposite failure, and the one this phase was built to prevent."""
+    sm = StateManager(tmp_path / "state.json")
+    await _run_check_with_cert(sm, days_left=25)      # first WARN
+    kinds: list = []
+    for day in (24, 23, 22, 21, 20):
+        mock_alert = await _run_check_with_cert(sm, days_left=day)
+        kinds += [c.kwargs["kind"] for c in _cert_alerts(mock_alert)]
+    assert kinds == []
+
+
 async def test_healthy_cert_never_alerts(tmp_path: Path) -> None:
     sm = StateManager(tmp_path / "state.json")
     mock_alert = await _run_check_with_cert(sm, days_left=200)

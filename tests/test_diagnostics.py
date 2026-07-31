@@ -57,6 +57,7 @@ from diagnostics import (
     default_window_ceiling_bps,
     degraded_reason,
     is_cert_healthy,
+    is_cert_renewed,
     effective_window_bytes,
     host_port_from_url,
     phases_to_dict,
@@ -549,3 +550,20 @@ def test_partial_renewal_into_the_warn_band_does_not_realert() -> None:
     rather than drifting into an accident: a cert renewed from 5 days to 25
     stays silent, because the operator already got the critical."""
     assert cert_alert_threshold(25, CERT_CRIT_DAYS) is None
+
+
+@pytest.mark.parametrize("days,last_seen,renewed", [
+    (25,   3,    True),    # the audit's case: renewed but still under 30
+    (90,   5,    True),
+    (6,    5,    True),    # even a tiny rise is a replacement
+    (24,   25,   False),   # ordinary decay
+    (25,   25,   False),   # same day, no movement
+    (25,   None, False),   # first observation is not a renewal
+    (None, 25,   False),   # lost TLS visibility is not a renewal
+    (None, None, False),
+])
+def test_is_cert_renewed(days, last_seen, renewed) -> None:
+    """Certificate lifetime only decreases with the calendar, so a RISE is
+    the one unambiguous replacement signal — and the only one available when
+    the new certificate is itself under CERT_WARN_DAYS."""
+    assert is_cert_renewed(days, last_seen) is renewed
