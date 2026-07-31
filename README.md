@@ -207,6 +207,7 @@ infrastructure.
 ├── history.py           SQLite historical persistence — isolated from the alert path
 ├── notifiers.py         Multi-channel alert delivery — Discord + Slack, in parallel
 ├── api.py               Read-only JSON endpoint — separate process, never writes
+├── dashboard.py         HTML view over that JSON — no framework, no JS dependency
 ├── targets.yaml         URL configuration — edit freely, no restarts required
 ├── Dockerfile           Multi-stage, non-root, health-checked production image
 ├── docker-compose.yml   Standard deployment manifest
@@ -214,7 +215,7 @@ infrastructure.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               287-test suite covering probes, state, alerts, diagnostics, history
+├── tests/               311-test suite covering probes, state, alerts, diagnostics, history
 ├── .github/             CI: pytest, then docker build + run a real health-check cycle
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
@@ -229,7 +230,7 @@ infrastructure.
 
 We do not ship what we cannot prove works.
 
-287 automated tests cover every component in isolation: target loading (including
+311 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -531,6 +532,44 @@ every time the service recovers or the container restarts.
 leave the old threshold recorded forever, and the *next* expiry would skip its
 30-day warning — the monitor going quiet exactly at the notice that gives you
 the most room to act.
+
+---
+
+## The dashboard
+
+```bash
+python api.py     # then open http://127.0.0.1:8787
+```
+
+One page. No navigation — if it needed a menu it would already be bigger than
+this product is. A dense list rather than a grid of cards, because a grid looks
+empty at six targets and unmanageable at fifty, while a list survives both.
+
+**The freshness bar sits above everything, before a single target.** Almost no
+monitoring dashboard tells you its own data is old: it shows green and you
+assume green means now. When the probe process dies, this page would keep
+answering 200 with data that is perfectly well-formed and simply stale. So past
+two run cycles the bar turns amber, and past five it turns red **and dims every
+row below it** — green that might be hours old has no business looking
+reassuring. That behaviour is the visual counterpart of the dead-man's switch,
+and it is the one thing here not borrowed from anyone else.
+
+**Three states, and colour is never the only channel.** UP, DEGRADED and DOWN
+carry the same palette Discord and Slack already use, so the reflex you train in
+one place works in the others. But roughly 8% of men have a colour vision
+deficiency and red/green is exactly the pair that fails, so every state also
+carries its own glyph and its own word.
+
+Clicking a row expands it — that is a native `<details>` element, not
+JavaScript. It is keyboard-accessible for free.
+
+**No framework, and no JavaScript dependency.** The roadmap picked FastAPI +
+Jinja2 + HTMX while this was still hypothetical. By the time it was built, it
+was two routes and two templates: FastAPI would have bought routing and
+validation nothing here needs while dragging in four more packages, and HTMX
+would have bought interactivity that came to ten lines of `fetch`. Three
+dependencies after many releases. The exit is written down: the day this grows
+filtering, silencing or acknowledgement, both earn their place.
 
 ---
 

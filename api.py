@@ -47,6 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from dashboard import render_page, render_rows
 from history import HISTORY_DB_FILE, latency_percentiles, uptime_pct
 
 logger = logging.getLogger("sre.api")
@@ -169,11 +170,46 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _respond_html(self, status: int, markup: str) -> None:
+        encoded = markup.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        # The page loads no external resource — every style and script is
+        # inline and self-authored, so the policy can be this tight. It also
+        # means a value that somehow escaped _row()'s escaping still could not
+        # pull in anything from outside.
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline'; connect-src 'self'",
+        )
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _dashboard_data(self) -> tuple[dict, dict, float | None]:
+        """State, history aggregates and staleness — what both HTML routes need."""
+        targets = read_state(self.state_path)
+        history = history_payload(
+            self.history_path, DEFAULT_WINDOW, list(targets)
+        )["targets"]
+        return targets, history, stale_seconds(targets)
+
     def do_GET(self) -> None:  # noqa: N802 — http.server's required spelling
         parsed = urlparse(self.path)
         route  = parsed.path.rstrip("/") or "/"
 
         try:
+            if route == "/":
+                self._log_metric("dashboard")
+                self._respond_html(200, render_page(*self._dashboard_data()))
+                return
+
+            if route == "/partial/targets":
+                self._log_metric("partial")
+                self._respond_html(200, render_rows(*self._dashboard_data()))
+                return
+
             if route == "/api/status":
                 targets = read_state(self.state_path)
                 stale   = stale_seconds(targets)
