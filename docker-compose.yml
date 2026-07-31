@@ -17,3 +17,41 @@ services:
     restart: unless-stopped
     command: >
       sh -c "while true; do python main.py || exit 1; sleep 60; done"
+
+  # The read-only API and the dashboard it serves (the design note, the design note). A separate
+  # service and not a thread inside health-checker, because health-checker is not
+  # a long-lived process: it runs one cycle and exits, and the loop above restarts
+  # it every 60 seconds. An HTTP server living in there would die every minute.
+  dashboard:
+    build: .
+    environment:
+      - STATE_FILE_PATH=/app/data/state.json
+      # 0.0.0.0 INSIDE the container is required, not a loosening: a process
+      # bound to the container's own loopback is unreachable through a port
+      # mapping. The isolation lives in the "127.0.0.1:" of the ports entry
+      # below, on the host side, which is where it actually holds. api.py logs
+      # a warning when it binds off-loopback and that warning is correct here —
+      # it states exactly what is happening.
+      - API_HOST=0.0.0.0
+    volumes:
+      # Read-only twice over: sqlite opens with mode=ro, and the mount makes a
+      # write physically impossible. This process runs alongside a live writer.
+      - ./data:/app/data:ro
+      - ./history.db:/app/history.db:ro
+    ports:
+      # Bound to the host's loopback deliberately. This endpoint has NO
+      # authentication and publishes the operational map — which targets exist,
+      # when they fail, with what error. Publishing it is a decision; "8787:8787"
+      # is how you back into it by accident.
+      - "127.0.0.1:8787:8787"
+    restart: unless-stopped
+    command: ["python", "api.py"]
+    healthcheck:
+      # The probe's healthcheck loads config; this one has to prove the socket
+      # answers, which is the only thing this service exists to do.
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/status', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5s
+      retries: 3

@@ -24,6 +24,18 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
+      - name: Audit dependencies for known CVEs
+        # Twenty phases shipped with three pinned dependencies and nothing
+        # checking whether any of them had a published CVE. Pinning makes the
+        # build reproducible; it also means the versions never move on their
+        # own, so a reproducible build is a photograph of a state that ages.
+        # aiohttp carries every outbound request this project makes and has a
+        # real history of CVEs. pip-audit is PyPA's, queries the OSV database,
+        # and lives in CI — it adds nothing to requirements.txt.
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
   docker:
     name: docker build & run
     runs-on: ubuntu-latest
@@ -33,14 +45,17 @@ jobs:
       - name: Build image
         run: docker build -t vigil-sre .
 
-      - name: Verify the image can import its own application module
-        # A `docker build` succeeding proves nothing about whether the app
-        # can start -- an earlier Dockerfile revision COPYed only main.py
-        # while main.py imports diagnostics and history, and the build still
-        # passed. Only running the image catches that. This mirrors the
-        # Dockerfile's own HEALTHCHECK command exactly, so a regression here
-        # is a regression there too.
-        run: docker run --rm --entrypoint python vigil-sre -c "import main; print('main OK')"
+      - name: Verify the image can import every entrypoint it ships
+        # A `docker build` succeeding proves nothing about whether the app can
+        # start -- a build that COPYs three of six modules is a perfectly
+        # successful build. This step existed and would have caught the an earlier release
+        # break on the day it landed; it never ran, because CI had not run
+        # unpushed. Both entrypoints are named now, not just main: the image
+        # went a long time unable to import notifiers, api or dashboard while
+        # `import main` alone was the whole check.
+        run: |
+          docker run --rm --entrypoint python vigil-sre -c "import main; print('main OK')"
+          docker run --rm --entrypoint python vigil-sre -c "import api, dashboard, notifiers; print('api OK')"
 
       - name: Run one real health-check cycle end-to-end
         # Exercises the actual deployment path (docker-compose.yml, the real

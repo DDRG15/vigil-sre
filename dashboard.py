@@ -30,8 +30,9 @@ Depends : stdlib only (html, json).
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
-from datetime import datetime, timezone
 
 #: Same palette Discord and Slack already use for the same three states, so
 #: the reflex an operator trains in one channel carries to the others.
@@ -100,9 +101,15 @@ def _row(url: str, state: dict, history: dict) -> str:
     place any of them enters the HTML — see the module docstring for why that
     is structural rather than a convention to remember.
     """
+    # isinstance BEFORE the membership test: `in COLOURS` raises TypeError on an
+    # unhashable value rather than falling through to UNKNOWN, and `and` short-
+    # circuits before it gets the chance. TargetState types these `str`, but
+    # nothing enforces that at the JSON boundary — a hand edit during debugging
+    # is enough, and the crash costs the whole page, not the one bad row.
     status  = state.get("status", "UNKNOWN")
-    status  = status if status in COLOURS else "UNKNOWN"
+    status  = status if isinstance(status, str) and status in COLOURS else "UNKNOWN"
     detail  = state.get("last_error") or ""
+    detail  = detail if isinstance(detail, str) else str(detail)
     checked = state.get("last_checked", "—")
 
     e_url     = html.escape(url)
@@ -192,6 +199,10 @@ header{display:flex;justify-content:space-between;align-items:baseline;
 .body{padding:.25rem .25rem .75rem 9.75rem}
 .detail{margin:.25rem 0;word-break:break-word}
 .muted{color:var(--muted)}
+/* Empty until a poll fails, so it costs no space in the normal case. When it
+   does speak it is the only red in the header, because it outranks everything
+   below it: if polling is broken, nothing below it is current. */
+.conn{color:#FF0000;font-weight:700;font-size:.85rem}
 .empty{color:var(--muted);padding:2rem 0;text-align:center}
 @media(max-width:640px){
   body{padding:.75rem}
@@ -201,24 +212,63 @@ header{display:flex;justify-content:space-between;align-items:baseline;
   .body{padding-left:.25rem}}
 """
 
-# Ten lines of fetch, in place of a JavaScript dependency. It preserves which
-# rows are open across a swap — replacing innerHTML would otherwise close every
-# expanded row every 30 seconds, which is the kind of small wrongness that
+# A dozen lines of fetch, in place of a JavaScript dependency. It preserves
+# which rows are open across a swap — replacing innerHTML would otherwise close
+# every expanded row every 30 seconds, which is the kind of small wrongness that
 # makes a tool feel broken.
+#
+# A failed poll used to keep the last good render on screen and say nothing.
+# That is the freshness banner's own failure mode turned against it: the banner
+# only updates when the poll succeeds, so the moment polling breaks it freezes
+# mid-sentence and keeps claiming the data is thirty seconds old. #conn lives
+# outside #list precisely so a failed poll can still reach it.
 _SCRIPT = """
+let misses=0;
 async function refresh(){
   const open=[...document.querySelectorAll('details[open]')].map(d=>d.dataset.url);
+  const conn=document.getElementById('conn');
   try{
     const r=await fetch('/partial/targets',{cache:'no-store'});
-    if(!r.ok)return;
+    if(!r.ok){
+      misses++;
+      if(conn)conn.textContent=`⚠ El servidor respondió ${r.status} — ${misses} sondeo(s) sin actualizar.`;
+      return;
+    }
     document.getElementById('list').innerHTML=await r.text();
     open.forEach(u=>{
       const d=document.querySelector(`details[data-url="${CSS.escape(u)}"]`);
       if(d)d.open=true;});
-  }catch(e){/* a failed poll keeps the last good render on screen */}
+    misses=0;
+    if(conn)conn.textContent='';
+  }catch(e){
+    misses++;
+    if(conn)conn.textContent=`⚠ Sin conexión con el servidor — ${misses} intento(s) fallido(s). Lo de abajo es el último dato bueno.`;
+  }
 }
 setInterval(refresh, %d000);
 """
+
+
+#: The exact bytes that go inside <script>. Rendered once and reused, because
+#: the CSP hash below is computed over this string: formatting it twice would
+#: let the two copies drift by a byte, and the browser would then refuse the
+#: script and silently stop refreshing the page.
+_SCRIPT_RENDERED = _SCRIPT % POLL_INTERVAL_S
+
+
+def _csp_hash(content: str) -> str:
+    """A `'sha256-...'` source expression for exactly this inline block."""
+    digest = hashlib.sha256(content.encode("utf-8")).digest()
+    return "'sha256-" + base64.b64encode(digest).decode("ascii") + "'"
+
+
+#: `unsafe-inline` would let ANY inline script run, including an injected one —
+#: which is the single thing CSP exists to stop, so a policy carrying it buys
+#: nothing against XSS while reading as if it did. Both blocks here are fixed
+#: strings for the life of the process, so a hash computed once is enough and
+#: no per-request nonce is needed.
+STYLE_HASH : str = _csp_hash(_STYLE)
+SCRIPT_HASH: str = _csp_hash(_SCRIPT_RENDERED)
 
 
 def render_page(targets: dict, history: dict, stale_seconds: float | None) -> str:
@@ -233,11 +283,12 @@ def render_page(targets: dict, history: dict, stale_seconds: float | None) -> st
 <header>
   <h1>vigil-sre</h1>
   <span class="muted">{len(targets)} target(s) · se actualiza cada {POLL_INTERVAL_S}s</span>
+  <span id="conn" class="conn" role="status" aria-live="polite"></span>
 </header>
 <div class="row head"><div class="row"><summary style="cursor:default">
   <span>Estado</span><span>Target</span><span class="num">Uptime</span>
   <span class="num">p50</span><span class="num">p95</span>
 </summary></div></div>
 <div id="list">{render_rows(targets, history, stale_seconds)}</div>
-<script>{_SCRIPT % POLL_INTERVAL_S}</script>
+<script>{_SCRIPT_RENDERED}</script>
 </body></html>"""

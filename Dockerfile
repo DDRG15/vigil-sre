@@ -69,10 +69,16 @@ WORKDIR /app
 # in the runtime image, which keeps it small and reduces the attack surface.
 COPY --from=builder /install/lib/python3.11/site-packages /app/site-packages
 
-# Copy application source files — all three modules main.py imports.
+# Copy every application module. NOT one COPY per file: that list silently
+# desynchronised twice — once in an earlier release, and again in an earlier release, where the image
+# went a long time unable to start because `notifiers.py` was never added to it.
+# A build copying three of six files is a perfectly successful build, so nothing
+# fails until the container runs. Copying the package and filtering through
+# .dockerignore inverts the failure mode: forgetting to exclude something bakes
+# in one extra file, while forgetting to include one no longer breaks startup.
 # targets.yaml and .env are expected to be bind-mounted at runtime (see above)
 # so they are NOT baked into the image — this keeps secrets out of image layers.
-COPY main.py diagnostics.py history.py ./
+COPY *.py ./
 
 # state.json (ephemeral fallback path) and /app/data (the STATE_FILE_PATH
 # directory docker-compose.yml mounts — see its comment for why state.json

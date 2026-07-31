@@ -47,6 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import dashboard
 from dashboard import render_page, render_rows
 from history import HISTORY_DB_FILE, latency_percentiles, uptime_pct
 
@@ -175,14 +176,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
-        # The page loads no external resource — every style and script is
-        # inline and self-authored, so the policy can be this tight. It also
-        # means a value that somehow escaped _row()'s escaping still could not
-        # pull in anything from outside.
+        # The page loads no external resource, so the policy can forbid every
+        # origin outright. The inline blocks are admitted by their SHA-256
+        # hash, not by 'unsafe-inline': the earlier policy carried
+        # `script-src 'unsafe-inline'`, which admits ANY inline script — an
+        # injected one included — so it read as a defence against XSS while
+        # providing none. base-uri and form-action are named explicitly
+        # because neither inherits from default-src under CSP3, and an
+        # injected <base> would redirect the page's own poll to another origin.
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'; "
-            "script-src 'unsafe-inline'; connect-src 'self'",
+            f"default-src 'none'; style-src {dashboard.STYLE_HASH}; "
+            f"script-src {dashboard.SCRIPT_HASH}; connect-src 'self'; "
+            "base-uri 'none'; form-action 'none'",
         )
         self.end_headers()
         self.wfile.write(encoded)

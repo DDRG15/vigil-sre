@@ -538,8 +538,19 @@ the most room to act.
 ## The dashboard
 
 ```bash
-python api.py     # then open http://127.0.0.1:8787
+docker compose up -d          # probe + dashboard, both
+python api.py                 # or standalone, without Docker
+                              # then open http://127.0.0.1:8787
 ```
+
+Compose runs it as its own service, not a thread inside the probe: the probe is
+not a long-lived process — it runs one cycle and exits, and the loop restarts it
+every 60 seconds — so a server living in there would die every minute. The
+service mounts the state directory and the database **read-only**, and publishes
+its port to `127.0.0.1` on the host rather than to every interface. This endpoint
+has no authentication and it serves the operational map: which targets exist,
+when they fail, with what error. Publishing that is a decision, and `8787:8787`
+is how you back into it by accident.
 
 One page. No navigation — if it needed a menu it would already be bigger than
 this product is. A dense list rather than a grid of cards, because a grid looks
@@ -553,6 +564,13 @@ two run cycles the bar turns amber, and past five it turns red **and dims every
 row below it** — green that might be hours old has no business looking
 reassuring. That behaviour is the visual counterpart of the dead-man's switch,
 and it is the one thing here not borrowed from anyone else.
+
+That bar has one blind spot, and the header covers it: **the bar only updates
+when a poll succeeds.** If the server dies while a tab is open, the page would
+freeze mid-sentence and go on claiming the data is thirty seconds old — the
+freshness mechanism disabled by exactly the kind of failure it exists to catch.
+So a failed poll writes its own line in the header, outside the fragment the
+refresh replaces, and counts how many have failed in a row.
 
 **Three states, and colour is never the only channel.** UP, DEGRADED and DOWN
 carry the same palette Discord and Slack already use, so the reflex you train in

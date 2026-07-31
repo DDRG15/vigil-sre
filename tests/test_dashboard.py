@@ -149,6 +149,26 @@ def test_a_non_dict_state_entry_does_not_break_the_page() -> None:
     assert GLYPHS["UNKNOWN"] in markup
 
 
+def test_a_non_string_status_does_not_crash_the_page() -> None:
+    """The test above covers a whole entry being non-dict. It does not cover a
+    single mistyped FIELD inside an otherwise valid record, which is the gap the
+    a later audit found: `status in COLOURS` raises TypeError on an unhashable
+    value instead of falling through to UNKNOWN, and that exception escapes
+    do_GET's `except sqlite3.Error` -- so the operator loses the view of all six
+    targets over one bad field in one of them."""
+    markup = render_rows({URL: _state(status=["UP"])}, {}, 10)
+    assert GLYPHS["UNKNOWN"] in markup
+    assert COLOURS["UP"] not in markup
+
+
+def test_a_non_string_last_error_does_not_crash_the_page() -> None:
+    """last_error is typed str in TargetState, but nothing enforces that at the
+    JSON boundary -- a hand edit while debugging is enough. Coerce, then escape:
+    the operator still sees the value, and the page still renders."""
+    markup = render_rows({URL: _state("DOWN", last_error=404)}, {}, 10)
+    assert "404" in markup
+
+
 # =============================================================================
 # C. render_page()
 # =============================================================================
@@ -177,6 +197,33 @@ def test_dead_data_dims_the_rows() -> None:
 def test_page_with_no_targets_says_so() -> None:
     page = render_page({}, {}, None)
     assert "No hay targets" in page
+
+
+def test_the_page_can_report_its_own_poll_failing() -> None:
+    """The freshness banner only updates when a poll succeeds, so when polling
+    breaks it freezes mid-sentence and keeps claiming the data is 30s old --
+    the banner's own failure mode, turned against it, exactly when it matters.
+    #conn lives OUTSIDE #list so a failed poll can still reach it; if it were
+    inside, the swap that never happens is the swap that would have written it."""
+    page = render_page({URL: _state()}, {}, 10)
+    assert 'id="conn"' in page
+    before_list, _, after_list = page.partition('<div id="list">')
+    assert 'id="conn"' in before_list, "#conn must not sit inside the swapped fragment"
+    assert 'id="conn"' not in after_list
+
+    partial = render_rows({URL: _state()}, {}, 10)
+    assert 'id="conn"' not in partial, "the fragment must not carry a second #conn"
+
+
+def test_the_script_the_page_serves_is_the_one_the_csp_hashes() -> None:
+    """A byte of drift between the rendered script and the hashed string is
+    invisible in pytest and fatal in a browser: the script is refused, the page
+    stops refreshing, and it still looks perfectly fine. Assert they are the
+    same object's content rather than trusting two call sites to agree."""
+    page = render_page({URL: _state()}, {}, 10)
+    assert f"<script>{dashboard._SCRIPT_RENDERED}</script>" in page
+    assert dashboard.SCRIPT_HASH == dashboard._csp_hash(dashboard._SCRIPT_RENDERED)
+    assert dashboard.STYLE_HASH  == dashboard._csp_hash(dashboard._STYLE)
 
 
 # =============================================================================
@@ -232,6 +279,29 @@ def test_html_routes_send_a_restrictive_csp(live_server) -> None:
     _, headers, _ = _get(live_server, "/")
     csp = headers["Content-Security-Policy"]
     assert "default-src 'none'" in csp
+
+
+def test_the_csp_does_not_allow_unsafe_inline(live_server) -> None:
+    """`script-src 'unsafe-inline'` admits ANY inline script, an injected one
+    included -- which is the one thing CSP exists to stop. The old policy
+    carried it while its comment claimed it blunted anything that escaped the
+    escaping. Both inline blocks are fixed strings, so hashes suffice and no
+    per-request nonce is needed."""
+    _, headers, _ = _get(live_server, "/")
+    csp = headers["Content-Security-Policy"]
+    assert "'unsafe-inline'" not in csp
+    assert f"script-src {dashboard.SCRIPT_HASH}" in csp
+    assert f"style-src {dashboard.STYLE_HASH}" in csp
+
+
+def test_the_csp_names_the_directives_that_do_not_inherit(live_server) -> None:
+    """base-uri and form-action do NOT fall back to default-src under CSP3.
+    An injected <base href="https://evil"> would point the page's own
+    fetch('/partial/targets') at someone else's origin."""
+    _, headers, _ = _get(live_server, "/")
+    csp = headers["Content-Security-Policy"]
+    assert "base-uri 'none'" in csp
+    assert "form-action 'none'" in csp
 
 
 def test_hostile_target_is_escaped_over_the_wire(live_server) -> None:

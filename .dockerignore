@@ -8,6 +8,10 @@ htmlcov/
 tests/
 *.log
 state.json
+# Operational data, never image content. history.db matters more since the
+# Dockerfile switched to `COPY *.py ./` — a wildcard COPY makes what stays out
+# of the image this file's job, not the COPY line's.
+history.db
 .env
 .git/
 .github/
