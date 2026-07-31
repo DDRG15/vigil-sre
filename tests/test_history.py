@@ -7,7 +7,7 @@ Coverage:
   C. prune()                      — 4 tests
   D. _retention_days_from_env()   — 4 tests
   E. Metric contract (caplog)     — 3 tests
-  F. uptime_pct() / latency_percentiles() (an earlier release) — 10 tests
+  F. uptime_pct() / latency_percentiles() (an earlier release + audit fixes) — 17 tests
 
 Reviewer notes
 --------------
@@ -21,6 +21,7 @@ be proving the guarantee, only assuming it.
 
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 import sys
@@ -405,6 +406,67 @@ async def test_uptime_pct_no_schema_yet_returns_none_not_a_crash(tmp_path: Path)
 async def test_latency_percentiles_no_schema_yet_returns_none_not_a_crash(tmp_path: Path) -> None:
     db_path = tmp_path / "history.db"
     assert latency_percentiles(db_path, URL, OLD_CUTOFF) is None
+
+
+async def test_uptime_pct_raises_on_a_locked_database_instead_of_saying_no_data(
+    tmp_path: Path,
+) -> None:
+    """'Nothing recorded yet' and 'I could not read it' are different claims.
+    Reproduced during the an earlier release audit: running --report while the probe
+    loop held a write lock reported 'no data' for a target with 100% uptime
+    and real rows, sending the operator hunting a persistence bug in a
+    healthy system. Only 'no such table' may be swallowed."""
+    db_path = tmp_path / "history.db"
+    rec = HistoryRecorder(db_path)
+    await rec.record_run("2026-07-30T00:00:00Z", [
+        CheckOutcome(url=URL, status="UP", checked_at="2026-07-30T00:00:00Z", phases=_phases())
+    ])
+    blocker = sqlite3.connect(db_path, isolation_level=None)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            uptime_pct(db_path, URL, OLD_CUTOFF)
+    finally:
+        blocker.close()
+
+
+async def test_latency_percentiles_raises_on_a_locked_database(tmp_path: Path) -> None:
+    db_path = tmp_path / "history.db"
+    rec = HistoryRecorder(db_path)
+    await rec.record_run("2026-07-30T00:00:00Z", [
+        CheckOutcome(url=URL, status="UP", checked_at="2026-07-30T00:00:00Z", phases=_phases())
+    ])
+    blocker = sqlite3.connect(db_path, isolation_level=None)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            latency_percentiles(db_path, URL, OLD_CUTOFF)
+    finally:
+        blocker.close()
+
+
+@pytest.mark.parametrize("n", [2, 3, 5, 10, 50])
+async def test_percentiles_include_the_maximum_at_every_sample_size(
+    tmp_path: Path, n: int,
+) -> None:
+    """PERCENT_RANK is (rank-1)/(n-1), so the top row always evaluates to
+    exactly 1.0 and `pr <= 0.95` structurally excludes the maximum -- biasing
+    p95 downward, always in the flattering direction. Measured during the
+    audit: 10 samples of 1..10ms reported p95 = 9, and 2 samples reported the
+    MINIMUM. Checked here against the textbook nearest-rank value, ceil(p*n),
+    at the sample sizes where the distortion is worst."""
+    db_path = tmp_path / "history.db"
+    rec = HistoryRecorder(db_path)
+    await rec.record_run("2026-07-30T00:00:00Z", [
+        CheckOutcome(url=URL, status="UP", checked_at="2026-07-30T00:00:00Z",
+                     phases=_phases(ttfb_ms=float(v)))
+        for v in range(1, n + 1)
+    ])
+    result = latency_percentiles(db_path, URL, OLD_CUTOFF)
+    assert result == {
+        "p50_ttfb_ms": float(math.ceil(0.50 * n)),
+        "p95_ttfb_ms": float(math.ceil(0.95 * n)),
+    }
 
 
 async def test_uptime_pct_excludes_rows_before_since(tmp_path: Path) -> None:

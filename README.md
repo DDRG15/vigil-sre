@@ -213,7 +213,7 @@ infrastructure.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               206-test suite covering probes, state, alerts, diagnostics, history
+├── tests/               214-test suite covering probes, state, alerts, diagnostics, history
 ├── .github/             CI: pytest, then docker build + run a real health-check cycle
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
@@ -228,7 +228,7 @@ infrastructure.
 
 We do not ship what we cannot prove works.
 
-206 automated tests cover every component in isolation: target loading (including
+214 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -403,13 +403,17 @@ operate — it is a file, and the backup procedure is the same one already docum
 for `state.json`: copy it.
 
 ```sql
--- p50/p95/p99 RTT and average TTFB per target, over everything history.db has kept
+-- p50/p95/p99 RTT and average TTFB per target, over everything history.db has kept.
+-- CUME_DIST (rank/n) with MIN, not PERCENT_RANK ((rank-1)/(n-1)) with MAX: under
+-- PERCENT_RANK the highest row always evaluates to exactly 1.0, so `<= 0.95` can
+-- never include the maximum and every percentile reads lower than it is. This is
+-- the same query --report runs, so the two agree by construction.
 SELECT url, COUNT(*) n, AVG(ttfb_ms) avg_ttfb,
-       MAX(CASE WHEN pr <= 0.50 THEN rtt_ms END) p50_rtt,
-       MAX(CASE WHEN pr <= 0.95 THEN rtt_ms END) p95_rtt,
-       MAX(CASE WHEN pr <= 0.99 THEN rtt_ms END) p99_rtt
+       MIN(CASE WHEN cd >= 0.50 THEN rtt_ms END) p50_rtt,
+       MIN(CASE WHEN cd >= 0.95 THEN rtt_ms END) p95_rtt,
+       MIN(CASE WHEN cd >= 0.99 THEN rtt_ms END) p99_rtt
 FROM (SELECT url, ttfb_ms, rtt_ms,
-             PERCENT_RANK() OVER (PARTITION BY url ORDER BY rtt_ms) pr
+             CUME_DIST() OVER (PARTITION BY url ORDER BY rtt_ms) cd
       FROM probe_results)
 GROUP BY url;
 

@@ -62,6 +62,30 @@ WEBHOOK_RETRY_AFTER_CAP_S: float = 30.0  # cap on an honoured Retry-After value
 # are different concerns that happened to share a number.
 WEBHOOK_TIMEOUT_S: float = 5.0
 
+#: Placeholder written in place of a webhook URL that would otherwise reach a log.
+REDACTED = "<webhook redacted>"
+
+
+def _redact(text: str, webhook: str | None) -> str:
+    """
+    Strip *webhook* out of *text* before it reaches a log.
+
+    aiohttp puts the FULL request URL into the message of its URL-shaped
+    errors (InvalidUrlClientError, NonHttpUrlClientError). Reproduced during
+    the an earlier release audit: a webhook whose scheme was typo'd — "htps://" —
+    lands verbatim in health_checker.log, token included, and that token
+    still works for anyone who reads the file and fixes the scheme. The log
+    rotates at 10 MiB x 5 backups, so it is a live credential sitting on disk
+    for a long time.
+
+    Redacting at the logging boundary rather than at each call site is the
+    same rule an earlier release applied to expect_substring: one place to get right,
+    and every sink downstream inherits it.
+    """
+    if not webhook:
+        return text
+    return text.replace(webhook, REDACTED)
+
 
 class AlertKind(Enum):
     """
@@ -222,7 +246,8 @@ class Notifier(abc.ABC):
                         "event_type=metric metric=alerts_lost_total channel=%s "
                         "value=1 reason=%s",
                         self.name, kind.value, url, WEBHOOK_RETRY_ATTEMPTS,
-                        type(exc).__name__, exc, self.name, type(exc).__name__,
+                        type(exc).__name__, _redact(str(exc), webhook),
+                        self.name, type(exc).__name__,
                     )
                     return False
 
@@ -386,7 +411,8 @@ def active_notifiers() -> list[Notifier]:
     config file to keep in sync with .env, and no way for a channel to be
     "enabled" while missing the webhook it needs.
     """
-    return [cls() for cls in ALL_NOTIFIERS if cls().webhook_url() is not None]
+    candidates = [cls() for cls in ALL_NOTIFIERS]
+    return [c for c in candidates if c.webhook_url() is not None]
 
 
 async def dispatch_alert(

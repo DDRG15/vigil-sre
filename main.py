@@ -1376,8 +1376,13 @@ def _generate_report(
         return (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     col_width = 12
+    # Widen the URL column to fit the longest target rather than a fixed 40:
+    # a longer URL used to push every numeric column out of alignment, and a
+    # misaligned table is read by eye, so the numbers stop lining up exactly
+    # where someone is trying to compare them.
+    url_width = max([len(t.url) for t in targets] + [len("Target")]) + 2
     header = (
-        "Target".ljust(40)
+        "Target".ljust(url_width)
         + "".join(f"Up {w}d".rjust(col_width) for w in windows)
         + "p50 TTFB".rjust(col_width) + "p95 TTFB".rjust(col_width)
     )
@@ -1390,7 +1395,7 @@ def _generate_report(
     ]
 
     for target in targets:
-        row = target.url.ljust(40)
+        row = target.url.ljust(url_width)
         for w in windows:
             pct = uptime_pct(history_path, target.url, since(w))
             cell = "no data" if pct is None else f"{pct:.1f}%"

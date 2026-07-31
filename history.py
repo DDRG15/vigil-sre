@@ -342,6 +342,23 @@ class HistoryRecorder:
 # — --report is a one-shot CLI invocation, not a long-lived process, so
 # there is no connection to amortise the cost across.
 
+def _is_missing_schema(exc: sqlite3.OperationalError) -> bool:
+    """
+    True only for "no such table" — history.db has never been initialised.
+
+    That is a real, expected sequence: --report on a freshly deployed
+    instance, before the first probe cycle recorded anything. Every other
+    OperationalError is a failure to READ, not an absence of data — most
+    importantly "database is locked", which happens when --report runs while
+    the probe loop is mid-write (reproduced during the an earlier release audit: the
+    report showed "no data" for a target with 100% uptime and 30 days of
+    rows). Collapsing the two turns "I could not read it" into the silent,
+    confident claim "there is nothing there", and sends an operator hunting
+    for a persistence bug in a healthy system.
+    """
+    return "no such table" in str(exc).lower()
+
+
 def uptime_pct(db_path: Path, url: str, since: str) -> float | None:
     """
     Percentage of *url*'s probes since *since* (an ISO-8601 UTC string,
@@ -362,17 +379,24 @@ def uptime_pct(db_path: Path, url: str, since: str) -> float | None:
     --report before the first probe cycle has ever recorded anything is a
     real sequence (a freshly deployed instance, or an operator checking the
     report before the first `sleep 60` loop iteration), and "no data" is the
-    honest answer, not a stack trace.
+    honest answer, not a stack trace. Any OTHER read failure is raised: see
+    _is_missing_schema for why the two must not look alike.
     """
-    con = sqlite3.connect(db_path)
+    con = sqlite3.connect(db_path, timeout=CONNECT_TIMEOUT_S)
     try:
         row = con.execute(
             "SELECT COUNT(*), SUM(CASE WHEN status != 'DOWN' THEN 1 ELSE 0 END) "
             "FROM probe_results WHERE url = ? AND checked_at >= ?",
             (url, since),
         ).fetchone()
-    except sqlite3.OperationalError:
-        return None  # no such table -- history.db predates any recorded run
+    except sqlite3.OperationalError as exc:
+        if _is_missing_schema(exc):
+            return None  # history.db predates any recorded run
+        logger.warning(
+            "Could not read uptime history for %s: %s — reporting this as "
+            "unavailable rather than as absent.", url, exc,
+        )
+        raise
     finally:
         con.close()
     total, up = row
@@ -388,29 +412,45 @@ def latency_percentiles(db_path: Path, url: str, since: str) -> dict[str, float]
     was DOWN for the entire window has nothing to measure, and a fabricated
     0ms reads as suspiciously fast rather than as absent.
 
-    PERCENT_RANK() is a SQLite window function (3.25+, confirmed present in
-    the runtime this project targets) — the same query shape the design note measured
-    at 118ms over 20,000 rows before choosing SQLite over a heavier engine.
+    Uses CUME_DIST(), not PERCENT_RANK(), and takes the MIN of the rows that
+    reach the threshold — that pair is the nearest-rank definition of a
+    percentile, equal to the textbook value at index ceil(p * n).
+
+    The distinction is not academic. PERCENT_RANK is (rank-1)/(n-1), so the
+    highest row always evaluates to exactly 1.0 and `pr <= 0.95` structurally
+    excludes the maximum — measured during the an earlier release audit: with 10
+    samples of 1..10ms it reported p95 = 9 instead of 10, and with 2 samples
+    it reported the MINIMUM. The bias is systematic and always in the
+    flattering direction, understating the latency tail in a tool whose only
+    value is being trustworthy about numbers. CUME_DIST is rank/n, so the
+    maximum reaches 1.0 and is included.
 
     Returns None (not a crash) when history.db has no schema yet — see
-    uptime_pct()'s docstring for why that is a real, expected sequence.
+    uptime_pct()'s docstring for why that is a real, expected sequence, and
+    _is_missing_schema for why every other read failure is raised instead.
     """
-    con = sqlite3.connect(db_path)
+    con = sqlite3.connect(db_path, timeout=CONNECT_TIMEOUT_S)
     try:
         row = con.execute(
             """
-            SELECT MAX(CASE WHEN pr <= 0.50 THEN ttfb_ms END) AS p50,
-                   MAX(CASE WHEN pr <= 0.95 THEN ttfb_ms END) AS p95
+            SELECT MIN(CASE WHEN cd >= 0.50 THEN ttfb_ms END) AS p50,
+                   MIN(CASE WHEN cd >= 0.95 THEN ttfb_ms END) AS p95
             FROM (
-                SELECT ttfb_ms, PERCENT_RANK() OVER (ORDER BY ttfb_ms) AS pr
+                SELECT ttfb_ms, CUME_DIST() OVER (ORDER BY ttfb_ms) AS cd
                 FROM probe_results
                 WHERE url = ? AND checked_at >= ? AND ttfb_ms IS NOT NULL
             )
             """,
             (url, since),
         ).fetchone()
-    except sqlite3.OperationalError:
-        return None  # no such table -- history.db predates any recorded run
+    except sqlite3.OperationalError as exc:
+        if _is_missing_schema(exc):
+            return None  # history.db predates any recorded run
+        logger.warning(
+            "Could not read latency history for %s: %s — reporting this as "
+            "unavailable rather than as absent.", url, exc,
+        )
+        raise
     finally:
         con.close()
     p50, p95 = row

@@ -58,6 +58,7 @@ from main import (
     run_health_checks,
 )
 from notifiers import (
+    REDACTED,
     AlertKind,
     DiscordNotifier,
     SlackNotifier,
@@ -941,6 +942,27 @@ async def test_slack_send_accepts_200_not_204(monkeypatch) -> None:
                 )
         mock_sleep.assert_not_called()
     assert delivered is True
+
+
+async def test_send_never_writes_the_webhook_url_to_a_log(monkeypatch, caplog) -> None:
+    """A webhook whose scheme is typo'd still carries a VALID token, and
+    aiohttp puts the whole URL into its error message. Without redaction that
+    token lands in health_checker.log -- which rotates at 10 MiB x 5 backups,
+    so it is a live, reusable credential sitting on disk for anyone who reads
+    the file and fixes the scheme. (audit finding)"""
+    typo_url = "htps://hooks.slack.com/services/T0REAL/B0REAL/tOkEnRealQueSiSirve"
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", typo_url)
+    with patch("notifiers.asyncio.sleep", new_callable=AsyncMock):
+        async with aiohttp.ClientSession() as session:
+            with caplog.at_level("WARNING"):
+                delivered = await SlackNotifier().send(
+                    session, TARGET_URL, "HTTP 503", AlertKind.FAILURE
+                )
+    assert delivered is False
+    logged = " ".join(r.message for r in caplog.records)
+    assert "tOkEnRealQueSiSirve" not in logged
+    assert typo_url not in logged
+    assert REDACTED in logged
 
 
 # =============================================================================
