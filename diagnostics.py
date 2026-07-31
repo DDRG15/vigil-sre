@@ -603,6 +603,80 @@ def analyze(phases: ProbePhases, *, rtt_high_ms: float = RTT_HIGH_MS) -> list[Di
     return findings
 
 
+def cert_alert_threshold(
+    days_left: int | None, already_alerted_at: int | None
+) -> int | None:
+    """
+    Decide whether an expiring certificate warrants an alert right now, and
+    at which threshold — or None for silence (the design note, an earlier release).
+
+    Pure by design: the whole suppression rule lives here, so the table of
+    cases below is testable with plain calls — no probe, no state file, no
+    webhook. That matters because the risk in this feature is not "does it
+    alert" but "does it stop alerting": a certificate sits below its warning
+    threshold for 30 days, which is 43,200 runs, and 43,198 of them must stay
+    quiet.
+
+    The stored value is the THRESHOLD last alerted at, not the days
+    remaining. Days remaining change every single day and are useless for
+    "have I already said this"; the threshold is stable for the whole band.
+
+        days  stored  ->  result
+          25       —      alert at 30 (first warn crossing)
+          24      30      silence
+           6      30      alert at 7 (escalation to critical)
+           5       7      silence
+          90       7      clear — renewed, so the next expiry alerts again
+          25       —      alert at 30 (a year later, as if new)
+
+    The reset on renewal is the case that cannot be dropped. Without it a
+    renewed certificate keeps ``stored = 7`` forever, and its next expiry
+    would skip the 30-day warning entirely — the monitor going quiet exactly
+    at the notice that gives the most room to act.
+
+    Args:
+        days_left:          phases.tls_cert_days_left; None for plain HTTP or
+                            when the transport did not expose a certificate.
+        already_alerted_at: The threshold this target was last alerted at, or
+                            None if never (or since renewed).
+
+    Returns:
+        CERT_CRIT_DAYS or CERT_WARN_DAYS when an alert should fire now, else
+        None. A None return with a healthy certificate is also the caller's
+        signal to clear any stored threshold — see is_cert_healthy().
+    """
+    if days_left is None:
+        return None
+
+    if days_left < CERT_CRIT_DAYS:
+        threshold = CERT_CRIT_DAYS
+    elif days_left < CERT_WARN_DAYS:
+        threshold = CERT_WARN_DAYS
+    else:
+        return None  # healthy — nothing to say
+
+    if already_alerted_at is None or threshold < already_alerted_at:
+        return threshold
+
+    # Known limitation (the design note): a partial renewal landing back inside the
+    # 7-30 day band does not re-alert, because 30 < 7 is false. Defensible —
+    # the operator already got the critical — and rare enough not to
+    # complicate the rule. Documented, not forgotten.
+    return None
+
+
+def is_cert_healthy(days_left: int | None) -> bool:
+    """
+    True when a certificate is far enough out that any stored alert threshold
+    should be cleared — the renewal case in cert_alert_threshold's table.
+
+    Separate from cert_alert_threshold because "should I alert" and "should I
+    forget that I alerted" are different questions, and collapsing them into
+    one return value is how the reset gets lost in a refactor.
+    """
+    return days_left is not None and days_left >= CERT_WARN_DAYS
+
+
 def degraded_reason(
     phases: ProbePhases,
     findings: list[Diagnosis],

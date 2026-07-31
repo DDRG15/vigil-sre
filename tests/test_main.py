@@ -420,7 +420,7 @@ async def test_state_atomic_write(tmp_path: Path) -> None:
 
     assert state_file.exists()
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == main.STATE_SCHEMA_VERSION
     record = data["targets"][TARGET_URL]
     assert record["status"] == "UP"
     assert record["last_error"] == ""
@@ -542,7 +542,7 @@ async def test_state_migrates_legacy_v1_schema(tmp_path: Path) -> None:
 
     # ...and the next write must upgrade the on-disk shape to v2.
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == main.STATE_SCHEMA_VERSION
     assert data["targets"][TARGET_URL]["status"] == "UP"
 
 
@@ -1435,6 +1435,190 @@ def test_discord_payload_degraded() -> None:
     embed = payload["embeds"][0]
     assert embed["color"] == 0xFFB300
     assert "Degraded" in embed["title"]
+
+
+# =============================================================================
+# G2. Certificate expiry alerting (an earlier release)
+#
+# The risk here is not "does it alert" -- alerting once is trivial. It is
+# "does it STOP alerting": a certificate sits below its warning threshold for
+# 30 days, which is 43,200 runs, and 43,198 of them must stay silent. Every
+# test below that matters is about the SECOND run.
+# =============================================================================
+
+
+def _cert_phases(days_left: int | None) -> ProbePhases:
+    """A healthy, fast probe result carrying a specific cert expiry."""
+    return ProbePhases(
+        url=TARGET_URL, http_status=200, ttfb_ms=50.0, transfer_ms=1.0,
+        body_bytes=100, rtt_ms=10.0, tls_cert_days_left=days_left,
+    )
+
+
+async def _run_check_with_cert(sm: StateManager, days_left: int | None):
+    """One full check_url run against a healthy target whose cert has
+    days_left remaining. Returns the dispatch_alert mock."""
+    with aioresponses() as mock:
+        mock.get(TARGET_URL, status=200, body=b"x" * 100)
+        async with aiohttp.ClientSession() as session:
+            with patch("main.sample_connection", new_callable=AsyncMock,
+                       return_value=_HEALTHY_SAMPLE):
+                with patch("main._probe_once", new_callable=AsyncMock,
+                           return_value=_cert_phases(days_left)):
+                    with patch("main.dispatch_alert", new_callable=AsyncMock) as mock_alert:
+                        await check_url(TARGET_URL, session, sm)
+    return mock_alert
+
+
+def _cert_alerts(mock_alert) -> list:
+    """Only the certificate alerts — filters out status-transition alerts."""
+    return [
+        c for c in mock_alert.call_args_list
+        if c.kwargs.get("kind") in (
+            AlertKind.CERT_EXPIRING_WARN, AlertKind.CERT_EXPIRING_CRIT,
+        )
+    ]
+
+
+async def test_cert_alert_fires_once_when_crossing_the_warning_threshold(tmp_path: Path) -> None:
+    sm = StateManager(tmp_path / "state.json")
+    mock_alert = await _run_check_with_cert(sm, days_left=25)
+    alerts = _cert_alerts(mock_alert)
+    assert len(alerts) == 1
+    assert alerts[0].kwargs["kind"] is AlertKind.CERT_EXPIRING_WARN
+    assert sm.cert_alerted_days(TARGET_URL) == 30
+
+
+async def test_cert_alert_is_suppressed_on_the_second_run(tmp_path: Path) -> None:
+    """THE test of this phase. Alerting once is easy; a certificate stays
+    below 30 days for weeks, and every run after the first must be silent or
+    the feature becomes the alert fatigue it was built to prevent."""
+    sm = StateManager(tmp_path / "state.json")
+    await _run_check_with_cert(sm, days_left=25)          # first crossing
+    mock_alert = await _run_check_with_cert(sm, days_left=24)   # next run
+    assert _cert_alerts(mock_alert) == []
+
+
+async def test_cert_alert_escalates_to_critical_at_the_second_threshold(tmp_path: Path) -> None:
+    """Having already warned at 30 days must not silence the 7-day critical --
+    suppression is per band, not per certificate."""
+    sm = StateManager(tmp_path / "state.json")
+    await _run_check_with_cert(sm, days_left=25)
+    mock_alert = await _run_check_with_cert(sm, days_left=6)
+    alerts = _cert_alerts(mock_alert)
+    assert len(alerts) == 1
+    assert alerts[0].kwargs["kind"] is AlertKind.CERT_EXPIRING_CRIT
+    assert sm.cert_alerted_days(TARGET_URL) == 7
+
+
+async def test_cert_alert_is_suppressed_after_the_critical_too(tmp_path: Path) -> None:
+    sm = StateManager(tmp_path / "state.json")
+    await _run_check_with_cert(sm, days_left=6)
+    mock_alert = await _run_check_with_cert(sm, days_left=5)
+    assert _cert_alerts(mock_alert) == []
+
+
+async def test_renewal_clears_the_stored_threshold(tmp_path: Path) -> None:
+    """Without this reset a renewed certificate keeps cert_alerted_days=7
+    forever, and its NEXT expiry would skip the 30-day warning entirely --
+    the monitor going quiet precisely at the notice that gives the most room
+    to act."""
+    sm = StateManager(tmp_path / "state.json")
+    await _run_check_with_cert(sm, days_left=6)
+    assert sm.cert_alerted_days(TARGET_URL) == 7
+
+    await _run_check_with_cert(sm, days_left=90)   # renewed
+    assert sm.cert_alerted_days(TARGET_URL) is None
+
+    mock_alert = await _run_check_with_cert(sm, days_left=25)  # a year later
+    alerts = _cert_alerts(mock_alert)
+    assert len(alerts) == 1
+    assert alerts[0].kwargs["kind"] is AlertKind.CERT_EXPIRING_WARN
+
+
+async def test_healthy_cert_never_alerts(tmp_path: Path) -> None:
+    sm = StateManager(tmp_path / "state.json")
+    mock_alert = await _run_check_with_cert(sm, days_left=200)
+    assert _cert_alerts(mock_alert) == []
+    assert sm.cert_alerted_days(TARGET_URL) is None
+
+
+async def test_plain_http_target_never_cert_alerts(tmp_path: Path) -> None:
+    """No TLS means tls_cert_days_left is None -- there is no certificate to
+    have an opinion about, and None must not be read as 'zero days left'."""
+    sm = StateManager(tmp_path / "state.json")
+    mock_alert = await _run_check_with_cert(sm, days_left=None)
+    assert _cert_alerts(mock_alert) == []
+
+
+async def test_cert_state_survives_a_status_change(tmp_path: Path) -> None:
+    """The finding that shaped the design note: set_up/set_degraded/set_down REBUILD
+    the record rather than merging, so without _carry_forward the stored
+    threshold is wiped on the next successful run -- every 60 seconds -- and
+    the cert alert re-fires for 30 days straight."""
+    sm = StateManager(tmp_path / "state.json")
+    await _run_check_with_cert(sm, days_left=25)
+    assert sm.cert_alerted_days(TARGET_URL) == 30
+
+    await sm.set_down(TARGET_URL, "HTTP 503")
+    assert sm.cert_alerted_days(TARGET_URL) == 30, "wiped by set_down"
+
+    await sm.set_up(TARGET_URL)
+    assert sm.cert_alerted_days(TARGET_URL) == 30, "wiped by set_up"
+
+    await sm.set_degraded(TARGET_URL, "SLOW_RESPONSE (...)")
+    assert sm.cert_alerted_days(TARGET_URL) == 30, "wiped by set_degraded"
+
+
+async def test_cert_state_survives_a_process_restart(tmp_path: Path) -> None:
+    """Suppression must outlive the process: the compose loop starts a fresh
+    interpreter every 60 seconds, so in-memory-only state would re-alert on
+    every single cycle."""
+    state_file = tmp_path / "state.json"
+    sm = StateManager(state_file)
+    await _run_check_with_cert(sm, days_left=25)
+
+    reloaded = StateManager(state_file)   # simulates the next process
+    assert reloaded.cert_alerted_days(TARGET_URL) == 30
+
+    mock_alert = await _run_check_with_cert(reloaded, days_left=24)
+    assert _cert_alerts(mock_alert) == []
+
+
+def test_consecutive_failures_is_not_carried_forward() -> None:
+    """_carry_forward must copy only what is orthogonal to status.
+    consecutive_failures is state ABOUT the status and has to reset on
+    recovery, or a target would never clear its strike count."""
+    assert "consecutive_failures" not in main._CARRY_FORWARD_FIELDS
+    assert "cert_alerted_days" in main._CARRY_FORWARD_FIELDS
+
+
+@pytest.mark.parametrize("kind,color", [
+    (AlertKind.CERT_EXPIRING_WARN, 0xFFB300),
+    (AlertKind.CERT_EXPIRING_CRIT, 0xFF0000),
+])
+def test_cert_payload_colour_carries_the_triage(kind: AlertKind, color: int) -> None:
+    payload = DiscordNotifier().build_payload(
+        url=TARGET_URL, status_detail="tls_cert_days_left=5",
+        timestamp="2026-01-01T00:00:00Z", kind=kind,
+    )
+    assert payload["embeds"][0]["color"] == color
+    assert "Certificate" in payload["embeds"][0]["title"]
+
+
+def test_an_unhandled_alert_kind_raises_instead_of_rendering_as_a_failure() -> None:
+    """Before an earlier release the builders ended in a bare `else`, so a new AlertKind
+    silently rendered as a red 'Health Check Failed' -- a false statement
+    about the service, in the channel people trust. Loud beats wrong."""
+    class _FakeKind:
+        pass
+
+    for notifier in (DiscordNotifier(), SlackNotifier()):
+        with pytest.raises(ValueError, match="unhandled AlertKind"):
+            notifier.build_payload(
+                url=TARGET_URL, status_detail="x",
+                timestamp="2026-01-01T00:00:00Z", kind=_FakeKind(),  # type: ignore[arg-type]
+            )
 
 
 # =============================================================================

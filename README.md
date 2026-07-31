@@ -213,7 +213,7 @@ infrastructure.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               214-test suite covering probes, state, alerts, diagnostics, history
+├── tests/               246-test suite covering probes, state, alerts, diagnostics, history
 ├── .github/             CI: pytest, then docker build + run a real health-check cycle
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
@@ -228,7 +228,7 @@ infrastructure.
 
 We do not ship what we cannot prove works.
 
-214 automated tests cover every component in isolation: target loading (including
+246 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -499,6 +499,37 @@ public in git would be security theater, not security. Referencing a variable
 that isn't set in `.env` fails the run at startup with a clear message — a probe
 that silently never matches because its secret failed to resolve is a worse
 failure mode than refusing to start.
+
+---
+
+## Certificate expiry: the outage with a date on it
+
+Every other failure this tool watches for is a surprise. A TLS certificate is
+not: it announces its own expiry date months ahead, and when it arrives, every
+client hard-fails the handshake at once. There is no degradation curve, no
+partial outage — the service is fine, and then it is not.
+
+vigil-sre has measured `tls_cert_days_left` on every HTTPS probe since the
+diagnostics engine existed. What it does now is *tell you*: an amber alert at
+30 days, a red one at 7.
+
+**It does not change the target's status.** A service with a certificate
+expiring in 20 days is UP, not DEGRADED — folding a scheduled future outage
+into a measurement of present health would corrupt both, and would quietly
+distort the uptime figures in `--report`.
+
+**It alerts twice per certificate, not 43,200 times.** A certificate sits
+below the 30-day threshold for a month, which at one run per minute is 43,200
+checks. Two of them alert. The suppression state is keyed on the threshold
+crossed rather than the days remaining — days change daily and are useless for
+"have I already said this" — and it survives both status changes and process
+restarts, because the alerting decision is worthless if it forgets itself
+every time the service recovers or the container restarts.
+
+**A renewed certificate resets the memory.** Without that, a renewal would
+leave the old threshold recorded forever, and the *next* expiry would skip its
+30-day warning — the monitor going quiet exactly at the notice that gives you
+the most room to act.
 
 ---
 

@@ -97,13 +97,24 @@ class AlertKind(Enum):
     already existed implicitly — the old code recomputed it as a string on
     every call — so naming it here formalises what was already there.
 
-    an earlier release adds CERT_EXPIRING by appending one member, with no signature
-    change anywhere in the call chain.
+    an earlier release added the two CERT_EXPIRING members by appending them, with no
+    signature change anywhere in the call chain — which was the point of
+    naming this concept in an earlier release.
+
+    Why two cert members instead of one plus a severity argument: every
+    member maps 1:1 to a visual treatment in each channel's payload, and the
+    project has decided repeatedly that colour carries triage (amber = worth
+    your attention, red = urgent). A single member would force the severity
+    through a second parameter that only one kind uses, and would break that
+    1:1 mapping — the same mapping that lets an unhandled kind fail loudly
+    instead of silently rendering as something it is not.
     """
 
-    FAILURE  = "failure"
-    RECOVERY = "recovery"
-    DEGRADED = "degraded"
+    FAILURE            = "failure"
+    RECOVERY           = "recovery"
+    DEGRADED           = "degraded"
+    CERT_EXPIRING_WARN = "cert_expiring_warn"
+    CERT_EXPIRING_CRIT = "cert_expiring_crit"
 
 
 class Notifier(abc.ABC):
@@ -289,10 +300,26 @@ class DiscordNotifier(Notifier):
             title        = "⚠️  Service Degraded — Up But Hurting"
             color        = 0xFFB300  # amber-600
             status_label = "🟡  Degradation Detail"
-        else:
+        elif kind is AlertKind.CERT_EXPIRING_WARN:
+            title        = "📅  Certificate Expiring — Renew Before It Bites"
+            color        = 0xFFB300  # amber: worth your attention, not urgent
+            status_label = "🟡  Certificate"
+        elif kind is AlertKind.CERT_EXPIRING_CRIT:
+            title        = "🚨  Certificate Expiring — Outage Has a Date"
+            color        = 0xFF0000  # red: this becomes a full outage, soon
+            status_label = "📛  Certificate"
+        elif kind is AlertKind.FAILURE:
             title        = "🚨  Infrastructure Alert — Health Check Failed"
             color        = 0xFF0000  # red
             status_label = "📛  Failure Detail"
+        else:
+            # Not defensive padding: the previous shape ended in a bare else,
+            # so a new AlertKind rendered silently as a red "Health Check
+            # Failed" — a wrong statement about the service, in the channel
+            # people trust. Raising instead surfaces it as the bug it is, and
+            # dispatch_alert's gather already contains a raising notifier
+            # without taking down the sibling channel.
+            raise ValueError(f"unhandled AlertKind in Discord payload: {kind}")
 
         return {
             "username"  : "SRE Health Checker",
@@ -356,10 +383,20 @@ class SlackNotifier(Notifier):
             title        = "⚠️  Service Degraded — Up But Hurting"
             color        = "#FFB300"  # same amber
             status_label = "Degradation Detail"
-        else:
+        elif kind is AlertKind.CERT_EXPIRING_WARN:
+            title        = "📅  Certificate Expiring — Renew Before It Bites"
+            color        = "#FFB300"  # same amber as Discord: identical triage
+            status_label = "Certificate"
+        elif kind is AlertKind.CERT_EXPIRING_CRIT:
+            title        = "🚨  Certificate Expiring — Outage Has a Date"
+            color        = "#FF0000"  # same red as Discord
+            status_label = "Certificate"
+        elif kind is AlertKind.FAILURE:
             title        = "🚨  Infrastructure Alert — Health Check Failed"
             color        = "#FF0000"  # same red
             status_label = "Failure Detail"
+        else:
+            raise ValueError(f"unhandled AlertKind in Slack payload: {kind}")
 
         return {
             "text": f"{title} — {url}",  # mobile push preview

@@ -52,15 +52,18 @@ import yaml
 from dotenv import load_dotenv
 
 from diagnostics import (
+    CERT_CRIT_DAYS,
     DEGRADED_TTFB_MS,
     RTT_HIGH_MS,
     ConnectionSample,
     ProbePhases,
     analyze,
     build_trace_config,
+    cert_alert_threshold,
     cert_days_left,
     degraded_reason,
     host_port_from_url,
+    is_cert_healthy,
     phases_to_dict,
     sample_connection,
 )
@@ -148,7 +151,12 @@ STATUS_DEGRADED: str = "DEGRADED"   # probe succeeded but a performance finding 
 # still alert on their very first run.
 DOWN_CONFIRMATIONS: int = 2
 
-STATE_SCHEMA_VERSION: int = 2   # bump whenever state.json's on-disk shape changes
+# v3 added the optional cert_alerted_days field (an earlier release). The bump is
+# documentary, not functional: _load_sync only checks whether schema_version
+# EXISTS, never its value, and UrlState is total=False — so a v2 file loads
+# under v3 with the field simply absent, which is exactly the correct default
+# ("never cert-alerted"). There is no migration step to run or forget.
+STATE_SCHEMA_VERSION: int = 3   # bump whenever state.json's on-disk shape changes
 
 # Webhook delivery retry now lives in notifiers.py alongside the Notifier
 # base class that applies it — see WEBHOOK_RETRY_ATTEMPTS / _BASE_S /
@@ -468,6 +476,39 @@ class UrlState(TypedDict, total=False):
     last_error          : str    # "" when UP; failure detail when DOWN/pending; reason when DEGRADED
     diagnostics         : dict   # last latency/BDP breakdown; on UP and DEGRADED probes
     consecutive_failures: int    # failed runs in a row since last healthy state; absent/0 when healthy
+    cert_alerted_days   : int    # threshold (30 or 7) this target was last cert-alerted at
+
+
+#: Fields that describe something ORTHOGONAL to the current status, and must
+#: therefore survive a status change. Everything else in a UrlState record is
+#: rebuilt from scratch by set_up/set_degraded/set_down — those three replace
+#: the record wholesale rather than merging, so a field not named here is
+#: silently dropped on the next successful run, i.e. within 60 seconds.
+#:
+#: cert_alerted_days is the first such field: whether we already warned about
+#: an expiring certificate has nothing to do with whether the service is UP
+#: right now, and losing it would re-fire the certificate alert every single
+#: run for 30 days.
+#:
+#: consecutive_failures is deliberately NOT here — it is state ABOUT the
+#: status and must reset when the target recovers.
+_CARRY_FORWARD_FIELDS: tuple[str, ...] = ("cert_alerted_days",)
+
+
+def _carry_forward(previous: UrlState | None, record: UrlState) -> UrlState:
+    """
+    Copy the status-orthogonal fields from *previous* into *record*.
+
+    One place to declare what outlives a status change, instead of five
+    replacement sites to remember (see _CARRY_FORWARD_FIELDS for why that
+    distinction is load-bearing).
+    """
+    if previous is None:
+        return record
+    for field_name in _CARRY_FORWARD_FIELDS:
+        if field_name in previous:
+            record[field_name] = previous[field_name]  # type: ignore[literal-required]
+    return record
 
 
 class StateManager:
@@ -603,7 +644,7 @@ class StateManager:
             if diagnostics is not None:
                 record["diagnostics"] = diagnostics
 
-            self._state[url] = record
+            self._state[url] = _carry_forward(previous, record)
             self._write_sync()
             return changed
 
@@ -641,13 +682,13 @@ class StateManager:
                 return True
 
             if previous["status"] == STATUS_DOWN:
-                self._state[url] = UrlState(
+                self._state[url] = _carry_forward(previous, UrlState(
                     status               =STATUS_DOWN,
                     last_checked         =now,
                     last_changed         =previous["last_changed"],
                     last_error           =error,
                     consecutive_failures =previous.get("consecutive_failures", 1) + 1,
-                )
+                ))
                 self._write_sync()
                 return False
 
@@ -663,13 +704,13 @@ class StateManager:
                 self._write_sync()
                 return False
 
-            self._state[url] = UrlState(
+            self._state[url] = _carry_forward(previous, UrlState(
                 status               =STATUS_DOWN,
                 last_checked         =now,
                 last_changed         =now,
                 last_error           =error,
                 consecutive_failures =strikes,
-            )
+            ))
             self._write_sync()
             return True
 
@@ -703,9 +744,39 @@ class StateManager:
             if diagnostics is not None:
                 record["diagnostics"] = diagnostics
 
-            self._state[url] = record
+            self._state[url] = _carry_forward(previous, record)
             self._write_sync()
             return changed
+
+
+    async def record_cert_alert(self, url: str, threshold_days: int | None) -> None:
+        """
+        Persist the certificate threshold this target was last alerted at, or
+        clear it when *threshold_days* is None (the certificate was renewed).
+
+        Separate from the status writers on purpose: certificate expiry is
+        orthogonal to whether the service is up right now, so it does not
+        belong in set_up/set_degraded/set_down's decision logic. It survives
+        those writers via _carry_forward.
+
+        A no-op when the record does not exist yet — the status writer always
+        runs first in check_url, so that only happens if a caller inverts the
+        order, and inventing a bare record here would hide that mistake.
+        """
+        async with self._lock:
+            record = self._state.get(url)
+            if record is None:
+                return
+            if threshold_days is None:
+                record.pop("cert_alerted_days", None)  # type: ignore[misc]
+            else:
+                record["cert_alerted_days"] = threshold_days
+            self._write_sync()
+
+    def cert_alerted_days(self, url: str) -> int | None:
+        """The threshold this target was last cert-alerted at, or None."""
+        record = self._state.get(url)
+        return record.get("cert_alerted_days") if record else None
 
 
 
@@ -1005,6 +1076,65 @@ def _log_diagnostics(url: str, phases: ProbePhases, findings: list) -> None:
 # Per-URL orchestration coroutine
 # ---------------------------------------------------------------------------
 
+async def _maybe_alert_cert_expiry(
+    session: aiohttp.ClientSession,
+    url    : str,
+    state  : StateManager,
+    phases : ProbePhases,
+) -> None:
+    """
+    Fire a certificate-expiry alert if this run crossed a threshold, and stay
+    silent on every run that did not (the design note, an earlier release).
+
+    This is the one alert in the system that does NOT come from a state
+    transition: a certificate 20 days from expiry leaves the service
+    perfectly UP, so nothing in the UP/DEGRADED/DOWN machine would ever
+    mention it. diagnostics.py has measured tls_cert_days_left since an earlier release
+    and deliberately excludes CERT_EXPIRING from the codes that degrade a
+    target — which meant that until now the finding was logged, persisted,
+    and read by nobody. This function is the missing channel.
+
+    Never raises: dispatch_alert owns that guarantee, and the state write is
+    a plain dict update under the existing lock.
+
+    The threshold is recorded BEFORE dispatching. dispatch_alert does not
+    report success (by design — it retries per channel and owns its own
+    alerts_lost_all_channels_total metric), so recording afterwards would be
+    identical in observable behaviour while leaving a window where a crash
+    mid-dispatch re-alerts on the next run. At most one alert per threshold
+    is the property worth protecting; a delivery failure is already covered
+    one layer down.
+    """
+    days = phases.tls_cert_days_left
+
+    if is_cert_healthy(days):
+        # Renewed (or never close to expiry). Forget any stored threshold so
+        # the NEXT expiry alerts from 30 days out again — without this, a
+        # renewed certificate keeps its old threshold forever and the monitor
+        # goes quiet exactly at the notice that gives the most room to act.
+        if state.cert_alerted_days(url) is not None:
+            logger.info("🔐  Certificate renewed for %s (%d days left).", url, days)
+            await state.record_cert_alert(url, None)
+        return
+
+    threshold = cert_alert_threshold(days, state.cert_alerted_days(url))
+    if threshold is None:
+        return  # already alerted in this band — silence is the feature
+
+    await state.record_cert_alert(url, threshold)
+
+    critical = threshold == CERT_CRIT_DAYS
+    detail   = f"tls_cert_days_left={days} (alerting below {threshold})"
+    logger.warning(
+        "🔐  CERTIFICATE %s  %s | %s",
+        "CRITICAL" if critical else "EXPIRING", url, detail,
+    )
+    await dispatch_alert(
+        session, url, status_detail=detail,
+        kind=AlertKind.CERT_EXPIRING_CRIT if critical else AlertKind.CERT_EXPIRING_WARN,
+    )
+
+
 async def check_url(
     url                     : str,
     session                 : aiohttp.ClientSession,
@@ -1104,6 +1234,10 @@ async def check_url(
                 )
             else:
                 logger.info("🟡  Still DEGRADED (alert suppressed)  %s | %s", url, reason)
+            # After the status write: the record must exist and _carry_forward
+            # must have run, or the stored threshold would be clobbered by the
+            # very write we just did.
+            await _maybe_alert_cert_expiry(session, url, state, phases)
             return CheckOutcome(
                 url=url, status=STATUS_DEGRADED, error=reason, checked_at=checked_at,
                 phases=phases, findings=findings,
@@ -1117,6 +1251,7 @@ async def check_url(
                 )
             else:
                 logger.info("✅  OK (no change)       %s", url)
+            await _maybe_alert_cert_expiry(session, url, state, phases)
             return CheckOutcome(
                 url=url, status=STATUS_UP, error=None, checked_at=checked_at,
                 phases=phases, findings=findings,

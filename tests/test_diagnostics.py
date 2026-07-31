@@ -8,6 +8,7 @@ Coverage:
   D. confidence gating      —  bandwidth rules stay silent on small samples
   E. measure_tcp_rtt()      —  real local server (hit) + closed port (None)
   F. phases_to_dict()       —  serialization shape + None survival
+  G. cert_alert_threshold() —  the suppression rule, case by case (an earlier release)
 
 Run: pytest tests/ -v
 
@@ -33,6 +34,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from diagnostics import (
     BANDWIDTH_MIN_SAMPLE_BYTES,
+    CERT_CRIT_DAYS,
+    CERT_WARN_DAYS,
     CODE_CERT_EXPIRING,
     CODE_HIGH_RTT,
     CODE_HTTP2_UNSUPPORTED,
@@ -49,9 +52,11 @@ from diagnostics import (
     ProbePhases,
     analyze,
     bandwidth_confidence,
+    cert_alert_threshold,
     cert_days_left,
     default_window_ceiling_bps,
     degraded_reason,
+    is_cert_healthy,
     effective_window_bytes,
     host_port_from_url,
     phases_to_dict,
@@ -492,3 +497,55 @@ def test_degraded_reason_ignores_cert_and_http2() -> None:
     assert any(f.code == CODE_CERT_EXPIRING for f in findings)
     # ...but it must not drive DEGRADED.
     assert degraded_reason(phases, findings) is None
+
+
+# =============================================================================
+# G. cert_alert_threshold() / is_cert_healthy() — the suppression rule (an earlier release)
+#
+# Pure functions on purpose: the whole rule is exercised here with plain
+# calls, no probe, no state file, no webhook. The property under test is not
+# "does it alert" but "does it stop alerting" — a cert sits below its warning
+# threshold for 30 days, and 43,198 of those 43,200 runs must be silent.
+# =============================================================================
+
+
+@pytest.mark.parametrize("days,stored,expected", [
+    # --- first crossings -----------------------------------------------------
+    (25,   None, CERT_WARN_DAYS),   # crosses warn for the first time
+    (6,    None, CERT_CRIT_DAYS),   # first observation already critical
+    # --- suppression: the whole point of the feature -------------------------
+    (24,   30,   None),             # still in the warn band, already said so
+    (8,    30,   None),             # bottom of the warn band, still silent
+    (5,    7,    None),             # still critical, already said so
+    (1,    7,    None),             # about to expire, still no repeat
+    # --- escalation ----------------------------------------------------------
+    (6,    30,   CERT_CRIT_DAYS),   # warn -> critical must NOT be suppressed
+    # --- healthy -------------------------------------------------------------
+    (90,   None, None),
+    (90,   7,    None),             # renewed; the clearing is is_cert_healthy's job
+    (31,   None, None),             # one day above the threshold: silence
+    (30,   None, None),             # exactly at the threshold: not below it
+    # --- no certificate ------------------------------------------------------
+    (None, None, None),
+    (None, 30,   None),
+])
+def test_cert_alert_threshold_cases(days, stored, expected) -> None:
+    assert cert_alert_threshold(days, stored) == expected
+
+
+@pytest.mark.parametrize("days,healthy", [
+    (90,   True),
+    (30,   True),    # at the threshold counts as healthy — nothing to warn about
+    (29,   False),
+    (1,    False),
+    (None, False),   # no certificate is not the same as a healthy one
+])
+def test_is_cert_healthy(days, healthy) -> None:
+    assert is_cert_healthy(days) is healthy
+
+
+def test_partial_renewal_into_the_warn_band_does_not_realert() -> None:
+    """Documented limitation of the design note, asserted so it stays a decision
+    rather than drifting into an accident: a cert renewed from 5 days to 25
+    stays silent, because the operator already got the critical."""
+    assert cert_alert_threshold(25, CERT_CRIT_DAYS) is None
