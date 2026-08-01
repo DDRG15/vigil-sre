@@ -206,16 +206,21 @@ infrastructure.
 ├── diagnostics.py       Latency/BDP diagnostic engine — phase timings + findings
 ├── history.py           SQLite historical persistence — isolated from the alert path
 ├── notifiers.py         Multi-channel alert delivery — Discord + Slack, in parallel
-├── api.py               Read-only JSON endpoint — separate process, never writes
+├── api.py               Read-only JSON endpoint + target editor — separate process
+├── targetstore.py       The target list when the dashboard owns it — stdlib only,
+│                        shared by both processes so neither has to import the other
 ├── dashboard.py         HTML view over that JSON — no framework, no JS dependency
-├── targets.yaml         URL configuration — edit freely, no restarts required
+├── targets.yaml         URL configuration — the hand-edited seed
+├── targets.yaml.example Documented template with every per-target field
+├── scripts/             init-watchdog.sh — provisions the self-hosted watchdog
 ├── Dockerfile           Multi-stage, non-root, health-checked production image
 ├── docker-compose.yml   Standard deployment manifest
 ├── .dockerignore        Build context exclusion list — image contains no dev artifacts
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               311-test suite covering probes, state, alerts, diagnostics, history
+├── tests/               498-test suite: probes, state, alerts, diagnostics, history,
+│                        dashboard, target store, reminders, trend, maintenance, packaging
 ├── .github/             CI: pytest, then docker build + run a real health-check cycle
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
@@ -583,6 +588,19 @@ a screen reader rather than living in hue alone. The status glyph and the status
 word remain the primary channel — a 4px bar cannot carry shape, so the strip is
 supplementary by design and is the first thing to disappear on a narrow screen.
 
+**Targets are editable from the page.** The `Administrar targets` block at the
+bottom adds, removes and configures targets — every per-target override plus
+the reminder opt-in and maintenance windows — and the probe picks the change up
+on its next run. Writes require `API_WRITE_TOKEN` from `.env` and **fail closed
+without it**: with no token there is no way to tell an operator from anything
+else that reaches the port, and adding a target is not editing a row in a list
+— it makes this monitor fetch that URL from inside your network, on a schedule,
+forever. That is the capability worth a secret, even on loopback.
+
+The list then lives in `data/targets.json`, and `targets.yaml` becomes the seed
+the page says it no longer reads. Two files that both look authoritative is
+worse than either one alone.
+
 That freshness bar has one blind spot, and the header covers it: **the bar only
 updates when a poll succeeds.** If the server dies while a tab is open, the page would
 freeze mid-sentence and go on claiming the data is thirty seconds old — the
@@ -687,6 +705,29 @@ real monitoring with it.
 
 Set the watchdog's expected period to your run interval (60s in the shipped
 `docker-compose.yml`) with a grace period of a few cycles.
+
+### Try it without signing up for anything
+
+`docker compose up -d watchdog && ./scripts/init-watchdog.sh` runs a
+self-hosted healthchecks instance and prints the ping URL to paste into `.env`.
+A clone of this repo can then demonstrate the dead-man's switch end to end
+without an account anywhere. It notifies nobody — no SMTP, no webhook — so the
+evidence lives in its own event log at `http://127.0.0.1:8000` rather than in
+your inbox, which is more convincing anyway:
+
+```
+18:50:50   new  -> up      first ping from the probe
+18:53:18   the health-checker is killed
+18:58:58   up   -> down    period 60s + grace 300s
+```
+
+**It is for reproducibility, not for vigilance, and the difference matters.** A
+watchdog sharing a machine with what it watches cannot report that the machine
+died. It catches the probe container crashing; it does not catch Docker
+stopping, the host powering off, or the network dropping — and those are the
+failures where nobody is left inside to speak. For real operation, point
+`HEARTBEAT_URL` at an instance somewhere else. The code does not care which:
+it is one URL.
 
 **Leaving `HEARTBEAT_URL` unset is allowed, and it logs a warning on every
 run.** That is deliberate. Disabling the watchdog is a legitimate choice, but
