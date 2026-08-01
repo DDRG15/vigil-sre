@@ -55,6 +55,7 @@ from dotenv import load_dotenv
 
 from diagnostics import (
     TREND_DEGRADING,
+    in_maintenance,
     TREND_IMPROVING,
     TREND_MIN_CHANGE_MS,
     TREND_MIN_CHANGE_PCT,
@@ -241,6 +242,7 @@ class Target:
     #: default, and deliberately so — a target you added to watch something
     #: break (a test URL, a known-bad endpoint) would otherwise nag forever.
     remind                  : bool  = False
+    maintenance             : list[dict] | None = None
 
 
 # Imported, not redeclared. The dashboard write path validates the same syntax
@@ -1299,6 +1301,7 @@ async def _maybe_alert_cert_expiry(
     url    : str,
     state  : StateManager,
     phases : ProbePhases,
+    maintenance: list[dict] | None = None,
 ) -> None:
     """
     Fire a certificate-expiry alert if this run crossed a threshold, and stay
@@ -1371,10 +1374,45 @@ async def _maybe_alert_cert_expiry(
     # suppressed by cert_alerted_days, a separate mechanism with its own reset
     # condition (a RISE in days left). Sharing the flag would let a lost cert
     # alert re-fire a status alert, and vice versa.
-    await dispatch_alert(
-        session, url, status_detail=detail,
-        kind=AlertKind.CERT_EXPIRING_CRIT if critical else AlertKind.CERT_EXPIRING_WARN,
+    await _alert_unless_muted(
+        session, url, detail,
+        AlertKind.CERT_EXPIRING_CRIT if critical else AlertKind.CERT_EXPIRING_WARN,
+        maintenance,
     )
+
+
+async def _alert_unless_muted(
+    session      : aiohttp.ClientSession,
+    url          : str,
+    status_detail: str,
+    kind         : AlertKind,
+    maintenance  : list[dict] | None,
+) -> bool:
+    """
+    Send an alert unless this target is inside a maintenance window.
+
+    Every alert in this module goes through here, and that is the point. The
+    dispatch sites are five and growing; a mute checked at each of them is a
+    guarantee somebody has to remember, and this project has decided more than
+    once that a remembered guarantee is a broken one. One funnel means a new
+    alert kind inherits the behaviour instead of opting out of it by omission.
+
+    Returns True for "nothing is owed" — either the alert was delivered, or it
+    was deliberately not sent. A muted alert must NOT arm the retry: doing so
+    would queue every suppressed alert and fire them all the moment the window
+    closes, converting planned quiet into an unplanned storm.
+    """
+    window = in_maintenance(maintenance, datetime.now(timezone.utc))
+    if window is not None:
+        # Logged, never swallowed. "Silenced on purpose" and "never noticed"
+        # are different events, and only the log can tell them apart later.
+        logger.info(
+            "🔇  Alerta suprimida por ventana de mantenimiento (%s–%s UTC)  "
+            "%s | %s. event_type=metric metric=alerts_muted_total value=1",
+            window["start"], window["end"], url, status_detail,
+        )
+        return True
+    return await dispatch_alert(session, url, status_detail=status_detail, kind=kind)
 
 
 async def check_url(
@@ -1388,6 +1426,7 @@ async def check_url(
     degraded_rtt_ms         : float | None = None,
     expect_substring_display: str   | None = None,
     remind                  : bool  = False,
+    maintenance             : list[dict] | None = None,
 ) -> CheckOutcome:
     """
     Run the full health-check pipeline for one URL.
@@ -1472,8 +1511,8 @@ async def check_url(
             transitioned = await state.set_degraded(url, reason, diagnostics=diagnostics)
             if transitioned:
                 logger.warning("🟡  STATE CHANGE → DEGRADED  %s | %s", url, reason)
-                delivered = await dispatch_alert(
-                    session, url, status_detail=reason, kind=AlertKind.DEGRADED
+                delivered = await _alert_unless_muted(
+                    session, url, reason, AlertKind.DEGRADED, maintenance
                 )
                 await state.record_alert_outcome(url, delivered)
             else:
@@ -1481,7 +1520,7 @@ async def check_url(
             # After the status write: the record must exist and _carry_forward
             # must have run, or the stored threshold would be clobbered by the
             # very write we just did.
-            await _maybe_alert_cert_expiry(session, url, state, phases)
+            await _maybe_alert_cert_expiry(session, url, state, phases, maintenance)
             return CheckOutcome(
                 url=url, status=STATUS_DEGRADED, error=reason, checked_at=checked_at,
                 phases=phases, findings=findings,
@@ -1490,13 +1529,13 @@ async def check_url(
             transitioned = await state.set_up(url, diagnostics=diagnostics)
             if transitioned:
                 logger.info("🟢  STATE CHANGE → UP    %s", url)
-                delivered = await dispatch_alert(
-                    session, url, status_detail="Service is UP", kind=AlertKind.RECOVERY
+                delivered = await _alert_unless_muted(
+                    session, url, "Service is UP", AlertKind.RECOVERY, maintenance
                 )
                 await state.record_alert_outcome(url, delivered)
             else:
                 logger.info("✅  OK (no change)       %s", url)
-            await _maybe_alert_cert_expiry(session, url, state, phases)
+            await _maybe_alert_cert_expiry(session, url, state, phases, maintenance)
             return CheckOutcome(
                 url=url, status=STATUS_UP, error=None, checked_at=checked_at,
                 phases=phases, findings=findings,
@@ -1507,8 +1546,8 @@ async def check_url(
         transitioned = await state.set_down(url, error=exc.detail)
         if transitioned:
             logger.error("🔴  STATE CHANGE → DOWN  %s | %s", url, exc.detail)
-            delivered = await dispatch_alert(
-                session, url, status_detail=exc.detail, kind=AlertKind.FAILURE
+            delivered = await _alert_unless_muted(
+                session, url, exc.detail, AlertKind.FAILURE, maintenance
             )
             await state.record_alert_outcome(url, delivered)
         else:
@@ -1536,9 +1575,9 @@ async def check_url(
                         "⏳  RECORDATORIO  %s | %.1fh caído | %s",
                         url, elapsed_h, exc.detail,
                     )
-                    delivered = await dispatch_alert(
-                        session, url, status_detail=detail,
-                        kind=AlertKind.STILL_DOWN,
+                    delivered = await _alert_unless_muted(
+                        session, url, detail,
+                        AlertKind.STILL_DOWN, maintenance,
                     )
                     await state.record_alert_outcome(url, delivered)
         # The persisted status is authoritative: a pending-hysteresis failure
@@ -1767,6 +1806,7 @@ async def run_health_checks(
                 degraded_ttfb_ms=t.degraded_ttfb_ms,
                 degraded_rtt_ms=t.degraded_rtt_ms,
                 remind=t.remind,
+                maintenance=t.maintenance,
                 expect_substring_display=t.expect_substring_display,
             )
             for t in resolved

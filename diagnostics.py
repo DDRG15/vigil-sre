@@ -923,3 +923,63 @@ def latency_trend(
 
     result["verdict"] = TREND_DEGRADING if change_ms > 0 else TREND_IMPROVING
     return result
+
+
+# ---------------------------------------------------------------------------
+# Maintenance windows
+# ---------------------------------------------------------------------------
+
+def in_maintenance(windows: list[dict] | None, now: datetime) -> dict | None:
+    """
+    Return the window currently in effect for a target, or None.
+
+    A window is ``{"days": [0..6], "start": "HH:MM", "end": "HH:MM"}`` in UTC,
+    where 0 is Monday. Recurring weekly, because planned work recurs weekly:
+    a one-off outage does not need configuration, it needs someone to ignore
+    one alert.
+
+    Windows silence the ALERT, never the probe. During one the target is still
+    measured and still recorded, so uptime stays honest and the history has no
+    hole. A window that stopped probing would leave a gap on the dashboard
+    indistinguishable from "the monitor died" — trading a known noise for an
+    unknown silence, which is the worse of the two every time.
+
+    A window whose end is before its start crosses midnight (``22:00`` to
+    ``02:00``), and is evaluated as such rather than treated as invalid: the
+    hours nobody is awake are exactly the hours maintenance happens.
+
+    Pure: the caller supplies the clock.
+    """
+    if not windows:
+        return None
+
+    weekday = now.weekday()
+    minutes = now.hour * 60 + now.minute
+
+    for window in windows:
+        days = window.get("days")
+        try:
+            start_h, start_m = (int(part) for part in window["start"].split(":"))
+            end_h,   end_m   = (int(part) for part in window["end"].split(":"))
+        except (KeyError, ValueError, AttributeError):
+            continue                      # validated on the way in; skip if not
+
+        start = start_h * 60 + start_m
+        end   = end_h * 60 + end_m
+
+        if start <= end:
+            if days is not None and weekday not in days:
+                continue
+            if start <= minutes < end:
+                return window
+        else:
+            # Crosses midnight. The tail after 00:00 belongs to the PREVIOUS
+            # day's window, so a Monday 22:00-02:00 window covers Tuesday's
+            # small hours — matching how a human describes "Monday night".
+            if minutes >= start:
+                if days is None or weekday in days:
+                    return window
+            elif minutes < end:
+                if days is None or (weekday - 1) % 7 in days:
+                    return window
+    return None

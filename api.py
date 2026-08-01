@@ -51,6 +51,7 @@ from urllib.parse import parse_qs, urlparse
 
 import dashboard
 import targetstore
+from diagnostics import in_maintenance
 from dashboard import render_page, render_rows
 from history import (
     HISTORY_DB_FILE,
@@ -224,7 +225,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _dashboard_data(self) -> tuple[dict, dict, float | None, dict]:
+    def _dashboard_data(self) -> tuple[dict, dict, float | None, dict, dict]:
         """State, aggregates, staleness and per-target strips — what both HTML
         routes need.
 
@@ -242,7 +243,19 @@ class _Handler(BaseHTTPRequestHandler):
             datetime.now(timezone.utc) - timedelta(days=WINDOWS[DEFAULT_WINDOW])
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
         strips  = status_strip(self.history_path, urls, since)
-        return targets, history, stale_seconds(targets), strips
+
+        # Which targets are currently silenced, computed HERE rather than
+        # stored: a window is a schedule, not a state, so asking "is it in
+        # effect right now" at render time is the only answer that cannot go
+        # stale between the probe writing and the page being read.
+        now    = datetime.now(timezone.utc)
+        stored = targetstore.read_store() or []
+        muted  = {
+            entry["url"]: window
+            for entry in stored
+            if (window := in_maintenance(entry.get("maintenance"), now)) is not None
+        }
+        return targets, history, stale_seconds(targets), strips, muted
 
     def _authorised(self) -> bool:
         """

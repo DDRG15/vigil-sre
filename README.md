@@ -769,6 +769,37 @@ Two consequences worth knowing:
   per-channel, so a dead Discord never delays a healthy Slack, and the breaker
   resets every run — a single bad minute must not mute a channel for good.
 
+### Planned work, without the 3am page
+
+Being woken by a monitor for an outage you scheduled yourself is the fastest
+way to stop trusting it. A target can carry maintenance windows — recurring
+weekly, in UTC, set per target from `targets.yaml` or the dashboard editor:
+
+```yaml
+  - url: https://api.example.com/health
+    maintenance:
+      - days: [6]           # 0 = Monday, 6 = Sunday
+        start: "02:00"
+        end:   "04:00"
+      - start: "22:00"      # no `days` means every day; this one crosses
+        end:   "02:00"      # midnight, which is when maintenance happens
+```
+
+**The window silences the alert, never the probe.** The target is still
+measured and still recorded, so uptime stays honest and the history has no
+hole. A window that stopped probing would leave a gap indistinguishable from
+"the monitor died" — trading a known noise for an unknown silence, which is
+the worse of the two every time.
+
+**A muted alert does not arm the retry.** Alerts that reach nobody are re-sent
+on the next run; a deliberate silence must not count as a failed delivery, or
+every suppressed alert would queue and fire the moment the window closed.
+
+**The dashboard marks silenced targets and names the window.** A muted target
+can be DOWN and say nothing, so a row that looks identical to a healthy one is
+worse than no row: the reader sees a status and assumes somebody would have
+been told.
+
 ### Is it getting worse?
 
 Every threshold here is absolute: RTT over 400 ms, TTFB over 1500. Those answer

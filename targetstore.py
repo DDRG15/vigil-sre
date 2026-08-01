@@ -76,7 +76,7 @@ def _resolve(path: Path | None) -> Path:
 #: believes is in effect.
 ALLOWED_KEYS: frozenset[str] = frozenset({
     "url", "expect_substring", "expected_status", "timeout_s",
-    "degraded_ttfb_ms", "degraded_rtt_ms", "remind",
+    "degraded_ttfb_ms", "degraded_rtt_ms", "remind", "maintenance",
 })
 
 #: (minimum, maximum) per numeric field. The same bounds load_targets already
@@ -125,10 +125,64 @@ def env_reference_problem(raw: str) -> tuple[str, str] | None:
     return None
 
 
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
 ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
 MAX_TARGETS: int = 200
 MAX_URL_LENGTH: int = 2048
+
+
+MAX_WINDOWS: int = 20
+
+
+def _validated_windows(raw: object) -> list[dict]:
+    """
+    Validate maintenance windows, rejecting rather than repairing.
+
+    A window that silently failed to parse would leave the operator believing
+    a target is silenced while it pages them at 3am — the exact promise this
+    feature exists to keep, broken in the direction that costs sleep.
+    """
+    if not isinstance(raw, list):
+        raise ValidationError("'maintenance' debe ser una lista de ventanas.")
+    if len(raw) > MAX_WINDOWS:
+        raise ValidationError(f"Máximo {MAX_WINDOWS} ventanas por target.")
+
+    out: list[dict] = []
+    for window in raw:
+        if not isinstance(window, dict):
+            raise ValidationError("Cada ventana debe ser un objeto.")
+        if set(window) - {"days", "start", "end"}:
+            raise ValidationError(
+                "Una ventana solo admite 'days', 'start' y 'end'.")
+
+        clean: dict = {}
+        for field in ("start", "end"):
+            value = window.get(field)
+            if not isinstance(value, str) or not _HHMM.match(value):
+                raise ValidationError(
+                    f"'{field}' debe tener formato HH:MM en 24h (UTC).")
+            clean[field] = value
+
+        if clean["start"] == clean["end"]:
+            # Otherwise it is either a zero-length window or a 24h one, and
+            # which one it means is a coin flip. Make the operator say it.
+            raise ValidationError(
+                "'start' y 'end' no pueden ser iguales — para silenciar todo "
+                "el día usá 00:00 a 23:59.")
+
+        days = window.get("days")
+        if days is not None:
+            if (not isinstance(days, list) or not days
+                    or any(not isinstance(d, int) or isinstance(d, bool)
+                           or not 0 <= d <= 6 for d in days)):
+                raise ValidationError(
+                    "'days' debe ser una lista de enteros 0-6 (0 = lunes).")
+            clean["days"] = sorted(set(days))
+
+        out.append(clean)
+    return out
 
 
 class ValidationError(ValueError):
@@ -212,6 +266,10 @@ def validate_entry(raw: object) -> dict:
         if not (low <= value <= high):
             raise ValidationError(f"'{field}' debe estar entre {low} y {high}.")
         entry[field] = int(value) if field == "expected_status" else float(value)
+
+    windows = raw.get("maintenance")
+    if windows:
+        entry["maintenance"] = _validated_windows(windows)
 
     remind = raw.get("remind", False)
     if not isinstance(remind, bool):

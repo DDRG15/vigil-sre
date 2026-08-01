@@ -143,7 +143,27 @@ def freshness(stale_seconds: float | None) -> tuple[str, str]:
     )
 
 
-def _row(url: str, state: dict, history: dict, strip: list | None = None) -> str:
+def _muted_badge(window: dict | None) -> str:
+    """
+    Mark a target whose alerts are silenced, with the window that silences it.
+
+    Not optional decoration. A target inside a maintenance window can be DOWN
+    and say nothing, so a row that looks identical to a healthy one is worse
+    than no row: the reader sees a status and assumes someone would have been
+    told. Naming the window also answers the next question — when does this
+    stop being true — without a trip to the config.
+    """
+    if not window:
+        return ""
+    label = html.escape(f'{window.get("start", "?")}–{window.get("end", "?")} UTC')
+    return (
+        f'<span class="muted-badge" title="Alertas silenciadas por ventana de '
+        f'mantenimiento">🔇 {label}</span>'
+    )
+
+
+def _row(url: str, state: dict, history: dict, strip: list | None = None,
+         muted: dict | None = None) -> str:
     """
     Render one target row. **Every value is escaped here**, which is the only
     place any of them enters the HTML — see the module docstring for why that
@@ -180,7 +200,7 @@ def _row(url: str, state: dict, history: dict, strip: list | None = None) -> str
   <summary>
     <span class="state" style="color:{colour}" title="{e_status}">{glyph}<b>{e_status}</b></span>
     <span class="url">{e_url}</span>
-    <span class="hist">{render_strip(strip)}</span>
+    <span class="hist">{render_strip(strip)}</span>{_muted_badge(muted)}
     <span class="num" title="uptime">{uptime}</span>
     <span class="num" title="p50 TTFB">{p50}</span>
     <span class="num" title="p95 TTFB">{p95}</span>
@@ -193,7 +213,7 @@ def _row(url: str, state: dict, history: dict, strip: list | None = None) -> str
 
 
 def render_rows(targets: dict, history: dict, stale_seconds: float | None,
-                strips: dict | None = None) -> str:
+                strips: dict | None = None, muted: dict | None = None) -> str:
     """The fragment the page re-fetches: freshness banner plus every row."""
     level, message = freshness(stale_seconds)
     banner = (
@@ -215,8 +235,12 @@ def render_rows(targets: dict, history: dict, stale_seconds: float | None,
         value = strips.get(url) if isinstance(strips, dict) else None
         return value if isinstance(value, list) else None
 
+    def _muted_of(url: str) -> dict | None:
+        value = muted.get(url) if isinstance(muted, dict) else None
+        return value if isinstance(value, dict) else None
+
     rows = "\n".join(
-        _row(url, _state_of(url), _history_of(url), _strip_of(url))
+        _row(url, _state_of(url), _history_of(url), _strip_of(url), _muted_of(url))
         for url in sorted(targets)
     )
     return f'{banner}<div class="rows {level}">{rows}</div>'
@@ -263,6 +287,10 @@ header{display:flex;justify-content:space-between;align-items:baseline;
    does speak it is the only red in the header, because it outranks everything
    below it: if polling is broken, nothing below it is current. */
 .conn{color:#FF0000;font-weight:700;font-size:.85rem}
+/* A silenced target that looks like a healthy one is a trap: the operator
+   reads green and assumes green, when what it means is nobody is watching. */
+.muted-badge{font-size:.65rem;border:1px solid var(--muted);color:var(--muted);
+  border-radius:3px;padding:0 .3rem;margin-left:.4rem;white-space:nowrap}
 .empty{color:var(--muted);padding:2rem 0;text-align:center}
 @media(max-width:640px){
   body{padding:.75rem}
@@ -450,7 +478,7 @@ SCRIPT_HASH: str = _csp_hash(_SCRIPT_RENDERED)
 
 
 def render_page(targets: dict, history: dict, stale_seconds: float | None,
-                strips: dict | None = None) -> str:
+                strips: dict | None = None, muted: dict | None = None) -> str:
     """The full page. Rows come from the same fragment the poll re-fetches."""
     return f"""<!doctype html>
 <html lang="es"><head>
@@ -468,7 +496,7 @@ def render_page(targets: dict, history: dict, stale_seconds: float | None,
   <span>Estado</span><span>Target</span><span>Historial</span><span class="num">Uptime</span>
   <span class="num">p50</span><span class="num">p95</span>
 </summary></div></div>
-<div id="list">{render_rows(targets, history, stale_seconds, strips)}</div>
+<div id="list">{render_rows(targets, history, stale_seconds, strips, muted)}</div>
 {_EDITOR}
 <script>{_SCRIPT_RENDERED}</script>
 </body></html>"""
