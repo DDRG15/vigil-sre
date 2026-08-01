@@ -828,3 +828,98 @@ def reminders_due(elapsed_hours: float) -> int:
     if elapsed_hours >= last:
         due += int((elapsed_hours - last) // REMINDER_REPEAT_H)
     return due
+
+
+# ---------------------------------------------------------------------------
+# Latency trend
+# ---------------------------------------------------------------------------
+
+#: A change must be at least this large in RELATIVE terms to count.
+TREND_MIN_CHANGE_PCT: float = 50.0
+
+#: ...and at least this large in ABSOLUTE terms. Both, not either.
+#:
+#: 2 ms to 6 ms is +200% and matters to nobody. Without an absolute floor this
+#: feature would fire on numbers too small to act on, and a signal that fires
+#: on nothing is one an operator learns to ignore — the exact failure the whole
+#: project is built against.
+TREND_MIN_CHANGE_MS: float = 50.0
+
+#: Minimum readings per window. A p95 over three samples is a number, not a
+#: measurement, and comparing two of them is arithmetic on noise.
+TREND_MIN_SAMPLES: int = 20
+
+#: Why a comparison produced no verdict. Returned rather than swallowed:
+#: "suppressed because the change was tiny" and "the feature did not run" look
+#: identical from outside, and only one of them is fine.
+TREND_OK              = "ok"                # measured, and nothing changed enough
+TREND_DEGRADING       = "degrading"
+TREND_IMPROVING       = "improving"
+TREND_TOO_FEW_SAMPLES = "too_few_samples"   # not enough history to compare
+TREND_NO_DATA         = "no_data"           # one window or both are empty
+
+
+def latency_trend(
+    recent_p95      : float | None,
+    previous_p95    : float | None,
+    recent_samples  : int = 0,
+    previous_samples: int = 0,
+) -> dict:
+    """
+    Compare two equal-length windows of the same target and say what changed.
+
+    Why two windows instead of a threshold
+    --------------------------------------
+    A fixed threshold answers "is this slow", which every target answers
+    differently and which the per-target overrides already handle. It cannot
+    answer "is this getting worse", and that is the failure a threshold never
+    sees: a service drifting from 50 ms to 380 ms over two weeks never crosses
+    400 ms, so it dies slowly and in silence. Comparing a target against its
+    own recent past makes the signal relative to the target — an endpoint that
+    was always 300 ms is not news; one that went from 50 to 300 is.
+
+    p95 and not the mean, because the mean hides exactly the tail worth
+    knowing about.
+
+    Always returns a dict with a ``verdict``. It never returns None and never
+    silently declines: a change suppressed by the floors reports
+    ``ok`` WITH the numbers that were suppressed, so a reader can tell
+    "measured, too small to act on" from "did not run". Those two look the same
+    from outside and only one of them is acceptable.
+    """
+    result: dict = {
+        "recent_p95_ms"   : recent_p95,
+        "previous_p95_ms" : previous_p95,
+        "recent_samples"  : recent_samples,
+        "previous_samples": previous_samples,
+        "change_pct"      : None,
+        "change_ms"       : None,
+        "verdict"         : TREND_NO_DATA,
+        "suppressed_by"   : None,
+    }
+
+    if recent_p95 is None or previous_p95 is None or previous_p95 <= 0:
+        return result
+
+    if min(recent_samples, previous_samples) < TREND_MIN_SAMPLES:
+        result["verdict"] = TREND_TOO_FEW_SAMPLES
+        return result
+
+    change_ms  = recent_p95 - previous_p95
+    change_pct = (change_ms / previous_p95) * 100.0
+    result["change_ms"]  = change_ms
+    result["change_pct"] = change_pct
+    result["verdict"]    = TREND_OK
+
+    if abs(change_pct) < TREND_MIN_CHANGE_PCT:
+        result["suppressed_by"] = "relative"
+        return result
+    if abs(change_ms) < TREND_MIN_CHANGE_MS:
+        # Named, not hidden. A +200% jump from 2 ms to 6 ms is real and
+        # irrelevant; saying WHICH floor stopped it is what keeps a quiet
+        # feature from reading as a broken one.
+        result["suppressed_by"] = "absolute"
+        return result
+
+    result["verdict"] = TREND_DEGRADING if change_ms > 0 else TREND_IMPROVING
+    return result

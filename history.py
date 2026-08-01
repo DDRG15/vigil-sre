@@ -429,9 +429,19 @@ def uptime_pct(db_path: Path, url: str, since: str) -> float | None:
     return (up / total) * 100.0
 
 
-def latency_percentiles(db_path: Path, url: str, since: str) -> dict[str, float] | None:
+def latency_percentiles(
+    db_path: Path,
+    url    : str,
+    since  : str,
+    until  : str | None = None,
+) -> dict[str, float] | None:
     """
-    p50/p95 TTFB (milliseconds) for *url* since *since*. Returns None when
+    p50/p95 TTFB (milliseconds) for *url* between *since* and *until*.
+
+    *until* is exclusive and defaults to None, meaning "up to now" — the
+    open-ended behaviour every existing caller relies on. Bounding it is what
+    lets the trend comparison ask for the window BEFORE the current one
+    without a second query that could drift from this one. Returns None when
     there are no rows with a non-NULL ttfb_ms in the window — a target that
     was DOWN for the entire window has nothing to measure, and a fabricated
     0ms reads as suspiciously fast rather than as absent.
@@ -460,14 +470,16 @@ def latency_percentiles(db_path: Path, url: str, since: str) -> dict[str, float]
         row = con.execute(
             """
             SELECT MIN(CASE WHEN cd >= 0.50 THEN ttfb_ms END) AS p50,
-                   MIN(CASE WHEN cd >= 0.95 THEN ttfb_ms END) AS p95
+                   MIN(CASE WHEN cd >= 0.95 THEN ttfb_ms END) AS p95,
+                   COUNT(*)                                    AS n
             FROM (
                 SELECT ttfb_ms, CUME_DIST() OVER (ORDER BY ttfb_ms) AS cd
                 FROM probe_results
                 WHERE url = ? AND checked_at >= ? AND ttfb_ms IS NOT NULL
+                  AND (? IS NULL OR checked_at < ?)
             )
             """,
-            (url, since),
+            (url, since, until, until),
         ).fetchone()
     except sqlite3.OperationalError as exc:
         if _is_missing_schema(exc):
@@ -479,10 +491,14 @@ def latency_percentiles(db_path: Path, url: str, since: str) -> dict[str, float]
         raise
     finally:
         con.close()
-    p50, p95 = row
+    p50, p95, n = row
     if p50 is None:
         return None
-    return {"p50_ttfb_ms": p50, "p95_ttfb_ms": p95}
+    # `samples` is additive, not a contract change: every existing caller reads
+    # the two percentile keys by name. Trend comparison needs it, because two
+    # windows with wildly different sample counts are not comparable -- a p95
+    # over three readings is a number, not a measurement.
+    return {"p50_ttfb_ms": p50, "p95_ttfb_ms": p95, "samples": n}
 
 
 #: Bars in one target's history strip. Fixed, not derived from the data: a
@@ -580,3 +596,34 @@ def status_strip(
         if url in strips:
             strips[url][index] = rank_to_status.get(worst)
     return strips
+
+
+def latency_trend_windows(
+    db_path    : Path,
+    url        : str,
+    window_days: int = 7,
+    now        : datetime | None = None,
+) -> tuple[dict | None, dict | None]:
+    """
+    Percentiles for the most recent *window_days*, and for the window before it.
+
+    Two calls to the SAME function rather than one query with two branches:
+    the comparison is only meaningful if both halves were computed identically,
+    and the surest way to guarantee that is to compute them with the same code.
+    This project already learned that lesson when a CLI and an API derived the
+    same figure separately and disagreed.
+
+    Returns ``(recent, previous)``, either of which may be None when its window
+    holds no measurable rows — a target that was DOWN for a whole window has
+    nothing to compare, and inventing a zero would read as suspiciously fast.
+    """
+    now      = now or datetime.now(timezone.utc)
+    fmt      = "%Y-%m-%dT%H:%M:%SZ"
+    boundary = now - timedelta(days=window_days)
+    earliest = now - timedelta(days=window_days * 2)
+
+    recent   = latency_percentiles(db_path, url, boundary.strftime(fmt))
+    previous = latency_percentiles(
+        db_path, url, earliest.strftime(fmt), until=boundary.strftime(fmt)
+    )
+    return recent, previous

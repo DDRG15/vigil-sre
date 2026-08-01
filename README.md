@@ -769,6 +769,35 @@ Two consequences worth knowing:
   per-channel, so a dead Discord never delays a healthy Slack, and the breaker
   resets every run — a single bad minute must not mute a channel for good.
 
+### Is it getting worse?
+
+Every threshold here is absolute: RTT over 400 ms, TTFB over 1500. Those answer
+*is this slow*, and the per-target overrides make that question fair. None of
+them answers *is this getting worse*, and that is the failure a threshold
+structurally cannot see — a service drifting from 50 ms to 380 ms over two
+weeks never crosses 400, so it dies slowly and in silence.
+
+`--report` ends with a p95 comparison of the last seven days against the seven
+before them. Comparing a target against its own past makes the signal relative
+to that target: an endpoint that was always 300 ms is not news, one that went
+from 50 to 300 is.
+
+Two floors keep it quiet, and **both must clear, not either**: a change must be
+at least 50% *and* at least 50 ms. Two milliseconds becoming six is +200% and
+matters to nobody; five seconds becoming 5.2 is +200 ms and is noise on an
+endpoint that slow.
+
+**A suppressed change still prints, with the number that was suppressed and the
+floor that stopped it.** "Measured, too small to act on" and "the check never
+ran" look identical from outside, and only one of them is acceptable — a quiet
+feature that cannot prove it ran is indistinguishable from a broken one.
+
+**It does not alert, deliberately.** Choosing the point where a trend becomes
+worth waking someone up requires knowing which ranges are noise on your own
+targets, and that takes weeks of history nobody has on day one. Measuring
+first and alerting later is the honest order. Revisit once there is real
+history to calibrate against.
+
 ### Reminders while an outage is still going
 
 Alerting once on the transition is right against noise and wrong against a

@@ -54,6 +54,14 @@ import targetstore
 from dotenv import load_dotenv
 
 from diagnostics import (
+    TREND_DEGRADING,
+    TREND_IMPROVING,
+    TREND_MIN_CHANGE_MS,
+    TREND_MIN_CHANGE_PCT,
+    TREND_MIN_SAMPLES,
+    TREND_NO_DATA,
+    TREND_TOO_FEW_SAMPLES,
+    latency_trend,
     reminders_due,
     CERT_CRIT_DAYS,
     DEGRADED_TTFB_MS,
@@ -72,6 +80,7 @@ from diagnostics import (
     sample_connection,
 )
 from history import (
+    latency_trend_windows,
     HISTORY_DB_FILE,
     CheckOutcome,
     HistoryRecorder,
@@ -1898,7 +1907,88 @@ def _generate_report(
             )
         lines.append(row)
 
+    trend_lines = _trend_lines(targets, history_path, now)
+    if trend_lines:
+        lines.append("")
+        lines.extend(trend_lines)
+
     return "\n".join(lines)
+
+
+#: Window compared against the one before it. Half the default retention, so
+#: both halves fit inside what was actually kept — comparing a full window
+#: against one that retention already truncated would report a change that is
+#: an artefact of deletion, not of the service.
+TREND_WINDOW_DAYS: int = 7
+
+
+def _trend_lines(
+    targets     : list[Target],
+    history_path: Path,
+    now         : datetime | None = None,
+) -> list[str]:
+    """
+    The "is this getting worse" section of --report.
+
+    Every target gets a line, including the ones with nothing to say. A section
+    that lists only problems cannot be told apart from a section that failed to
+    run, and this project treats "silence that looks like health" as the thing
+    to design against. So a target whose change was too small to matter says
+    so, and prints the number that was too small.
+    """
+    rows: list[tuple[str, str]] = []
+    for target in targets:
+        recent, previous = latency_trend_windows(
+            history_path, target.url, TREND_WINDOW_DAYS, now
+        )
+        verdict = latency_trend(
+            recent["p95_ttfb_ms"]   if recent   else None,
+            previous["p95_ttfb_ms"] if previous else None,
+            recent["samples"]       if recent   else 0,
+            previous["samples"]     if previous else 0,
+        )
+        rows.append((target.url, _describe_trend(verdict)))
+
+    if not rows:
+        return []
+    width  = max(len(url) for url, _ in rows) + 2
+    header = (
+        f"Tendencia p95 — últimos {TREND_WINDOW_DAYS}d contra los "
+        f"{TREND_WINDOW_DAYS}d previos"
+    )
+    return [header, "-" * len(header)] + [
+        url.ljust(width) + text for url, text in rows
+    ]
+
+
+def _describe_trend(t: dict) -> str:
+    """One line per target, and never an empty one."""
+    if t["verdict"] == TREND_NO_DATA:
+        return "sin datos suficientes en una de las dos ventanas"
+    if t["verdict"] == TREND_TOO_FEW_SAMPLES:
+        return (
+            f"muestras insuficientes para comparar "
+            f"({t['recent_samples']} vs {t['previous_samples']}, "
+            f"se necesitan {TREND_MIN_SAMPLES})"
+        )
+
+    delta  = f"{t['change_pct']:+.0f}% ({t['change_ms']:+.0f}ms)"
+    detail = f"{t['previous_p95_ms']:.0f}ms → {t['recent_p95_ms']:.0f}ms"
+
+    if t["verdict"] == TREND_DEGRADING:
+        return f"⚠  DEGRADANDO  {delta}   {detail}"
+    if t["verdict"] == TREND_IMPROVING:
+        return f"   mejorando    {delta}   {detail}"
+
+    # Suppressed, and it names WHICH floor stopped it. "Measured and too small
+    # to act on" must not read as "the check did not run" — that ambiguity is
+    # what makes a quiet feature look like a broken one.
+    floor = {
+        "relative": f"cambio bajo el {TREND_MIN_CHANGE_PCT:.0f}% mínimo",
+        "absolute": f"cambio bajo los {TREND_MIN_CHANGE_MS:.0f}ms mínimos",
+    }.get(t["suppressed_by"], "estable")
+    return f"   estable      {delta}   {detail}   [{floor}]"
+
 
 
 def undelivered_alerts(state_path: Path) -> int:

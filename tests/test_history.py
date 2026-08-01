@@ -463,10 +463,11 @@ async def test_percentiles_include_the_maximum_at_every_sample_size(
         for v in range(1, n + 1)
     ])
     result = latency_percentiles(db_path, URL, OLD_CUTOFF)
-    assert result == {
-        "p50_ttfb_ms": float(math.ceil(0.50 * n)),
-        "p95_ttfb_ms": float(math.ceil(0.95 * n)),
-    }
+    assert (result["p50_ttfb_ms"], result["p95_ttfb_ms"]) == (
+        float(math.ceil(0.50 * n)),
+        float(math.ceil(0.95 * n)),
+    )
+    assert result["samples"] == n, "the count must match what was seeded"
 
 
 async def test_uptime_pct_excludes_rows_before_since(tmp_path: Path) -> None:
@@ -497,7 +498,7 @@ async def test_latency_percentiles_hand_calculated(tmp_path: Path) -> None:
     ]
     await rec.record_run("2026-07-30T00:00:00Z", outcomes)
     result = latency_percentiles(db_path, URL, OLD_CUTOFF)
-    assert result == {"p50_ttfb_ms": 10.0, "p95_ttfb_ms": 19.0}
+    assert (result["p50_ttfb_ms"], result["p95_ttfb_ms"]) == (10.0, 19.0)
 
 
 async def test_latency_percentiles_no_rows_returns_none(tmp_path: Path) -> None:
@@ -520,7 +521,7 @@ async def test_latency_percentiles_ignores_down_rows_with_null_ttfb(tmp_path: Pa
     ]
     await rec.record_run("2026-07-30T00:00:00Z", outcomes)
     result = latency_percentiles(db_path, URL, OLD_CUTOFF)
-    assert result == {"p50_ttfb_ms": 50.0, "p95_ttfb_ms": 50.0}
+    assert (result["p50_ttfb_ms"], result["p95_ttfb_ms"]) == (50.0, 50.0)
 
 
 async def test_latency_percentiles_excludes_rows_before_since(tmp_path: Path) -> None:
@@ -535,4 +536,4 @@ async def test_latency_percentiles_excludes_rows_before_since(tmp_path: Path) ->
                      phases=_phases(ttfb_ms=50.0))
     ])
     result = latency_percentiles(db_path, URL, "2026-01-01T00:00:00Z")
-    assert result == {"p50_ttfb_ms": 50.0, "p95_ttfb_ms": 50.0}
+    assert (result["p50_ttfb_ms"], result["p95_ttfb_ms"]) == (50.0, 50.0)

@@ -59,3 +59,41 @@ services:
       timeout: 10s
       start_period: 5s
       retries: 3
+
+  # The dead-man's switch, self-hosted, so a clone of this repo demonstrates it
+  # without anyone signing up for anything.
+  #
+  # Read this before trusting it: a watchdog that shares a machine with what it
+  # watches cannot report that the machine died. It catches the probe container
+  # crashing. It does not catch Docker stopping, the host powering off, or the
+  # network dropping — and those are the failures that matter most, because
+  # they are the ones where nobody is left inside to speak.
+  #
+  # So this service is for REPRODUCIBILITY, not for vigilance. For real
+  # operation, point HEARTBEAT_URL at an external instance (healthchecks.io or
+  # your own, somewhere else). The code does not care which: it is one URL.
+  #
+  # It notifies nobody. No SMTP, no webhook, on purpose — evidence lives in its
+  # own event log at http://127.0.0.1:8000, which is more convincing than an
+  # email anyway, and costs the reader zero notifications.
+  watchdog:
+    image: healthchecks/healthchecks:latest
+    environment:
+      - SECRET_KEY=vigil-sre-local-demo-not-a-production-secret
+      - DEBUG=False
+      - ALLOWED_HOSTS=*
+      - CSRF_TRUSTED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000
+      - DB=sqlite
+      - DB_NAME=/data/hc.sqlite
+      - SITE_ROOT=http://127.0.0.1:8000
+      # No EMAIL_HOST: an unconfigured backend sends nothing. Deliberate.
+      - SUPERUSER_EMAIL=demo@vigil.local
+      - SUPERUSER_PASSWORD=vigil-demo
+      - REGISTRATION_OPEN=False
+    volumes:
+      - ./data/watchdog:/data
+    ports:
+      # Loopback only, same rule as the dashboard: this is a local demo, not a
+      # service to publish.
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
