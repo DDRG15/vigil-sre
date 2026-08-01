@@ -809,6 +809,47 @@ class StateManager:
             self._write_sync()
             return True
 
+    async def prune(self, urls: list[str]) -> list[str]:
+        """
+        Drop state for targets no longer configured. Returns what was removed.
+
+        Nothing else removes these records, and they are not inert. Two things
+        read the whole map rather than the configured list:
+
+          - ``stale_seconds`` answers with the age of the OLDEST record, so a
+            single abandoned target pins the dashboard's freshness banner to
+            "dead" forever — the one indicator this project calls its own, made
+            permanently red and therefore ignorable.
+          - The dashboard renders a row per record, so it shows endpoints
+            nobody is watching, with an uptime that stopped moving.
+
+        Reproduced live: two fixtures removed from the config kept a running
+        monitor reading "these data are 978 minutes old" while it had probed
+        sixty seconds earlier. The page contradicted itself in the same
+        viewport — header "6 target(s)", editor listing 4.
+
+        The dashboard editor turned removing a target into one click, so this
+        went from a rare state to the expected one.
+
+        Called at the end of a run, not the start: a target removed mid-run has
+        already been probed, and dropping its record first would throw away the
+        result of work that was done.
+        """
+        async with self._lock:
+            configured = set(urls)
+            removed    = [url for url in self._state if url not in configured]
+            if not removed:
+                return []
+            for url in removed:
+                del self._state[url]
+            self._write_sync()
+        logger.info(
+            "Pruned %d target(s) no longer configured: %s. event_type=metric "
+            "metric=state_pruned_total value=%d",
+            len(removed), ", ".join(removed), len(removed),
+        )
+        return removed
+
     async def claim_reminder(self, url: str) -> float | None:
         """
         Return the outage's age in hours if a reminder is owed, else None.
@@ -1751,6 +1792,12 @@ async def run_health_checks(
     # and it can't: HistoryRecorder never raises (see history.py).
     await history.record_run(run_started_at, outcomes)
     await history.prune()
+
+    # The configured list is authoritative, and this is the only place that
+    # holds both it and the state. Records for targets that are gone are not
+    # harmless leftovers: stale_seconds() takes the OLDEST of them, so one
+    # abandoned entry keeps the freshness banner red forever.
+    await state.prune([t.url for t in resolved])
 
     if shutdown_event.is_set():
         logger.info("Shutdown signal was processed cleanly.")
