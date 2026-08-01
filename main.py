@@ -54,6 +54,7 @@ import targetstore
 from dotenv import load_dotenv
 
 from diagnostics import (
+    reminders_due,
     CERT_CRIT_DAYS,
     DEGRADED_TTFB_MS,
     RTT_HIGH_MS,
@@ -530,6 +531,7 @@ class UrlState(TypedDict, total=False):
     cert_alerted_days   : int    # threshold (30 or 7) this target was last cert-alerted at
     cert_last_seen_days : int    # previous run's tls_cert_days_left — a RISE means renewal
     alert_pending       : bool   # last alert for this target reached NOBODY; retry next run
+    remind_step         : int    # reminders already sent for the CURRENT outage
 
 
 #: Fields that describe something ORTHOGONAL to the current status, and must
@@ -766,6 +768,13 @@ class StateManager:
                     last_changed         =previous["last_changed"],
                     last_error           =error,
                     consecutive_failures =previous.get("consecutive_failures", 1) + 1,
+                    # Carried by hand rather than via _CARRY_FORWARD_FIELDS,
+                    # for the same reason consecutive_failures is: this counts
+                    # reminders for THIS outage, so it must survive a repeat
+                    # failure and vanish the moment the target recovers. A
+                    # carried-forward field would follow the record into UP and
+                    # silence the first reminder of the NEXT outage.
+                    remind_step          =previous.get("remind_step", 0),
                 ))
                 self._write_sync()
                 # Normally False: a repeat failure on an already-DOWN target is
@@ -796,6 +805,40 @@ class StateManager:
             ))
             self._write_sync()
             return True
+
+    async def claim_reminder(self, url: str) -> float | None:
+        """
+        Return the outage's age in hours if a reminder is owed, else None.
+
+        Claims rather than asks: when one is owed the counter advances inside
+        the same lock, so two concurrent probes of the same target cannot both
+        decide to send it.
+
+        The schedule is compared as a COUNT, not as "is one due right now".
+        A monitor that was itself down for six hours comes back, sees three
+        reminders were owed and sends one — not three, and not zero. Asking
+        "is one due in this window" would skip a reminder forever whenever a
+        run did not happen to land inside it.
+        """
+        async with self._lock:
+            record = self._state.get(url)
+            if record is None or record.get("status") != STATUS_DOWN:
+                return None
+            try:
+                started = datetime.strptime(
+                    record["last_changed"], "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc)
+            except (KeyError, ValueError):
+                return None
+
+            elapsed_h = (datetime.now(timezone.utc) - started).total_seconds() / 3600
+            due       = reminders_due(elapsed_h)
+            if due <= record.get("remind_step", 0):
+                return None
+
+            record["remind_step"] = due
+            self._write_sync()
+            return elapsed_h
 
     async def record_alert_outcome(self, url: str, delivered: bool) -> None:
         """
@@ -1291,6 +1334,7 @@ async def check_url(
     degraded_ttfb_ms        : float | None = None,
     degraded_rtt_ms         : float | None = None,
     expect_substring_display: str   | None = None,
+    remind                  : bool  = False,
 ) -> CheckOutcome:
     """
     Run the full health-check pipeline for one URL.
@@ -1422,6 +1466,28 @@ async def check_url(
                 "⚠️   Failure recorded, alert suppressed (already DOWN or "
                 "pending confirmation)  %s | %s", url, exc.detail,
             )
+            # Opt-in, and only while confirmed DOWN. Alerting once is right
+            # against noise and wrong against a six-hour outage: after the
+            # first message, silence and "resolved" look identical. DEGRADED is
+            # deliberately excluded — this project treats it as a performance
+            # signal rather than an availability one (uptime counts DEGRADED as
+            # up), and a slow endpoint is not an incident to page about again.
+            if remind:
+                elapsed_h = await state.claim_reminder(url)
+                if elapsed_h is not None:
+                    detail = (
+                        f"{exc.detail} — lleva {elapsed_h:.1f}h caído "
+                        f"y sigue sin resolverse."
+                    )
+                    logger.error(
+                        "⏳  RECORDATORIO  %s | %.1fh caído | %s",
+                        url, elapsed_h, exc.detail,
+                    )
+                    delivered = await dispatch_alert(
+                        session, url, status_detail=detail,
+                        kind=AlertKind.STILL_DOWN,
+                    )
+                    await state.record_alert_outcome(url, delivered)
         # The persisted status is authoritative: a pending-hysteresis failure
         # leaves the target's previous healthy status in place (see set_down),
         # so this can legitimately come back UP/DEGRADED, not just DOWN — with
@@ -1647,6 +1713,7 @@ async def run_health_checks(
                 timeout_s=t.timeout_s,
                 degraded_ttfb_ms=t.degraded_ttfb_ms,
                 degraded_rtt_ms=t.degraded_rtt_ms,
+                remind=t.remind,
                 expect_substring_display=t.expect_substring_display,
             )
             for t in resolved

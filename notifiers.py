@@ -152,6 +152,7 @@ class AlertKind(Enum):
     DEGRADED           = "degraded"
     CERT_EXPIRING_WARN = "cert_expiring_warn"
     CERT_EXPIRING_CRIT = "cert_expiring_crit"
+    STILL_DOWN         = "still_down"
 
 
 class Notifier(abc.ABC):
@@ -345,6 +346,11 @@ class DiscordNotifier(Notifier):
             title        = "🚨  Certificate Expiring — Outage Has a Date"
             color        = 0xFF0000  # red: this becomes a full outage, soon
             status_label = "📛  Certificate"
+        elif kind is AlertKind.STILL_DOWN:
+            title        = "⏳  Still Down — This Has Been Going A While"
+            color        = 0xFF0000  # same red as the first alert: same severity
+            status_label = "🔴  Still DOWN"
+
         elif kind is AlertKind.FAILURE:
             title        = "🚨  Infrastructure Alert — Health Check Failed"
             color        = 0xFF0000  # red
@@ -432,6 +438,11 @@ class SlackNotifier(Notifier):
             title        = "🚨  Infrastructure Alert — Health Check Failed"
             color        = "#FF0000"  # same red
             status_label = "Failure Detail"
+        elif kind is AlertKind.STILL_DOWN:
+            title        = "⏳  Still Down — This Has Been Going A While"
+            color        = "#FF0000"   # same red as Discord: identical triage
+            status_label = "Still DOWN"
+
         else:
             raise ValueError(f"unhandled AlertKind in Slack payload: {kind}")
 

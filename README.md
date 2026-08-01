@@ -769,6 +769,25 @@ Two consequences worth knowing:
   per-channel, so a dead Discord never delays a healthy Slack, and the breaker
   resets every run — a single bad minute must not mute a channel for good.
 
+### Reminders while an outage is still going
+
+Alerting once on the transition is right against noise and wrong against a
+six-hour outage: after the first message, silence and "resolved" read the same.
+A target can opt in to being reminded at **1h, 2h, 4h, 6h, 12h, then daily** —
+widening gaps, because the spacing itself says how long this has been going,
+and a fixed hourly ping is nagging by hour six.
+
+**Opt-in per target, never opt-out**, via `remind: true` in `targets.yaml` or
+the checkbox in the dashboard editor. A target you added to watch something
+break — a test URL, an endpoint you know is bad — would otherwise nag forever.
+
+Two properties worth knowing. The schedule is evaluated as a **count of
+reminders owed**, not as "is one due right now": a monitor that was itself down
+for six hours comes back, sees three were owed, and sends one — not three, and
+not zero. And only confirmed DOWN targets are reminded; DEGRADED is excluded on
+purpose, because this project treats it as a performance signal rather than an
+availability one, and a slow endpoint is not an incident to page about again.
+
 ### Tune the thresholds to the path you are measuring
 
 `degraded_rtt_ms` defaults to 100 ms, which assumes the probe sits near what it

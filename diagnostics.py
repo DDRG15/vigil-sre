@@ -787,3 +787,44 @@ def phases_to_dict(phases: ProbePhases, findings: list[Diagnosis]) -> dict:
         ],
         "measured_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Ongoing-incident reminders
+# ---------------------------------------------------------------------------
+
+#: Hours after an outage begins at which a reminder is due. Growing gaps, not a
+#: fixed interval: the spacing itself communicates "this has been going a
+#: while", and a fixed hourly ping is nagging by hour six — the alert fatigue
+#: this project spent several rounds removing.
+REMINDER_SCHEDULE_H: tuple[float, ...] = (1, 2, 4, 6, 12)
+
+#: After the schedule above is exhausted, one reminder per day. An outage that
+#: has lasted twelve hours is known; a daily line is a record, not a page.
+REMINDER_REPEAT_H: float = 24
+
+
+def reminders_due(elapsed_hours: float) -> int:
+    """
+    How many reminders SHOULD have fired for an outage this old.
+
+    Returns a count, not a boolean, and that is the point. Comparing this
+    against how many were actually sent makes the schedule self-correcting:
+    a monitor that was itself down for six hours comes back, sees that three
+    reminders were owed, and sends one — not three, and not zero. A boolean
+    "is one due right now" would fire only if a run happened to land inside
+    the right window, so a missed cycle would silently skip that reminder
+    forever.
+
+    Pure: no clock, no state. The caller supplies the elapsed time.
+    """
+    # No guard against a negative elapsed time on purpose: the arithmetic
+    # already answers 0, because no `>=` comparison below can hold. A mutation
+    # test proved the guard was code a test could not tell from its absence,
+    # which is the definition of noise. The property is held by the test that
+    # asserts it, not by a line that restates it.
+    due = sum(1 for threshold in REMINDER_SCHEDULE_H if elapsed_hours >= threshold)
+    last = REMINDER_SCHEDULE_H[-1]
+    if elapsed_hours >= last:
+        due += int((elapsed_hours - last) // REMINDER_REPEAT_H)
+    return due
