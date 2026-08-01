@@ -437,6 +437,7 @@ def load_targets(
                 degraded_ttfb_ms        =e.get("degraded_ttfb_ms"),
                 degraded_rtt_ms         =e.get("degraded_rtt_ms"),
                 remind                  =e.get("remind", False),
+                maintenance             =e.get("maintenance"),
             )
             for e in stored
         ]
@@ -1387,6 +1388,7 @@ async def _alert_unless_muted(
     status_detail: str,
     kind         : AlertKind,
     maintenance  : list[dict] | None,
+    state        : StateManager | None = None,
 ) -> bool:
     """
     Send an alert unless this target is inside a maintenance window.
@@ -1411,8 +1413,20 @@ async def _alert_unless_muted(
             "%s | %s. event_type=metric metric=alerts_muted_total value=1",
             window["start"], window["end"], url, status_detail,
         )
+        # Returns WITHOUT touching alert_pending, and that omission is the
+        # point. If a previous delivery genuinely failed, that flag is the only
+        # memory that nobody was ever told; a mute landing on the retry would
+        # clear it and the outage would never be announced, not even after the
+        # window closes — because by then the status has not changed, so no
+        # transition fires. Silencing a NEW alert is the feature; erasing the
+        # record of an OLD one that never arrived is data loss.
         return True
-    return await dispatch_alert(session, url, status_detail=status_detail, kind=kind)
+
+    delivered = await dispatch_alert(
+        session, url, status_detail=status_detail, kind=kind)
+    if state is not None:
+        await state.record_alert_outcome(url, delivered)
+    return delivered
 
 
 async def check_url(
@@ -1511,10 +1525,9 @@ async def check_url(
             transitioned = await state.set_degraded(url, reason, diagnostics=diagnostics)
             if transitioned:
                 logger.warning("🟡  STATE CHANGE → DEGRADED  %s | %s", url, reason)
-                delivered = await _alert_unless_muted(
-                    session, url, reason, AlertKind.DEGRADED, maintenance
+                await _alert_unless_muted(
+                    session, url, reason, AlertKind.DEGRADED, maintenance, state
                 )
-                await state.record_alert_outcome(url, delivered)
             else:
                 logger.info("🟡  Still DEGRADED (alert suppressed)  %s | %s", url, reason)
             # After the status write: the record must exist and _carry_forward
@@ -1529,10 +1542,10 @@ async def check_url(
             transitioned = await state.set_up(url, diagnostics=diagnostics)
             if transitioned:
                 logger.info("🟢  STATE CHANGE → UP    %s", url)
-                delivered = await _alert_unless_muted(
-                    session, url, "Service is UP", AlertKind.RECOVERY, maintenance
+                await _alert_unless_muted(
+                    session, url, "Service is UP", AlertKind.RECOVERY,
+                    maintenance, state
                 )
-                await state.record_alert_outcome(url, delivered)
             else:
                 logger.info("✅  OK (no change)       %s", url)
             await _maybe_alert_cert_expiry(session, url, state, phases, maintenance)
@@ -1546,10 +1559,9 @@ async def check_url(
         transitioned = await state.set_down(url, error=exc.detail)
         if transitioned:
             logger.error("🔴  STATE CHANGE → DOWN  %s | %s", url, exc.detail)
-            delivered = await _alert_unless_muted(
-                session, url, exc.detail, AlertKind.FAILURE, maintenance
+            await _alert_unless_muted(
+                session, url, exc.detail, AlertKind.FAILURE, maintenance, state
             )
-            await state.record_alert_outcome(url, delivered)
         else:
             # Covers two cases: already-confirmed DOWN (repeat, alert already
             # sent), or a healthy target still inside its DOWN_CONFIRMATIONS
@@ -1575,11 +1587,10 @@ async def check_url(
                         "⏳  RECORDATORIO  %s | %.1fh caído | %s",
                         url, elapsed_h, exc.detail,
                     )
-                    delivered = await _alert_unless_muted(
+                    await _alert_unless_muted(
                         session, url, detail,
-                        AlertKind.STILL_DOWN, maintenance,
+                        AlertKind.STILL_DOWN, maintenance, state,
                     )
-                    await state.record_alert_outcome(url, delivered)
         # The persisted status is authoritative: a pending-hysteresis failure
         # leaves the target's previous healthy status in place (see set_down),
         # so this can legitimately come back UP/DEGRADED, not just DOWN — with

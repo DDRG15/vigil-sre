@@ -79,7 +79,14 @@ services:
   watchdog:
     image: healthchecks/healthchecks:latest
     environment:
-      - SECRET_KEY=vigil-sre-local-demo-not-a-production-secret
+      # Generated per install by scripts/init-watchdog.sh, never a literal.
+      # A hardcoded key would be byte-identical in every clone of a public
+      # repo, and Django signs session cookies with it: anyone could forge
+      # a session for the demo superuser without guessing anything. Today
+      # the port is loopback-only so that is unreachable — but "publish it
+      # to the team" is a one-line change to the ports entry below, and
+      # nobody making it would think to rotate a key that already works.
+      - SECRET_KEY=${WATCHDOG_SECRET_KEY:?Corré scripts/init-watchdog.sh primero}
       - DEBUG=False
       - ALLOWED_HOSTS=*
       - CSRF_TRUSTED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000

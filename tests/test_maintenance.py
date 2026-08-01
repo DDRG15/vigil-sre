@@ -274,3 +274,105 @@ async def test_the_probe_keeps_measuring_during_a_window(tmp_path, monkeypatch) 
     assert URL in stored["targets"], "the target was still probed and recorded"
     assert stored["targets"][URL].get("last_checked"), "with a real timestamp"
     assert spy.calls == 0, "and nobody was alerted"
+
+
+# =============================================================================
+# E. Regressions from the audit of this phase
+# =============================================================================
+
+
+def test_a_window_configured_in_the_store_reaches_the_target(tmp_path) -> None:
+    """The audit's HIGH, as an assertion.
+
+    Everything about this feature worked in isolation -- the store validated
+    and persisted the window, in_maintenance evaluated it correctly, the funnel
+    honoured it, and the dashboard drew the badge (it reads the store
+    directly). And it did nothing in production, because load_targets built
+    Target objects without the field. Two subsystems disagreed about reality
+    and only the visible one was right: the operator read "silenced" and got
+    paged anyway.
+
+    Every one of the 491 tests passed while the feature was inert, because all
+    of them construct Target by hand. This one goes through load_targets.
+    """
+    store = tmp_path / "targets.json"
+    yaml  = tmp_path / "targets.yaml"
+    yaml.write_text(f"targets:\n  - {URL}\n", encoding="utf-8")
+    targetstore.write_store(
+        [validate_entry({"url": URL, "maintenance": [NIGHT], "remind": True})], store)
+
+    target = main.load_targets(yaml, store_path=store)[0]
+    assert target.maintenance == [NIGHT], (
+        "a window configured from the dashboard must reach the object "
+        "check_url actually receives"
+    )
+    assert target.remind is True, "and so must every other per-target field"
+
+
+def test_the_documented_fullday_recipe_covers_the_whole_day() -> None:
+    """The store rejects start == end and tells the operator to use
+    "00:00 a 23:59" instead. With an exclusive end that recipe left the last
+    minute of every day unsilenced -- the message and the implementation
+    disagreeing once a day, forever."""
+    fullday = [{"start": "00:00", "end": "23:59"}]
+    assert in_maintenance(fullday, _at(3, 23, 59)), "23:59 is inside a full day"
+    assert in_maintenance(fullday, _at(3, 0, 0)),   "and so is midnight"
+
+
+def test_an_ordinary_end_stays_exclusive() -> None:
+    """Only the documented full-day end is special-cased. Making every end
+    inclusive would overlap two adjacent windows and silence a minute nobody
+    asked to silence."""
+    assert not in_maintenance([NIGHT], _at(3, 4, 0)), "04:00 ends the window"
+
+
+async def test_a_mute_does_not_erase_an_undelivered_alert(monkeypatch, tmp_path) -> None:
+    """The audit's second HIGH.
+
+    A failed delivery arms alert_pending -- the only memory that nobody was
+    ever told. A window opening on the RETRY used to clear it, and since the
+    status had not changed, no later transition would ever fire: the outage
+    stayed buried after the window closed. Silencing a NEW alert is the
+    feature; erasing the record of an OLD one that never arrived is data loss.
+    """
+    state = main.StateManager(tmp_path / "state.json")
+    await state.set_down(URL, "boom")
+    await state.record_alert_outcome(URL, delivered=False)   # every channel down
+    assert state._state[URL]["alert_pending"] is True
+
+    monkeypatch.setattr(main, "in_maintenance", lambda w, n: NIGHT)
+    spy = _Recorder()
+    monkeypatch.setattr(main, "dispatch_alert", spy)
+    await main._alert_unless_muted(
+        None, URL, "boom", AlertKind.FAILURE, [NIGHT], state)
+
+    assert spy.calls == 0, "muted: nothing was sent"
+    assert state._state[URL]["alert_pending"] is True, (
+        "and the retry armed by a real delivery failure survives the mute"
+    )
+
+
+async def test_a_delivered_alert_still_clears_the_flag(monkeypatch, tmp_path) -> None:
+    """The other half. Moving the bookkeeping into the funnel must not stop it
+    happening -- otherwise every delivered alert would re-send forever."""
+    state = main.StateManager(tmp_path / "state.json")
+    await state.set_down(URL, "boom")
+    await state.record_alert_outcome(URL, delivered=False)
+
+    monkeypatch.setattr(main, "in_maintenance", lambda w, n: None)
+    monkeypatch.setattr(main, "dispatch_alert", _Recorder())
+    await main._alert_unless_muted(
+        None, URL, "boom", AlertKind.FAILURE, None, state)
+
+    assert state._state[URL]["alert_pending"] is False
+
+
+def test_the_compose_file_holds_no_literal_secret() -> None:
+    """A hardcoded SECRET_KEY is byte-identical in every clone of a public
+    repo, and Django signs session cookies with it. Loopback-only today, but
+    publishing the port is a one-line change nobody would pair with rotating a
+    key that already works."""
+    compose = (Path(__file__).resolve().parent.parent / "docker-compose.yml"
+               ).read_text(encoding="utf-8")
+    assert "SECRET_KEY=${WATCHDOG_SECRET_KEY" in compose
+    assert "vigil-sre-local-demo" not in compose

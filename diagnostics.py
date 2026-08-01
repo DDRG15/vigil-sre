@@ -966,6 +966,15 @@ def in_maintenance(windows: list[dict] | None, now: datetime) -> dict | None:
 
         start = start_h * 60 + start_m
         end   = end_h * 60 + end_m
+        if end == 1439:
+            # 23:59 is the full-day recipe the store's own rejection message
+            # hands the operator ("para silenciar todo el día usá 00:00 a
+            # 23:59"). With an exclusive end that recipe leaves the last
+            # minute of every day unsilenced, so the config and the message
+            # that produced it disagree once a day, forever. Every other end
+            # stays exclusive; only this one is special-cased, because only
+            # this one is documented as meaning "all of it".
+            end = 1440
 
         if start <= end:
             if days is not None and weekday not in days:

@@ -26,6 +26,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# A key per install, not a literal shared by every clone of a public repo.
+# Django signs session cookies with it, so a shared one lets anyone forge a
+# session for the demo superuser. Generated here because compose refuses to
+# start the service without it — which is the point: the failure is loud.
+if ! grep -q '^WATCHDOG_SECRET_KEY=' .env 2>/dev/null; then
+    KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    printf '\nWATCHDOG_SECRET_KEY=%s\n' "$KEY" >> .env
+    echo "  Generado WATCHDOG_SECRET_KEY único para esta instalación en .env" >&2
+    echo "  Levantá el servicio ahora:  docker compose up -d watchdog" >&2
+    exit 0
+fi
+
 if ! docker compose ps watchdog --format '{{.Status}}' 2>/dev/null | grep -q Up; then
     echo "El servicio 'watchdog' no está corriendo. Levantalo primero:" >&2
     echo "  docker compose up -d watchdog" >&2
