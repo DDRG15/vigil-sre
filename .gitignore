@@ -42,5 +42,6 @@ Thumbs.db
 .claude/
 CLAUDE.md
 INSTRUCCIONES.md
-the design notes
+DEVELOPMENT_PHASES.md
 AUDITORIA_*.md
+prompts/
