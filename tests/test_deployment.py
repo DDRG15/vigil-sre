@@ -95,3 +95,24 @@ def test_the_api_port_is_published_only_to_loopback() -> None:
     assert published, "the API port is never published"
     for entry in published:
         assert entry.startswith("127.0.0.1:"), f"port published off-loopback: {entry}"
+
+
+def test_ci_supplies_the_key_compose_now_demands() -> None:
+    """The guard that broke CI, and the reason it stays.
+
+    Making compose refuse to render without WATCHDOG_SECRET_KEY was the right
+    call -- a shared key in a public repo lets anyone forge a session for the
+    watchdog's demo user. It also broke the end-to-end job, which copies only
+    .env.example. The fix is CI generating a throwaway key per run, not
+    weakening the guard: a check that fails loudly is doing its job, and
+    relaxing it to keep a pipeline green is how the guard stops meaning
+    anything.
+    """
+    compose = _read("docker-compose.yml")
+    ci      = _read(".github/workflows/ci.yml")
+    if "WATCHDOG_SECRET_KEY" not in compose:
+        return                                  # service removed; nothing to guard
+    assert "WATCHDOG_SECRET_KEY" in ci, (
+        "compose demands this variable, so the deployment job must supply one"
+    )
+    assert "rand" in ci, "generated per run, never a literal committed to the repo"

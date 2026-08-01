@@ -63,6 +63,12 @@ jobs:
         # unless --strict is passed, so this only fails on an unhandled crash.
         run: |
           cp .env.example .env
+          # compose refuses to render without this, on purpose: a shared
+          # SECRET_KEY in a public repo lets anyone forge a session for the
+          # watchdog's demo user. CI gets a throwaway one per run rather than
+          # a literal committed anywhere -- the guard stays strict and this
+          # job still exercises the real deployment path.
+          echo "WATCHDOG_SECRET_KEY=$(openssl rand -hex 32)" >> .env
           echo '{}' > state.json
           : > history.db
           docker compose build
