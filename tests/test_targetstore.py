@@ -288,3 +288,158 @@ def test_reading_the_target_list_needs_no_token(live) -> None:
     _put(live, {"targets": [{"url": URL}]})
     with urllib.request.urlopen(live + "/api/targets", timeout=10) as resp:
         assert _json.loads(resp.read())["managed"] is True
+
+
+# =============================================================================
+# E. The write path and the reader must agree about ${VAR}
+# =============================================================================
+
+import main as _main
+
+
+@pytest.mark.parametrize("bad,reason", [
+    ("${DEFINITELY_NOT_SET_12345}", "unset"),
+    ("${lowercase_var}",            "lowercase"),
+    ("Bearer ${TOKEN}",             "malformed"),
+    ("${}",                         "malformed"),
+])
+def test_an_unresolvable_env_reference_is_refused(bad, reason, monkeypatch) -> None:
+    """The audit finding, as an assertion.
+
+    main._resolve_expect_substring treats ${VAR} as strict syntax and answers
+    an unusable one with sys.exit(1) -- correct fail-fast for a file a human
+    edits and tests locally. That file is now filled over HTTP, so a value the
+    reader will refuse must not be accepted here: saving a typo from the
+    dashboard returned 200 and then killed the monitor on its next run, every
+    target and not just the edited one, with no alert about it because the
+    process that sends alerts is the one that died.
+    """
+    monkeypatch.delenv("DEFINITELY_NOT_SET_12345", raising=False)
+    with pytest.raises(ValidationError):
+        validate_entry({"url": URL, "expect_substring": bad})
+
+
+def test_a_resolvable_reference_is_accepted(monkeypatch) -> None:
+    """The feature still works: the point is refusing what breaks, not
+    refusing the syntax."""
+    monkeypatch.setenv("HEALTH_TOKEN_TEST", "s3cret")
+    entry = validate_entry({"url": URL, "expect_substring": "${HEALTH_TOKEN_TEST}"})
+    assert entry["expect_substring"] == "${HEALTH_TOKEN_TEST}"
+
+
+def test_a_plain_literal_is_untouched() -> None:
+    """No "${" anywhere means it is a literal, and literals with a bare $ (a
+    JSON "$schema" key, say) must keep working."""
+    assert validate_entry(
+        {"url": URL, "expect_substring": '"$schema":"ok"'}
+    )["expect_substring"] == '"$schema":"ok"'
+
+
+@pytest.mark.parametrize("value", [
+    "${DEFINITELY_NOT_SET_12345}", "${lowercase_var}", "Bearer ${TOKEN}",
+])
+def test_whatever_the_store_accepts_the_probe_can_load(value, tmp_path, monkeypatch) -> None:
+    """The invariant, asserted rather than assumed. Both sides answer the same
+    question and only one of them answers it fatally, so the test proves they
+    AGREE instead of proving each is self-consistent.
+
+    Anything write_store accepts must survive load_targets without exiting.
+    """
+    monkeypatch.delenv("DEFINITELY_NOT_SET_12345", raising=False)
+    store = tmp_path / "targets.json"
+    try:
+        write_store([{"url": URL, "expect_substring": value}], store)
+    except ValidationError:
+        return                      # refused up front: the reader never sees it
+
+    try:
+        _main.load_targets(store_path=store)
+    except SystemExit:                                     # pragma: no cover
+        pytest.fail(
+            f"write_store accepted {value!r} and load_targets killed the "
+            "process over it -- the two validators disagree"
+        )
+
+
+def test_both_sides_agree_on_what_the_syntax_IS() -> None:
+    """Asserted as agreement in BEHAVIOUR, not as object identity.
+
+    `_main._ENV_VAR_REF is targetstore.ENV_VAR_REF` looks like the stronger
+    check and is the weaker one: re.compile caches, so restating the same
+    pattern string hands back the very same object and the identity holds
+    while the code is duplicated. What matters is that the two never disagree
+    about a value, which is what this walks.
+    """
+    cases = [
+        "${HEALTH_TOKEN}", "${lowercase}", "${}", "Bearer ${TOKEN}",
+        "plain", '"$schema"', "${A1_B2}", "${1BAD}", "$ {SPACED}",
+    ]
+    for case in cases:
+        mine   = targetstore.ENV_VAR_REF.match(case)
+        theirs = _main._ENV_VAR_REF.match(case)
+        assert (mine is None) == (theirs is None), case
+        if mine:
+            assert mine.group(1) == theirs.group(1), case
+        assert bool(targetstore.ENV_VAR_SUSPECT.search(case)) == bool(
+            _main._ENV_VAR_SUSPECT.search(case)), case
+
+
+def test_a_lowercase_reference_is_refused_even_when_it_would_resolve(monkeypatch) -> None:
+    """The case check earns its keep only when getenv WOULD find the variable.
+
+    Windows resolves environment variables case-insensitively and Linux does
+    not, so ${health_token} finds the value on a developer's machine and
+    aborts in production -- the same targets.yaml behaving differently in two
+    places. Testing it against an unset variable proves nothing, because the
+    "unset" branch would refuse it anyway.
+    """
+    monkeypatch.setenv("CASE_PROBE_VAR", "value")
+    with pytest.raises(ValidationError, match="MAY[UÚ]SCULAS"):
+        validate_entry({"url": URL, "expect_substring": "${case_probe_var}"})
+
+
+# =============================================================================
+# F. The request body itself, before anything is parsed
+# =============================================================================
+
+import http.client
+
+import api as _api
+
+
+def test_deeply_nested_json_answers_400_not_a_dead_socket(live) -> None:
+    """RecursionError is NOT a JSONDecodeError, so it escaped do_PUT entirely:
+    the handler thread died and the client got a connection reset instead of a
+    refusal. A few KB of "[[[[" is enough -- far under MAX_BODY_BYTES -- and it
+    is reachable WITHOUT a token, because the body is read before the auth
+    check by design (so that a 401 does not reset the socket)."""
+    host, port = live.removeprefix("http://").split(":")
+    payload = ("[" * 3000 + "]" * 3000).encode()
+    conn = http.client.HTTPConnection(host, int(port), timeout=10)
+    conn.request("PUT", "/api/targets", body=payload,
+                 headers={"Content-Length": str(len(payload))})
+    resp = conn.getresponse()
+    assert resp.status == 400
+    assert "anidado" in _json.loads(resp.read())["error"]
+
+
+@pytest.mark.parametrize("length", ["-1", "-999999", "not-a-number"])
+def test_a_hostile_content_length_is_refused(live, length) -> None:
+    """`-1 > MAX_BODY_BYTES` is False, so a negative length sailed past the
+    size guard and reached read(-1) -- which means "read until EOF", removing
+    the limit by way of the check meant to enforce it."""
+    host, port = live.removeprefix("http://").split(":")
+    conn = http.client.HTTPConnection(host, int(port), timeout=10)
+    conn.putrequest("PUT", "/api/targets")
+    conn.putheader("Content-Length", length)
+    conn.endheaders()
+    assert conn.getresponse().status == 400
+
+
+def test_the_handler_has_a_socket_timeout() -> None:
+    """Without it, socketserver never calls settimeout() and a client that
+    announces a body it never sends holds a thread forever. ThreadingHTTPServer
+    caps nothing, so enough of those starve the process serving the dashboard
+    and both read-only endpoints."""
+    assert _api._Handler.timeout is not None
+    assert 0 < _api._Handler.timeout <= 60

@@ -180,6 +180,13 @@ def history_payload(db_path: Path, window: str, targets: list[str]) -> dict:
 class _Handler(BaseHTTPRequestHandler):
     """One request. Reads two files, writes none."""
 
+    #: Without this, socketserver.StreamRequestHandler.setup() never calls
+    #: settimeout(), so a read on this socket can block forever. A client that
+    #: announces a body and never sends one holds a thread indefinitely, and
+    #: ThreadingHTTPServer caps nothing -- textbook Slowloris against the
+    #: process that serves the dashboard and both read-only endpoints.
+    timeout: float = 30.0
+
     # Injected by serve() so tests never depend on the process's cwd.
     state_path  : Path = STATE_FILE
     history_path: Path = HISTORY_DB_FILE
@@ -260,13 +267,28 @@ class _Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(supplied, expected)
 
     def _read_json_body(self) -> object:
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError as exc:
+            raise ValueError("Content-Length no es un número.") from exc
+        # Negative FIRST, and not folded into the comparison below: `-1 >
+        # MAX_BODY_BYTES` is False, so a negative length sails past the size
+        # guard and reaches read(-1), which means "read until EOF" -- the size
+        # limit removed by the very check meant to enforce it.
+        if length < 0:
+            raise ValueError("Content-Length no puede ser negativo.")
         if length > MAX_BODY_BYTES:
             raise ValueError(f"Cuerpo demasiado grande (máximo {MAX_BODY_BYTES} bytes).")
+        raw = self.rfile.read(length)
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"JSON inválido: {exc}") from exc
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            # RecursionError is NOT a JSONDecodeError. Deeply nested JSON --
+            # a few KB of "[[[[" is enough, far under MAX_BODY_BYTES -- raised
+            # it straight out of do_GET/do_PUT, killing the handler thread and
+            # resetting the client's connection. Reachable WITHOUT a token,
+            # because the body is read before the auth check by design.
+            raise ValueError(f"JSON inválido o demasiado anidado: {exc}") from exc
 
     def do_PUT(self) -> None:  # noqa: N802 — http.server's required spelling
         """Replace the whole target list. Whole-list, not per-target patches:

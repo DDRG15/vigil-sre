@@ -234,8 +234,11 @@ class Target:
     remind                  : bool  = False
 
 
-_ENV_VAR_REF     = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
-_ENV_VAR_SUSPECT = re.compile(r"\$\{")
+# Imported, not redeclared. The dashboard write path validates the same syntax
+# before persisting, and it must be the SAME syntax: a pattern that drifts here
+# would let the API accept what this function then refuses with sys.exit(1).
+_ENV_VAR_REF     = targetstore.ENV_VAR_REF
+_ENV_VAR_SUSPECT = targetstore.ENV_VAR_SUSPECT
 
 
 def _resolve_expect_substring(raw: str, path: Path, url: str) -> tuple[str, str | None]:

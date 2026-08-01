@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
@@ -88,6 +89,41 @@ NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     "degraded_ttfb_ms": (1, 600_000),
     "degraded_rtt_ms" : (1, 600_000),
 }
+
+#: The ${VAR_NAME} reference syntax, defined HERE and imported by main.py
+#: rather than declared in both. Two copies of a rule are how a validator and
+#: the thing it validates drift apart, and the cost of that drift is the
+#: finding below.
+ENV_VAR_REF     = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+ENV_VAR_SUSPECT = re.compile(r"\$\{")
+
+
+def env_reference_problem(raw: str) -> tuple[str, str] | None:
+    """
+    Return ``(code, var_name)`` if *raw* is an unusable env reference, else None.
+
+    Codes: ``malformed`` (contains "${" but is not a complete reference),
+    ``lowercase`` (Windows resolves case-insensitively and Linux does not, so
+    the same file behaves differently in dev and prod), ``unset`` (the variable
+    does not exist or is empty).
+
+    Shared because main.py answers the same question and answers it FATALLY:
+    an unresolvable reference there is sys.exit(1). Before this existed, the
+    write path accepted a value the reader would refuse, so a typo saved from
+    the dashboard returned 200 and then killed the whole monitor on its next
+    run -- every target, not just the edited one, and with no alert about it,
+    because the process that would send the alert is the one that died.
+    """
+    match = ENV_VAR_REF.match(raw)
+    if match is None:
+        return ("malformed", raw) if ENV_VAR_SUSPECT.search(raw) else None
+    var_name = match.group(1)
+    if var_name != var_name.upper():
+        return ("lowercase", var_name)
+    if not os.getenv(var_name):
+        return ("unset", var_name)
+    return None
+
 
 ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
@@ -142,6 +178,29 @@ def validate_entry(raw: object) -> dict:
         if not isinstance(substring, str):
             raise ValidationError("'expect_substring' debe ser texto.")
         if substring:
+            problem = env_reference_problem(substring)
+            if problem:
+                code, name = problem
+                raise ValidationError({
+                    "malformed": (
+                        "'expect_substring' con '${' debe ser una referencia "
+                        "COMPLETA a una variable de entorno, por ejemplo "
+                        "'${HEALTH_TOKEN}'. No se admite concatenación."
+                    ),
+                    "lowercase": (
+                        f"'expect_substring' referencia ${{{name}}}, pero debe "
+                        f"ir en MAYÚSCULAS: ${{{name.upper()}}}. Windows las "
+                        f"resuelve sin distinguir mayúsculas y Linux no, así "
+                        f"que en minúsculas el mismo target se comporta "
+                        f"distinto en tu máquina y en producción."
+                    ),
+                    "unset": (
+                        f"'expect_substring' referencia ${{{name}}}, pero esa "
+                        f"variable no está definida (o está vacía). Guardarla "
+                        f"así detendría el monitor entero en la próxima "
+                        f"corrida, no solo este target."
+                    ),
+                }[code])
             entry["expect_substring"] = substring
 
     for field, (low, high) in NUMERIC_BOUNDS.items():
