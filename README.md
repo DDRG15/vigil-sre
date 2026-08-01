@@ -668,9 +668,16 @@ self-heals long before it matters. A watchdog that is down cannot take the
 real monitoring with it.
 
 Set the watchdog's expected period to your run interval (60s in the shipped
-`docker-compose.yml`) with a grace period of a few cycles. Leave
-`HEARTBEAT_URL` unset to disable it entirely — unconfigured is silent, not an
-error.
+`docker-compose.yml`) with a grace period of a few cycles.
+
+**Leaving `HEARTBEAT_URL` unset is allowed, and it logs a warning on every
+run.** That is deliberate. Disabling the watchdog is a legitimate choice, but
+from inside the process a deliberate choice and a forgotten variable look
+exactly the same — and what goes unprotected is the one failure this service
+cannot report on itself, because a dead monitor's only symptom is silence. The
+warning is what makes the gap noticeable at all. If you meant it, the line
+costs you one row per run; if you did not, it is the only thing standing
+between you and a monitor that died three weeks ago.
 
 ---
 
@@ -714,6 +721,48 @@ failure.
 The metric worth alerting on is `alerts_lost_all_channels_total`. Per-channel
 losses are diagnosis; that one means an alert was generated and no human is going
 to hear about it.
+
+### A lost alert is retried, not forgotten
+
+Alerts fire on transitions, which means a target that goes DOWN is announced
+once. That is the right behaviour and it had a hole in it: if every channel was
+unreachable during the exact cycle the target went down, the status still
+advanced, the next run read "no change, already alerted", and the alert was gone
+for good. The outage and the silence about it had the same cause, so nothing
+else in the system could catch it.
+
+Delivery is now recorded alongside the status. If an alert reached nobody, the
+target is marked `alert_pending` and the **next run alerts again**, sixty
+seconds later, until a channel accepts it. Then it goes quiet. Both halves
+matter: without the retry an outage can pass unannounced, and without the
+disarm a channel coming back would re-alert every minute for as long as the
+target stayed down.
+
+Two consequences worth knowing:
+
+- **The process exits non-zero when an alert reached nobody**, with or without
+  `--strict`. Targets being down is normal operation; an alert nobody received
+  is a failure of the monitor, and it is invisible by construction — so
+  whatever supervises the process needs to see it.
+- **A channel that fails repeatedly within one run stops being retried for the
+  rest of that run.** With a channel down, every target otherwise pays the full
+  retry policy on its own; six targets absorb that inside the run budget, thirty
+  do not, and then probing slows down because *alerting* is slow. Breaking is
+  per-channel, so a dead Discord never delays a healthy Slack, and the breaker
+  resets every run — a single bad minute must not mute a channel for good.
+
+### Tune the thresholds to the path you are measuring
+
+`degraded_rtt_ms` defaults to 100 ms, which assumes the probe sits near what it
+watches. Over an ordinary internet link it does not. Measured against the
+targets shipped here, round-trip times run 109–484 ms depending on the hour, so
+under the default GitHub and httpbin sat permanently DEGRADED for having normal
+latency — a claim about the network the probe runs on, not about them.
+
+Chronic false amber is how an operator learns to ignore amber. Set
+`degraded_rtt_ms` per target to something that clears your observed range with
+headroom; the shipped `targets.yaml` uses 400 ms and still catches genuine
+spikes above it.
 
 ---
 

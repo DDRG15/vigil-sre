@@ -62,6 +62,43 @@ WEBHOOK_RETRY_AFTER_CAP_S: float = 30.0  # cap on an honoured Retry-After value
 # are different concerns that happened to share a number.
 WEBHOOK_TIMEOUT_S: float = 5.0
 
+# Circuit breaker, scoped to ONE run on purpose.
+#
+# main.py probes every target concurrently and exits; the compose loop starts
+# it again 60 s later. So a breaker that persisted across runs would need to
+# live in state.json, and the risk it guards against does not need that. The
+# risk is inside a single run: with a channel down, every target pays the full
+# retry policy independently -- 3 attempts x 5 s, plus capped Retry-After
+# sleeps. Six targets absorb that inside RUN_BUDGET_S. Thirty do not, and the
+# probe starts skipping cycles because the ALERT path is slow, which is the
+# isolation boundary this project otherwise holds everywhere.
+#
+# After CIRCUIT_BREAK_AFTER consecutive failures on a channel within one run,
+# the remaining alerts on that channel fail fast instead of re-proving what the
+# run already established. The sibling channel is untouched: breaking is
+# per-channel precisely so a dead Discord cannot slow down a healthy Slack.
+CIRCUIT_BREAK_AFTER: int = 3
+
+#: Consecutive failures per channel name, for the current run only.
+_circuit_failures: dict[str, int] = {}
+
+
+def reset_circuits() -> None:
+    """Clear the breaker. Called once at the start of every run."""
+    _circuit_failures.clear()
+
+
+def _circuit_is_open(channel: str) -> bool:
+    return _circuit_failures.get(channel, 0) >= CIRCUIT_BREAK_AFTER
+
+
+def _record_circuit(channel: str, delivered: bool) -> None:
+    if delivered:
+        _circuit_failures[channel] = 0
+    else:
+        _circuit_failures[channel] = _circuit_failures.get(channel, 0) + 1
+
+
 #: Placeholder written in place of a webhook URL that would otherwise reach a log.
 REDACTED = "<webhook redacted>"
 
@@ -458,12 +495,21 @@ async def dispatch_alert(
     status_detail: str,
     kind         : AlertKind,
     notifiers    : list[Notifier] | None = None,
-) -> None:
+) -> bool:
     """
     Deliver one alert on every configured channel, in parallel.
 
     Never raises — this sits on the alert-critical path and must not be able
     to fail a probe that already succeeded.
+
+    Returns:
+        True  — at least one channel accepted the alert; a human will see it.
+        False — every channel failed, or none is configured. The caller MUST
+                treat this as "nobody was told" and arrange a retry. Returning
+                None here (as this did originally) meant the state machine
+                recorded "already alerted" for an alert that was never
+                delivered, and suppressed every following run — total silence
+                with no way to notice it.
 
     Args:
         session:       Shared aiohttp.ClientSession for the run.
@@ -485,10 +531,30 @@ async def dispatch_alert(
             "reason=no_channels",
             " or ".join(cls.env_var for cls in ALL_NOTIFIERS), kind.value, url,
         )
-        return
+        return False
+
+    # The breaker lives HERE and not inside Notifier.send because it is a
+    # dispatch policy, not a delivery detail: dispatch_alert is the only place
+    # that sees every channel at once. It also means a Notifier subclass that
+    # overrides send() inherits the breaker instead of quietly opting out of
+    # it — the same structural-over-remembered rule this project applies to
+    # escaping and redaction.
+    async def _deliver(channel: Notifier) -> bool:
+        if _circuit_is_open(channel.name):
+            # Fail fast, but say so: the alert is still lost and still needs
+            # to count as lost. What is skipped is the re-proving, never the
+            # accounting.
+            logger.warning(
+                "%s circuit open after %d consecutive failures this run — "
+                "skipping delivery for %s without retrying. event_type=metric "
+                "metric=alerts_circuit_skipped_total channel=%s value=1",
+                channel.name, CIRCUIT_BREAK_AFTER, url, channel.name,
+            )
+            return False
+        return await channel.send(session, url, status_detail, kind)
 
     results = await asyncio.gather(
-        *(c.send(session, url, status_detail, kind) for c in channels),
+        *(_deliver(c) for c in channels),
         return_exceptions=True,
     )
 
@@ -497,6 +563,7 @@ async def dispatch_alert(
     # delivery failure — and keep going, because the other channel's result
     # still matters.
     for channel, result in zip(channels, results):
+        _record_circuit(channel.name, result is True)
         if isinstance(result, BaseException):
             logger.error(
                 "%s notifier raised %s — this is a bug in that notifier, not a "
@@ -504,7 +571,8 @@ async def dispatch_alert(
                 channel.name, type(result).__name__, result,
             )
 
-    if not any(result is True for result in results):
+    delivered = any(result is True for result in results)
+    if not delivered:
         # The only line here that means "an alert was generated and no human
         # will hear about it". Per-channel losses are diagnosis; this is the
         # one that should page.
@@ -513,3 +581,4 @@ async def dispatch_alert(
             "metric=alerts_lost_all_channels_total value=1 reason=all_failed",
             kind.value.capitalize(), url, len(channels),
         )
+    return delivered

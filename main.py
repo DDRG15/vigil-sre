@@ -79,6 +79,7 @@ from history import (
 from notifiers import (
     AlertKind,
     dispatch_alert,
+    reset_circuits,
 )
 
 # ---------------------------------------------------------------------------
@@ -158,7 +159,7 @@ DOWN_CONFIRMATIONS: int = 2
 # EXISTS, never its value, and UrlState is total=False — so a v2 file loads
 # under v3 with the field simply absent, which is exactly the correct default
 # ("never cert-alerted"). There is no migration step to run or forget.
-STATE_SCHEMA_VERSION: int = 4   # bump whenever state.json's on-disk shape changes
+STATE_SCHEMA_VERSION: int = 5   # bump whenever state.json's on-disk shape changes
 
 # Webhook delivery retry now lives in notifiers.py alongside the Notifier
 # base class that applies it — see WEBHOOK_RETRY_ATTEMPTS / _BASE_S /
@@ -485,6 +486,7 @@ class UrlState(TypedDict, total=False):
     consecutive_failures: int    # failed runs in a row since last healthy state; absent/0 when healthy
     cert_alerted_days   : int    # threshold (30 or 7) this target was last cert-alerted at
     cert_last_seen_days : int    # previous run's tls_cert_days_left — a RISE means renewal
+    alert_pending       : bool   # last alert for this target reached NOBODY; retry next run
 
 
 #: Fields that describe something ORTHOGONAL to the current status, and must
@@ -500,7 +502,31 @@ class UrlState(TypedDict, total=False):
 #:
 #: consecutive_failures is deliberately NOT here — it is state ABOUT the
 #: status and must reset when the target recovers.
-_CARRY_FORWARD_FIELDS: tuple[str, ...] = ("cert_alerted_days", "cert_last_seen_days")
+#: alert_pending belongs here for the same reason: whether the last alert was
+#: actually delivered says nothing about whether the service is UP right now,
+#: and losing it on the next write is exactly what made a lost alert
+#: unrecoverable — the record would come back clean and every later run would
+#: read "already alerted".
+_CARRY_FORWARD_FIELDS: tuple[str, ...] = (
+    "cert_alerted_days", "cert_last_seen_days", "alert_pending")
+
+
+def _owed_an_alert(previous: UrlState | None) -> bool:
+    """
+    True when the last alert for this target reached nobody.
+
+    The three setters below decide "should we alert" from whether the status
+    CHANGED. That is correct only if a change always produced a delivered
+    alert. When every channel is down it does not: the status advances,
+    dispatch fails, and from the next run on the record reads "no change,
+    already alerted" forever. The outage and the silence about it have the
+    same cause, so nothing else can catch it.
+
+    Treating an undelivered alert as a reason to alert again turns that into
+    a self-healing loop: the retry happens on the next cycle, 60 seconds
+    later, and stops on its own once a channel comes back.
+    """
+    return bool(previous and previous.get("alert_pending"))
 
 
 def _carry_forward(previous: UrlState | None, record: UrlState) -> UrlState:
@@ -641,7 +667,8 @@ class StateManager:
         async with self._lock:
             now      = self._utc_now()
             previous = self._state.get(url)
-            changed  = previous is None or previous["status"] != STATUS_UP
+            changed  = (previous is None or previous["status"] != STATUS_UP
+                        or _owed_an_alert(previous))
 
             record = UrlState(
                 status      =STATUS_UP,
@@ -698,6 +725,11 @@ class StateManager:
                     consecutive_failures =previous.get("consecutive_failures", 1) + 1,
                 ))
                 self._write_sync()
+                # Normally False: a repeat failure on an already-DOWN target is
+                # not news. It IS news when the alert that announced the outage
+                # never landed.
+                if _owed_an_alert(previous):
+                    return True
                 return False
 
             strikes = previous.get("consecutive_failures", 0) + 1
@@ -722,6 +754,30 @@ class StateManager:
             self._write_sync()
             return True
 
+    async def record_alert_outcome(self, url: str, delivered: bool) -> None:
+        """
+        Persist whether the alert just dispatched for *url* reached anyone.
+
+        Called after EVERY dispatch, success or failure, because both answers
+        matter: a False arms the retry on the next run, and a True disarms one
+        that was pending. Writing only on failure would leave the flag stuck
+        and re-alert forever once a channel recovered.
+
+        Never raises. The alert already happened (or already failed); losing
+        the bookkeeping must not also cost the probe result that produced it.
+        """
+        async with self._lock:
+            record = self._state.get(url)
+            if record is None:
+                # No record to annotate — the setter that should have created
+                # one did not run. Nothing to do, and nothing worth failing a
+                # run over.
+                return
+            if record.get("alert_pending", False) == (not delivered):
+                return                      # already in that state; skip the write
+            record["alert_pending"] = not delivered
+            self._write_sync()
+
     async def set_degraded(
         self, url: str, reason: str, diagnostics: dict | None = None
     ) -> bool:
@@ -741,7 +797,9 @@ class StateManager:
         async with self._lock:
             now      = self._utc_now()
             previous = self._state.get(url)
-            changed  = previous is None or previous["status"] != STATUS_DEGRADED
+            changed  = (previous is None
+                        or previous["status"] != STATUS_DEGRADED
+                        or _owed_an_alert(previous))
 
             record = UrlState(
                 status      =STATUS_DEGRADED,
@@ -1170,6 +1228,10 @@ async def _maybe_alert_cert_expiry(
         "🔐  CERTIFICATE %s  %s | %s",
         "CRITICAL" if critical else "EXPIRING", url, detail,
     )
+    # Deliberately NOT wired to alert_pending: certificate alerts are
+    # suppressed by cert_alerted_days, a separate mechanism with its own reset
+    # condition (a RISE in days left). Sharing the flag would let a lost cert
+    # alert re-fire a status alert, and vice versa.
     await dispatch_alert(
         session, url, status_detail=detail,
         kind=AlertKind.CERT_EXPIRING_CRIT if critical else AlertKind.CERT_EXPIRING_WARN,
@@ -1270,9 +1332,10 @@ async def check_url(
             transitioned = await state.set_degraded(url, reason, diagnostics=diagnostics)
             if transitioned:
                 logger.warning("🟡  STATE CHANGE → DEGRADED  %s | %s", url, reason)
-                await dispatch_alert(
+                delivered = await dispatch_alert(
                     session, url, status_detail=reason, kind=AlertKind.DEGRADED
                 )
+                await state.record_alert_outcome(url, delivered)
             else:
                 logger.info("🟡  Still DEGRADED (alert suppressed)  %s | %s", url, reason)
             # After the status write: the record must exist and _carry_forward
@@ -1287,9 +1350,10 @@ async def check_url(
             transitioned = await state.set_up(url, diagnostics=diagnostics)
             if transitioned:
                 logger.info("🟢  STATE CHANGE → UP    %s", url)
-                await dispatch_alert(
+                delivered = await dispatch_alert(
                     session, url, status_detail="Service is UP", kind=AlertKind.RECOVERY
                 )
+                await state.record_alert_outcome(url, delivered)
             else:
                 logger.info("✅  OK (no change)       %s", url)
             await _maybe_alert_cert_expiry(session, url, state, phases)
@@ -1303,9 +1367,10 @@ async def check_url(
         transitioned = await state.set_down(url, error=exc.detail)
         if transitioned:
             logger.error("🔴  STATE CHANGE → DOWN  %s | %s", url, exc.detail)
-            await dispatch_alert(
+            delivered = await dispatch_alert(
                 session, url, status_detail=exc.detail, kind=AlertKind.FAILURE
             )
+            await state.record_alert_outcome(url, delivered)
         else:
             # Covers two cases: already-confirmed DOWN (repeat, alert already
             # sent), or a healthy target still inside its DOWN_CONFIRMATIONS
@@ -1393,7 +1458,20 @@ async def _send_heartbeat(down_count: int) -> None:
     """
     url = os.getenv("HEARTBEAT_URL")
     if not url:
-        return  # not configured is a choice, not an error
+        # Deliberately a WARNING and not silence. Leaving this unset is a
+        # legitimate choice, but an unset variable and a forgotten one look
+        # identical from inside the process -- and the thing it protects
+        # against is the one failure this service cannot report on itself.
+        # Saying so once per run costs a line and closes that gap.
+        logger.warning(
+            "HEARTBEAT_URL is not set — nothing is watching this monitor. If "
+            "this process dies, crash-loops, or the host powers off, no alert "
+            "will ever say so, because silence is what a dead monitor looks "
+            "like. Register a check at healthchecks.io (or equivalent) and put "
+            "its ping URL in .env. event_type=metric "
+            "metric=heartbeat_unconfigured_total value=1",
+        )
+        return
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -1491,6 +1569,10 @@ async def run_health_checks(
     shutdown_event = asyncio.Event()
     _install_signal_handlers(loop, shutdown_event)
 
+    # A channel that failed for the last target is not going to work for
+    # the next one within the same run, but each run starts believing it
+    # might -- otherwise a single bad minute would mute a channel forever.
+    reset_circuits()
     run_start      = time.monotonic()
     run_started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1659,16 +1741,52 @@ def _generate_report(
     return "\n".join(lines)
 
 
-def _exit_code(strict: bool, down_count: int) -> int:
+def undelivered_alerts(state_path: Path) -> int:
+    """
+    How many targets are still owed an alert nobody received.
+
+    Read from the persisted state rather than counted in memory during the
+    run, deliberately: `alert_pending` is what actually drives the retry on
+    the next cycle, so counting the same field keeps the exit code and the
+    retry from ever disagreeing about how many alerts were lost. An in-memory
+    tally could drift from the file; this cannot.
+
+    Never raises — a missing or malformed state file means "nothing known to
+    be pending", which is the same answer a fresh deployment gives.
+    """
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    targets = raw.get("targets", raw) if isinstance(raw, dict) else {}
+    if not isinstance(targets, dict):
+        return 0
+    return sum(
+        1 for record in targets.values()
+        if isinstance(record, dict) and record.get("alert_pending")
+    )
+
+
+def _exit_code(strict: bool, down_count: int, undelivered: int = 0) -> int:
     """
     Compute the process exit code for a completed run.
 
-    Without --strict this is always 0: "some targets are down" is this
-    monitor's normal operating condition, not a bug in the monitor itself —
-    a bare `python main.py` must not fail a cron job just because a target
-    it watches is having a bad day. With --strict, a non-zero down_count
-    becomes exit code 1 so a CI job or Kubernetes CronJob can act on it.
+    Two different questions, and only one of them is about the targets.
+
+    "Some targets are down" is this monitor's normal operating condition, not
+    a bug in the monitor — a bare `python main.py` must not fail a cron job
+    because a target it watches is having a bad day. That stays behind
+    --strict, unchanged.
+
+    "An alert was generated and reached nobody" is the opposite: it is a
+    failure OF the monitor, and it is invisible by construction, since the
+    channel that would report it is the one that broke. It exits non-zero
+    regardless of --strict, so the supervisor around this process — the
+    compose loop's `|| exit 1`, a CronJob's failure count — can see a run
+    where nothing was delivered instead of reading it as healthy.
     """
+    if undelivered > 0:
+        return 1
     return 1 if (strict and down_count > 0) else 0
 
 
@@ -1702,8 +1820,16 @@ if __name__ == "__main__":
         logger.info("KeyboardInterrupt received — exiting.")
         sys.exit(0)
 
-    exit_code = _exit_code(strict, down_count)
-    if exit_code != 0:
+    undelivered = undelivered_alerts(state_path)
+    exit_code   = _exit_code(strict, down_count, undelivered)
+    if undelivered > 0:
+        logger.error(
+            "Exiting %d: %d alert(s) reached NOBODY on any channel. They will "
+            "be retried next run. event_type=metric "
+            "metric=alerts_undelivered_total value=%d",
+            exit_code, undelivered, undelivered,
+        )
+    elif exit_code != 0:
         logger.error(
             "--strict: exiting %d because %d target(s) are DOWN.",
             exit_code, down_count,

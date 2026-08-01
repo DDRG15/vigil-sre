@@ -42,18 +42,37 @@
 #     degraded_rtt_ms: 250        # default 100  — for a legitimately distant target
 # =============================================================================
 
+# Every entry below sets degraded_rtt_ms: 400 instead of inheriting the 100 ms
+# default. That default assumes the probe sits near what it watches. It does
+# not here: these are public endpoints reached over a home/office link, and
+# measured RTT ranges 109-235 ms depending on the hour. Under the default,
+# GitHub and httpbin sat permanently DEGRADED for having ordinary internet
+# latency -- a claim about this network, not about them.
+#
+# Chronic false DEGRADED is how an operator learns to ignore amber, which is
+# the exact failure the per-target overrides exist to prevent. 400 ms clears
+# the observed range with headroom, so it still fires on a real routing change
+# while staying quiet on a normal Tuesday. The number should describe the path
+# being measured -- raise it if your link is slower.
+
 targets:
   # ── Reliable public endpoints (sanity baselines) ──────────────────────────
-  - https://www.google.com
-  - https://www.github.com
-  - https://www.cloudflare.com
+  - url: https://www.google.com
+    degraded_rtt_ms: 400
+  - url: https://www.github.com
+    degraded_rtt_ms: 400
+  - url: https://www.cloudflare.com
+    degraded_rtt_ms: 400
 
   # ── httpbin.org test suite ────────────────────────────────────────────────
-  - https://httpbin.org/status/200   # always 200 — confirms the probe path works
+  - url: https://httpbin.org/status/200   # always 200 — confirms the probe path works
+    degraded_rtt_ms: 400
 
   # ── Deliberate failure cases (used to validate alerting pipeline) ─────────
-  - https://httpbin.org/status/503                  # non-200 → triggers DOWN alert
-  - https://this-domain-does-not-exist-xyz.io       # DNS failure → ConnectionError
+  - url: https://httpbin.org/status/503   # non-200 → triggers DOWN alert
+    degraded_rtt_ms: 400
+  - url: https://this-domain-does-not-exist-xyz.io   # DNS failure → ConnectionError
+    degraded_rtt_ms: 400
 
   # ── PLACEHOLDER: your own services ───────────────────────────────────────
   # These are placeholders. Uncomment and replace with your actual URLs.

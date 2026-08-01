@@ -2018,14 +2018,23 @@ async def test_heartbeat_pings_even_when_targets_are_down(monkeypatch) -> None:
         assert len(mock.requests) == 1
 
 
-async def test_heartbeat_is_silent_when_unconfigured(monkeypatch, caplog) -> None:
-    """Not configured is a choice, not an error -- no request, no warning."""
+async def test_heartbeat_says_so_when_unconfigured(monkeypatch, caplog) -> None:
+    """No request, but NOT silence.
+
+    Leaving this unset is a legitimate choice. The problem is that from inside
+    the process a deliberate choice and a forgotten variable look identical --
+    and what goes unprotected is the one failure this service cannot report on
+    itself, because a dead monitor's symptom IS silence. Saying so once per
+    run is what makes the gap noticeable at all.
+    """
     monkeypatch.delenv("HEARTBEAT_URL", raising=False)
     with aioresponses() as mock:
         with caplog.at_level("WARNING"):
             await main._send_heartbeat(down_count=0)
-    assert len(mock.requests) == 0
-    assert not any("eartbeat" in r.message for r in caplog.records)
+    assert len(mock.requests) == 0, "must not invent a URL to ping"
+    warning = next(r for r in caplog.records if "HEARTBEAT_URL" in r.message)
+    assert warning.levelname == "WARNING"
+    assert "nothing is watching this monitor" in warning.message
 
 
 @pytest.mark.parametrize("failure", [
