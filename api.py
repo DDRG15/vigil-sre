@@ -38,6 +38,7 @@ Depends : stdlib only (http.server, sqlite3, json).
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import dashboard
+import targetstore
 from dashboard import render_page, render_rows
 from history import (
     HISTORY_DB_FILE,
@@ -66,6 +68,22 @@ DEFAULT_HOST: str = "127.0.0.1"
 DEFAULT_PORT: int = 8787
 
 STATE_FILE: Path = Path("state.json")
+
+#: Shared secret required to CHANGE the target list. Reads stay open.
+#:
+#: Adding a target is not editing a row in a list — it makes this monitor
+#: fetch that URL from inside your network, on a schedule, and renders the
+#: result on a page. That is the interesting capability here, and it is worth
+#: a token even on loopback.
+WRITE_TOKEN_VAR: str = "API_WRITE_TOKEN"
+
+#: Maximum body this endpoint will read. A list of 200 targets is a few tens
+#: of KB; anything larger is not a mistake worth accommodating.
+MAX_BODY_BYTES: int = 256 * 1024
+
+
+def write_token() -> str | None:
+    return os.getenv(WRITE_TOKEN_VAR) or None
 
 #: Windows the history endpoint accepts, mapped to days.
 WINDOWS: dict[str, int] = {"1d": 1, "7d": 7, "30d": 30}
@@ -219,6 +237,87 @@ class _Handler(BaseHTTPRequestHandler):
         strips  = status_strip(self.history_path, urls, since)
         return targets, history, stale_seconds(targets), strips
 
+    def _authorised(self) -> bool:
+        """
+        True when this request carries the write token.
+
+        Fails CLOSED when no token is configured: without one there is no way
+        to tell an operator from anything else that can reach the port, so the
+        honest answer is to refuse writes rather than to accept everything.
+        Reads are unaffected — they were already open.
+        """
+        expected = write_token()
+        if not expected:
+            logger.error(
+                "Rechazando escritura: %s no está configurado. Poné un valor "
+                "en .env para poder administrar targets desde el dashboard.",
+                WRITE_TOKEN_VAR,
+            )
+            return False
+        supplied = self.headers.get("X-Vigil-Token", "")
+        # compare_digest and not ==: string comparison short-circuits on the
+        # first differing byte, which leaks the prefix through timing.
+        return hmac.compare_digest(supplied, expected)
+
+    def _read_json_body(self) -> object:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY_BYTES:
+            raise ValueError(f"Cuerpo demasiado grande (máximo {MAX_BODY_BYTES} bytes).")
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"JSON inválido: {exc}") from exc
+
+    def do_PUT(self) -> None:  # noqa: N802 — http.server's required spelling
+        """Replace the whole target list. Whole-list, not per-target patches:
+        two dashboards editing at once would otherwise interleave into a state
+        neither of them asked for, and the list is small enough that sending
+        all of it is cheaper than reconciling parts of it."""
+        route = urlparse(self.path).path.rstrip("/") or "/"
+        if route != "/api/targets":
+            self._log_metric(route, error="not_found")
+            self._respond(404, {"error": "not found", "path": route})
+            return
+
+        # The body is drained BEFORE the auth check, and that ordering is not
+        # cosmetic: http.server keeps the connection alive, so replying 401
+        # without reading what the client is still sending resets the socket.
+        # The caller then sees a network error instead of a refusal — the
+        # dashboard would report "sin conexión" for a wrong token. Reading is
+        # safe because MAX_BODY_BYTES bounds it before any parsing happens.
+        try:
+            body = self._read_json_body()
+        except ValueError as exc:
+            self._log_metric("targets", error="invalid")
+            self._respond(400, {"error": str(exc)})
+            return
+
+        if not self._authorised():
+            self._log_metric("targets", error="unauthorised")
+            self._respond(401, {
+                "error": "escritura no autorizada",
+                "hint" : f"Enviá la cabecera X-Vigil-Token con el valor de {WRITE_TOKEN_VAR}.",
+            })
+            return
+
+        try:
+            entries = body.get("targets") if isinstance(body, dict) else body
+            stored  = targetstore.write_store(entries)
+        except (ValueError, targetstore.ValidationError) as exc:
+            # 400 with the reason, not a traceback: the message is meant to be
+            # rendered next to the field the operator just typed.
+            self._log_metric("targets", error="invalid")
+            self._respond(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            logger.error("No se pudo guardar la lista de targets: %s", exc)
+            self._log_metric("targets", error=type(exc).__name__)
+            self._respond(500, {"error": "no se pudo guardar la lista"})
+            return
+
+        self._log_metric("targets_write")
+        self._respond(200, {"targets": stored})
+
     def do_GET(self) -> None:  # noqa: N802 — http.server's required spelling
         parsed = urlparse(self.path)
         route  = parsed.path.rstrip("/") or "/"
@@ -232,6 +331,18 @@ class _Handler(BaseHTTPRequestHandler):
             if route == "/partial/targets":
                 self._log_metric("partial")
                 self._respond_html(200, render_rows(*self._dashboard_data()))
+                return
+
+            if route == "/api/targets":
+                self._log_metric("targets")
+                stored = targetstore.read_store()
+                self._respond(200, {
+                    "targets": stored if stored is not None else [],
+                    # The dashboard needs to say which file is authoritative:
+                    # two files that both look canonical is worse than either.
+                    "managed": stored is not None,
+                    "writable": write_token() is not None,
+                })
                 return
 
             if route == "/api/status":

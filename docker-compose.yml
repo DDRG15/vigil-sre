@@ -33,10 +33,14 @@ services:
       # a warning when it binds off-loopback and that warning is correct here —
       # it states exactly what is happening.
       - API_HOST=0.0.0.0
+    env_file: .env      # API_WRITE_TOKEN: sin él, las escrituras se rechazan
     volumes:
-      # Read-only twice over: sqlite opens with mode=ro, and the mount makes a
-      # write physically impossible. This process runs alongside a live writer.
-      - ./data:/app/data:ro
+      # data/ is writable now, and ONLY because the target editor lives here:
+      # this process owns data/targets.json. The read-only guarantee narrowed
+      # rather than disappeared -- history.db stays :ro, and sqlite still opens
+      # it with mode=ro, so the reader still cannot corrupt the writer's
+      # history. What it can now touch is one file it is the sole author of.
+      - ./data:/app/data
       - ./history.db:/app/history.db:ro
     ports:
       # Bound to the host's loopback deliberately. This endpoint has NO

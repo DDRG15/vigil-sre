@@ -68,6 +68,12 @@ targets:
   - url: https://httpbin.org/status/200   # always 200 — confirms the probe path works
     degraded_rtt_ms: 400
 
+  # ── Deliberate failure cases (used to validate alerting pipeline) ─────────
+  - url: https://httpbin.org/status/503   # non-200 → triggers DOWN alert
+    degraded_rtt_ms: 400
+  - url: https://this-domain-does-not-exist-xyz.io   # DNS failure → ConnectionError
+    degraded_rtt_ms: 400
+
   # ── PLACEHOLDER: your own services ───────────────────────────────────────
   # These are placeholders. Uncomment and replace with your actual URLs.
   # - https://api.yourcompany.com/health

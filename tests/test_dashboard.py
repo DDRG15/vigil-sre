@@ -222,8 +222,12 @@ def test_the_script_the_page_serves_is_the_one_the_csp_hashes() -> None:
     same object's content rather than trusting two call sites to agree."""
     page = render_page({URL: _state()}, {}, 10)
     assert f"<script>{dashboard._SCRIPT_RENDERED}</script>" in page
+    assert f"<style>{dashboard._STYLE_RENDERED}</style>" in page
+    # Asserted against the RENDERED constants, not their components: the
+    # editor appends to both blocks, and hashing a piece of what is served
+    # would pass here and be refused by the browser.
     assert dashboard.SCRIPT_HASH == dashboard._csp_hash(dashboard._SCRIPT_RENDERED)
-    assert dashboard.STYLE_HASH  == dashboard._csp_hash(dashboard._STYLE)
+    assert dashboard.STYLE_HASH  == dashboard._csp_hash(dashboard._STYLE_RENDERED)
 
 
 # =============================================================================

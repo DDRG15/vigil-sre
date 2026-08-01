@@ -35,7 +35,10 @@ from __future__ import annotations
 import inspect
 
 import aioresponses.core
+import pytest
 from aiohttp import ClientResponse
+
+import targetstore
 
 _needs_stream_writer = (
     "stream_writer" in inspect.signature(ClientResponse.__init__).parameters
@@ -60,3 +63,24 @@ if _needs_stream_writer:
     # aioresponses resolves its default response class from this module-level
     # name, so rebinding it is enough — no subclassing of the mocker itself.
     aioresponses.core.ClientResponse = _CompatClientResponse
+
+
+@pytest.fixture(autouse=True)
+def _isolate_target_store(tmp_path_factory, monkeypatch):
+    """
+    Point the dashboard-managed target store somewhere harmless, for every test.
+
+    load_targets() prefers data/targets.json over the YAML it is handed. That
+    is correct in production and poison in a test suite: whether a test passes
+    would depend on whether a file happens to exist beside the process, so the
+    suite would go green on a clean checkout and red on the developer machine
+    that used the dashboard once.
+
+    Autouse, and pointing at a path that does not exist, so the default answer
+    is always "no store, use the YAML". A test that wants the store writes to
+    it explicitly.
+    """
+    monkeypatch.setattr(
+        targetstore, "STORE_FILE",
+        tmp_path_factory.mktemp("store") / "targets.json",
+    )

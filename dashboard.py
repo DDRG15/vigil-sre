@@ -309,11 +309,128 @@ setInterval(refresh, %d000);
 """
 
 
+
+#: The target editor. Rendered empty and filled by JS from /api/targets,
+#: because every cell is an editable input that has to round-trip back to the
+#: API — server-rendering them would mean maintaining two sources of the same
+#: values, and the one on screen would win silently.
+#:
+#: Every value is written with `element.value = x`, never through innerHTML.
+#: That makes escaping structural rather than remembered: a target URL
+#: containing markup cannot become markup, because it never passes through an
+#: HTML parser. Same rule _row() follows on the server side.
+_EDITOR = """
+<details class="editor" id="editor">
+  <summary>Administrar targets</summary>
+  <div class="ebody">
+    <p class="muted" id="esrc"></p>
+    <label class="tok">Token de escritura
+      <input type="password" id="etok" placeholder="API_WRITE_TOKEN" autocomplete="off">
+    </label>
+    <div id="erows"></div>
+    <div class="eactions">
+      <button type="button" id="eadd">+ Agregar target</button>
+      <button type="button" id="esave">Guardar</button>
+      <span id="emsg" role="status" aria-live="polite"></span>
+    </div>
+  </div>
+</details>
+"""
+
+_EDITOR_STYLE = """
+.editor{margin-top:1.5rem;border-top:1px solid var(--line);padding-top:.75rem}
+.editor summary{cursor:pointer;color:var(--muted);font-size:.8rem;
+  text-transform:uppercase;letter-spacing:.05em}
+.ebody{padding:.75rem 0}
+.tok{display:block;margin:.5rem 0 1rem;font-size:.8rem;color:var(--muted)}
+.tok input{display:block;margin-top:.25rem;width:22rem;max-width:100%}
+.erow{display:grid;grid-template-columns:1fr 5rem 5rem 6rem 6rem 4rem 2rem;
+  gap:.4rem;margin-bottom:.4rem;align-items:center}
+.erow input[type=text],.erow input[type=number]{width:100%}
+.editor input,.editor button{background:var(--card);color:var(--fg);
+  border:1px solid var(--line);border-radius:3px;padding:.3rem .4rem;
+  font:inherit;font-size:.8rem}
+.editor button{cursor:pointer}
+.ehead{font-size:.7rem;color:var(--muted);text-transform:uppercase}
+.eactions{margin-top:.75rem;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+.erm{color:#FF0000}
+#emsg.ok{color:#00C853}
+#emsg.bad{color:#FF0000;font-weight:700}
+@media(max-width:700px){.erow{grid-template-columns:1fr}}
+"""
+
+_EDITOR_SCRIPT = """
+const EF=[['expected_status','status'],['timeout_s','timeout s'],
+          ['degraded_ttfb_ms','ttfb ms'],['degraded_rtt_ms','rtt ms']];
+function erow(t){
+  const d=document.createElement('div'); d.className='erow';
+  const u=document.createElement('input'); u.type='text'; u.dataset.f='url';
+  u.placeholder='https://...'; u.value=t.url||''; d.appendChild(u);
+  EF.forEach(([f,ph])=>{const i=document.createElement('input');
+    i.type='number'; i.step='any'; i.dataset.f=f; i.placeholder=ph;
+    if(t[f]!=null)i.value=t[f]; d.appendChild(i);});
+  const r=document.createElement('label'); r.style.fontSize='.75rem';
+  const c=document.createElement('input'); c.type='checkbox'; c.dataset.f='remind';
+  c.checked=!!t.remind; r.appendChild(c);
+  r.appendChild(document.createTextNode(' recordar')); d.appendChild(r);
+  const x=document.createElement('button'); x.type='button'; x.className='erm';
+  x.textContent='x'; x.title='Quitar'; x.onclick=()=>d.remove(); d.appendChild(x);
+  return d;
+}
+function ecollect(){
+  return [...document.querySelectorAll('#erows .erow')].map(d=>{
+    const o={};
+    d.querySelectorAll('[data-f]').forEach(i=>{
+      const f=i.dataset.f;
+      if(i.type==='checkbox'){o[f]=i.checked;}
+      else if(i.value!==''){o[f]=f==='url'?i.value:Number(i.value);}
+    });
+    return o;
+  }).filter(o=>o.url);
+}
+function emsg(text,ok){
+  const m=document.getElementById('emsg');
+  m.textContent=text; m.className=ok?'ok':'bad';
+}
+async function eload(){
+  try{
+    const r=await fetch('/api/targets',{cache:'no-store'});
+    if(!r.ok)return;
+    const d=await r.json();
+    const rows=document.getElementById('erows');
+    rows.replaceChildren(...d.targets.map(erow));
+    document.getElementById('esrc').textContent = d.managed
+      ? 'Esta lista se administra desde acá. targets.yaml quedó como semilla y ya no se lee.'
+      : 'Todavía se usa targets.yaml. Al guardar por primera vez, esta lista pasa a mandar.';
+    if(!d.writable)emsg('Escritura deshabilitada: falta API_WRITE_TOKEN en .env.',false);
+  }catch(e){emsg('No se pudo cargar la lista.',false);}
+}
+async function esave(){
+  const tok=document.getElementById('etok').value;
+  if(!tok){emsg('Falta el token.',false);return;}
+  sessionStorage.setItem('vigilTok',tok);
+  try{
+    const r=await fetch('/api/targets',{method:'PUT',
+      headers:{'Content-Type':'application/json','X-Vigil-Token':tok},
+      body:JSON.stringify({targets:ecollect()})});
+    const d=await r.json();
+    if(r.ok){emsg(`Guardado: ${d.targets.length} target(s). Se aplica en la próxima corrida.`,true);}
+    else{emsg(d.error||`Error ${r.status}`,false);}
+  }catch(e){emsg('No se pudo guardar: sin conexión con el servidor.',false);}
+}
+document.getElementById('eadd').onclick=()=>
+  document.getElementById('erows').appendChild(erow({}));
+document.getElementById('esave').onclick=esave;
+document.getElementById('editor').addEventListener('toggle',function(){
+  if(this.open)eload();});
+document.getElementById('etok').value=sessionStorage.getItem('vigilTok')||'';
+"""
+
 #: The exact bytes that go inside <script>. Rendered once and reused, because
 #: the CSP hash below is computed over this string: formatting it twice would
 #: let the two copies drift by a byte, and the browser would then refuse the
 #: script and silently stop refreshing the page.
-_SCRIPT_RENDERED = _SCRIPT % POLL_INTERVAL_S
+_SCRIPT_RENDERED = (_SCRIPT % POLL_INTERVAL_S) + _EDITOR_SCRIPT
 
 
 def _csp_hash(content: str) -> str:
@@ -327,7 +444,8 @@ def _csp_hash(content: str) -> str:
 #: nothing against XSS while reading as if it did. Both blocks here are fixed
 #: strings for the life of the process, so a hash computed once is enough and
 #: no per-request nonce is needed.
-STYLE_HASH : str = _csp_hash(_STYLE)
+_STYLE_RENDERED = _STYLE + _EDITOR_STYLE
+STYLE_HASH : str = _csp_hash(_STYLE_RENDERED)
 SCRIPT_HASH: str = _csp_hash(_SCRIPT_RENDERED)
 
 
@@ -339,7 +457,7 @@ def render_page(targets: dict, history: dict, stale_seconds: float | None,
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>vigil-sre</title>
-<style>{_STYLE}</style>
+<style>{_STYLE_RENDERED}</style>
 </head><body>
 <header>
   <h1>vigil-sre</h1>
@@ -351,5 +469,6 @@ def render_page(targets: dict, history: dict, stale_seconds: float | None,
   <span class="num">p50</span><span class="num">p95</span>
 </summary></div></div>
 <div id="list">{render_rows(targets, history, stale_seconds, strips)}</div>
+{_EDITOR}
 <script>{_SCRIPT_RENDERED}</script>
 </body></html>"""

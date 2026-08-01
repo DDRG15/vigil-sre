@@ -49,6 +49,8 @@ from typing import TypedDict
 
 import aiohttp
 import yaml
+
+import targetstore
 from dotenv import load_dotenv
 
 from diagnostics import (
@@ -225,6 +227,10 @@ class Target:
     timeout_s               : float | None = None
     degraded_ttfb_ms        : float | None = None
     degraded_rtt_ms         : float | None = None
+    #: Opt-in: re-alert on a schedule while this target stays DOWN. Off by
+    #: default, and deliberately so — a target you added to watch something
+    #: break (a test URL, a known-bad endpoint) would otherwise nag forever.
+    remind                  : bool  = False
 
 
 _ENV_VAR_REF     = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
@@ -341,7 +347,10 @@ def _validated_numeric_field(
     return value
 
 
-def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
+def load_targets(
+    path      : Path = TARGETS_FILE,
+    store_path: Path | None = None,
+) -> list[Target]:
     """
     Parse *path* as YAML and return the list of Targets.
 
@@ -382,6 +391,40 @@ def load_targets(path: Path = TARGETS_FILE) -> list[Target]:
         sys.exit(1)
 
     entries: list = raw.get("targets", []) if isinstance(raw, dict) else []
+
+    # The dashboard-managed store wins when it exists. `None` (never written)
+    # and `[]` (every target deliberately deleted) are different answers, and
+    # only `None` falls back — collapsing them would resurrect a list the
+    # operator removed on the very next run.
+    # store_path is a parameter and not just the module default so a test can
+    # point it somewhere harmless. Without it this function reads whatever
+    # data/targets.json happens to exist beside the process, which makes the
+    # result depend on the cwd -- the same ambient-state trap the state file
+    # path was given a parameter to escape.
+    stored = targetstore.read_store(store_path)
+    if stored is not None:
+        logger.info(
+            "Loaded %d target(s) from '%s' (managed from the dashboard; "
+            "'%s' is the seed and is no longer read).",
+            len(stored), targetstore.STORE_FILE, path,
+        )
+        return [
+            Target(
+                url                     =e["url"],
+                expect_substring        =_resolve_expect_substring(
+                    e["expect_substring"], path, e["url"])[0]
+                    if e.get("expect_substring") else None,
+                expect_substring_display=_resolve_expect_substring(
+                    e["expect_substring"], path, e["url"])[1]
+                    if e.get("expect_substring") else None,
+                expected_status         =e.get("expected_status"),
+                timeout_s               =e.get("timeout_s"),
+                degraded_ttfb_ms        =e.get("degraded_ttfb_ms"),
+                degraded_rtt_ms         =e.get("degraded_rtt_ms"),
+                remind                  =e.get("remind", False),
+            )
+            for e in stored
+        ]
 
     targets: list[Target] = []
     for entry in entries:
