@@ -49,6 +49,54 @@ COLOURS: dict[str, str] = {
 GLYPHS: dict[str, str] = {
     "UP": "●", "DEGRADED": "▲", "DOWN": "■", "UNKNOWN": "○"}
 
+#: A bucket with no probe in it. Deliberately NOT COLOURS["UNKNOWN"]: an
+#: unknown STATUS is something the monitor observed and could not classify,
+#: while an empty bucket is time the monitor was not watching at all. Rendering
+#: the second as the first would let a gap in coverage read as a reading.
+STRIP_EMPTY: str = "#6b728040"
+
+#: Bar geometry, in SVG user units. 60 bars at 4+1 fit inside 300px, which is
+#: the widest a row can give up without squeezing the URL column.
+STRIP_BAR_W : int = 4
+STRIP_GAP   : int = 1
+STRIP_HEIGHT: int = 18
+
+
+def render_strip(strip: list[str | None] | None) -> str:
+    """
+    One target's history as a bar per time bucket, oldest on the left.
+
+    Inline SVG rather than a div per bar: 60 bars across six targets is 360
+    elements re-inserted on every 30-second poll, and one <svg> is one node.
+    No dependency either way — this project has spent twenty phases keeping
+    that count at three.
+
+    Colour is NOT the only channel here, but it is the only one a 4px bar can
+    carry. That is acceptable because the strip is supplementary: the status
+    glyph and the status word sit in the same row, unchanged, and remain the
+    primary signal. Each bar also carries a <title>, so the information is
+    reachable by hover and by screen reader rather than by hue alone.
+    """
+    if not strip:
+        return ""
+    bars = []
+    for index, status in enumerate(strip):
+        x      = index * (STRIP_BAR_W + STRIP_GAP)
+        colour = COLOURS.get(status, STRIP_EMPTY) if status else STRIP_EMPTY
+        label  = status if status else "sin datos"
+        bars.append(
+            f'<rect x="{x}" y="0" width="{STRIP_BAR_W}" height="{STRIP_HEIGHT}" '
+            f'fill="{colour}"><title>{html.escape(label)}</title></rect>'
+        )
+    width = len(strip) * (STRIP_BAR_W + STRIP_GAP) - STRIP_GAP
+    return (
+        f'<svg class="strip" viewBox="0 0 {width} {STRIP_HEIGHT}" '
+        f'width="{width}" height="{STRIP_HEIGHT}" role="img" '
+        f'aria-label="Historial de estado, del más antiguo al más reciente">'
+        f'{"".join(bars)}</svg>'
+    )
+
+
 #: Run cadence in seconds. Staleness is judged in multiples of this.
 RUN_INTERVAL_S: int = 60
 
@@ -95,7 +143,7 @@ def freshness(stale_seconds: float | None) -> tuple[str, str]:
     )
 
 
-def _row(url: str, state: dict, history: dict) -> str:
+def _row(url: str, state: dict, history: dict, strip: list | None = None) -> str:
     """
     Render one target row. **Every value is escaped here**, which is the only
     place any of them enters the HTML — see the module docstring for why that
@@ -132,6 +180,7 @@ def _row(url: str, state: dict, history: dict) -> str:
   <summary>
     <span class="state" style="color:{colour}" title="{e_status}">{glyph}<b>{e_status}</b></span>
     <span class="url">{e_url}</span>
+    <span class="hist">{render_strip(strip)}</span>
     <span class="num" title="uptime">{uptime}</span>
     <span class="num" title="p50 TTFB">{p50}</span>
     <span class="num" title="p95 TTFB">{p95}</span>
@@ -143,7 +192,8 @@ def _row(url: str, state: dict, history: dict) -> str:
 </details>"""
 
 
-def render_rows(targets: dict, history: dict, stale_seconds: float | None) -> str:
+def render_rows(targets: dict, history: dict, stale_seconds: float | None,
+                strips: dict | None = None) -> str:
     """The fragment the page re-fetches: freshness banner plus every row."""
     level, message = freshness(stale_seconds)
     banner = (
@@ -161,8 +211,13 @@ def render_rows(targets: dict, history: dict, stale_seconds: float | None) -> st
         value = history.get(url) if isinstance(history, dict) else None
         return value if isinstance(value, dict) else {}
 
+    def _strip_of(url: str) -> list | None:
+        value = strips.get(url) if isinstance(strips, dict) else None
+        return value if isinstance(value, list) else None
+
     rows = "\n".join(
-        _row(url, _state_of(url), _history_of(url)) for url in sorted(targets)
+        _row(url, _state_of(url), _history_of(url), _strip_of(url))
+        for url in sorted(targets)
     )
     return f'{banner}<div class="rows {level}">{rows}</div>'
 
@@ -186,7 +241,7 @@ header{display:flex;justify-content:space-between;align-items:baseline;
    hours old has no business looking reassuring. */
 .rows.dead{opacity:.45}
 .row{border-bottom:1px solid var(--line)}
-.row summary{display:grid;grid-template-columns:9rem 1fr 5rem 5rem 5rem;
+.row summary{display:grid;grid-template-columns:9rem 1fr 19rem 5rem 5rem 5rem;
   gap:.75rem;align-items:center;padding:.5rem .25rem;cursor:pointer}
 .row summary::-webkit-details-marker{display:none}
 .row:hover{background:var(--card)}
@@ -199,6 +254,11 @@ header{display:flex;justify-content:space-between;align-items:baseline;
 .body{padding:.25rem .25rem .75rem 9.75rem}
 .detail{margin:.25rem 0;word-break:break-word}
 .muted{color:var(--muted)}
+/* Supplementary by design: the strip may shrink or vanish before the status
+   word does, because the word is the primary channel and a 4px bar is not. */
+.hist{display:flex;align-items:center;overflow:hidden}
+.strip{max-width:100%;display:block}
+@media(max-width:900px){.hist{display:none}}
 /* Empty until a poll fails, so it costs no space in the normal case. When it
    does speak it is the only red in the header, because it outranks everything
    below it: if polling is broken, nothing below it is current. */
@@ -271,7 +331,8 @@ STYLE_HASH : str = _csp_hash(_STYLE)
 SCRIPT_HASH: str = _csp_hash(_SCRIPT_RENDERED)
 
 
-def render_page(targets: dict, history: dict, stale_seconds: float | None) -> str:
+def render_page(targets: dict, history: dict, stale_seconds: float | None,
+                strips: dict | None = None) -> str:
     """The full page. Rows come from the same fragment the poll re-fetches."""
     return f"""<!doctype html>
 <html lang="es"><head>
@@ -286,9 +347,9 @@ def render_page(targets: dict, history: dict, stale_seconds: float | None) -> st
   <span id="conn" class="conn" role="status" aria-live="polite"></span>
 </header>
 <div class="row head"><div class="row"><summary style="cursor:default">
-  <span>Estado</span><span>Target</span><span class="num">Uptime</span>
+  <span>Estado</span><span>Target</span><span>Historial</span><span class="num">Uptime</span>
   <span class="num">p50</span><span class="num">p95</span>
 </summary></div></div>
-<div id="list">{render_rows(targets, history, stale_seconds)}</div>
+<div id="list">{render_rows(targets, history, stale_seconds, strips)}</div>
 <script>{_SCRIPT_RENDERED}</script>
 </body></html>"""

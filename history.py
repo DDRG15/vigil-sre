@@ -483,3 +483,100 @@ def latency_percentiles(db_path: Path, url: str, since: str) -> dict[str, float]
     if p50 is None:
         return None
     return {"p50_ttfb_ms": p50, "p95_ttfb_ms": p95}
+
+
+#: Bars in one target's history strip. Fixed, not derived from the data: a
+#: strip whose width changes with how much history exists would make two rows
+#: incomparable at a glance, which is the one thing a strip is for.
+STRIP_BUCKETS: int = 60
+
+
+def status_strip(
+    db_path: Path,
+    urls   : list[str],
+    since  : str,
+    buckets: int = STRIP_BUCKETS,
+) -> dict[str, list[str | None]]:
+    """
+    Bucket every target's history into *buckets* slots of equal duration.
+
+    Returns ``{url: [status, ...]}`` with exactly *buckets* entries per url,
+    oldest first. A slot with no probe in it is ``None`` — NOT "UP".
+
+    Why the worst status wins a bucket
+    ----------------------------------
+    A bucket spans hours and holds dozens of probes. Averaging them, or taking
+    the last one, hides exactly what the strip exists to show: a two-minute
+    outage inside a 3-hour bucket would round away to green. Uptime is already
+    reported as a percentage next to this; the strip answers a different
+    question, which is *when*, and a single failure is the answer to that.
+
+    Why a missing bucket is not UP
+    ------------------------------
+    No data means the monitor was not running, or the window predates
+    retention. Rendering that as healthy would let a dead monitor's silence
+    read as a clean bill of health — the failure mode this project treats as
+    the worst one there is.
+
+    One query for every target, not one per target: this runs on the poll
+    path, every 30 seconds, and six round trips there is a cost paid quietly
+    forever.
+    """
+    if not urls or buckets < 1:
+        return {}
+
+    # Existence checked BEFORE connecting, the same guard the aggregates above
+    # use: sqlite3's mode=ro raises "unable to open database file" for a path
+    # that does not exist, which is a different error from "no such table" and
+    # would sail past _is_missing_schema straight into a 500. A freshly
+    # deployed instance has no history.db at all, and that is an ordinary
+    # state, not a fault.
+    if not db_path.exists():
+        return {url: [None] * buckets for url in urls}
+
+    #: Rank for "worst wins". Lower is worse, so MIN() picks the worst.
+    rank_to_status = {1: "DOWN", 2: "DEGRADED", 3: "UP"}
+
+    placeholders = ",".join("?" for _ in urls)
+    con = _connect_read_only(db_path)
+    try:
+        rows = con.execute(
+            f"""
+            SELECT url,
+                   CAST(
+                       (julianday(checked_at) - julianday(?))
+                       / ((julianday('now') - julianday(?)) / {buckets})
+                   AS INTEGER) AS bucket,
+                   MIN(CASE status
+                           WHEN 'DOWN'     THEN 1
+                           WHEN 'DEGRADED' THEN 2
+                           ELSE 3
+                       END) AS worst
+            FROM probe_results
+            WHERE checked_at >= ? AND url IN ({placeholders})
+            GROUP BY url, bucket
+            """,
+            (since, since, since, *urls),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if _is_missing_schema(exc):
+            # A fresh deployment has no table yet. Empty strips are the honest
+            # answer, and they render as "no data" rather than as healthy.
+            return {url: [None] * buckets for url in urls}
+        logger.warning(
+            "Could not read status history: %s — reporting this as "
+            "unavailable rather than as absent.", exc,
+        )
+        raise
+    finally:
+        con.close()
+
+    strips: dict[str, list[str | None]] = {url: [None] * buckets for url in urls}
+    for url, bucket, worst in rows:
+        # A row landing exactly on `now` computes to `buckets`, one past the
+        # last slot. Clamping is correct rather than defensive: that reading
+        # belongs in the most recent bucket, not in a slot that does not exist.
+        index = min(max(int(bucket), 0), buckets - 1)
+        if url in strips:
+            strips[url][index] = rank_to_status.get(worst)
+    return strips

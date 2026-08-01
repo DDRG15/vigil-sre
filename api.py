@@ -50,7 +50,12 @@ from urllib.parse import parse_qs, urlparse
 
 import dashboard
 from dashboard import render_page, render_rows
-from history import HISTORY_DB_FILE, latency_percentiles, uptime_pct
+from history import (
+    HISTORY_DB_FILE,
+    latency_percentiles,
+    status_strip,
+    uptime_pct,
+)
 
 logger = logging.getLogger("sre.api")
 
@@ -194,13 +199,25 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _dashboard_data(self) -> tuple[dict, dict, float | None]:
-        """State, history aggregates and staleness — what both HTML routes need."""
+    def _dashboard_data(self) -> tuple[dict, dict, float | None, dict]:
+        """State, aggregates, staleness and per-target strips — what both HTML
+        routes need.
+
+        The strips cover DEFAULT_WINDOW, the same window as the numbers beside
+        them. A row whose uptime says "7 days" next to a strip covering one is
+        two different claims about the same target, and the reader has no way
+        to tell which one they are looking at.
+        """
         targets = read_state(self.state_path)
+        urls    = list(targets)
         history = history_payload(
-            self.history_path, DEFAULT_WINDOW, list(targets)
+            self.history_path, DEFAULT_WINDOW, urls
         )["targets"]
-        return targets, history, stale_seconds(targets)
+        since   = (
+            datetime.now(timezone.utc) - timedelta(days=WINDOWS[DEFAULT_WINDOW])
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        strips  = status_strip(self.history_path, urls, since)
+        return targets, history, stale_seconds(targets), strips
 
     def do_GET(self) -> None:  # noqa: N802 — http.server's required spelling
         parsed = urlparse(self.path)

@@ -565,8 +565,26 @@ row below it** — green that might be hours old has no business looking
 reassuring. That behaviour is the visual counterpart of the dead-man's switch,
 and it is the one thing here not borrowed from anyone else.
 
-That bar has one blind spot, and the header covers it: **the bar only updates
-when a poll succeeds.** If the server dies while a tab is open, the page would
+**Each row carries a strip of its own history**, one bar per time bucket over
+the same window as the numbers beside it, oldest on the left. The percentages
+answer *how much*; the strip answers *when*, and no aggregate can. "99.2%
+uptime" and "99.2% uptime, all of it lost in one three-hour outage the day
+before yesterday" are different incidents that read identically as a number.
+
+Two rules make the strip worth trusting. **The worst status in a bucket wins** —
+a bucket spans hours and holds dozens of probes, so averaging them would round a
+short outage away to green, which is exactly the event the strip exists to
+surface. And **a bucket with no data is not UP**: it is drawn in a muted tone
+distinct from every real status, because time the monitor was not watching must
+never read as time it watched and found nothing wrong.
+
+It is inline SVG with a `<title>` per bar, so the information survives hover and
+a screen reader rather than living in hue alone. The status glyph and the status
+word remain the primary channel — a 4px bar cannot carry shape, so the strip is
+supplementary by design and is the first thing to disappear on a narrow screen.
+
+That freshness bar has one blind spot, and the header covers it: **the bar only
+updates when a poll succeeds.** If the server dies while a tab is open, the page would
 freeze mid-sentence and go on claiming the data is thirty seconds old — the
 freshness mechanism disabled by exactly the kind of failure it exists to catch.
 So a failed poll writes its own line in the header, outside the fragment the
