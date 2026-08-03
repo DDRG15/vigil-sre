@@ -488,3 +488,23 @@ def test_the_actions_run_on_a_supported_node() -> None:
             encoding="utf-8")
         assert "actions/checkout@v4" not in body, f"{name}: checkout on Node 20"
         assert "actions/setup-python@v5" not in body, f"{name}: setup-python on Node 20"
+
+
+def test_the_collector_does_not_impersonate_a_real_account() -> None:
+    """`<word>@users.noreply.github.com` resolves to the GitHub account whose
+    username is <word>. Picking a descriptive word credited every collected
+    commit to a stranger and listed them as a contributor to this repo.
+
+    Attribution is not cosmetic: it is the record of who did the work, and
+    putting someone else's name on a machine's commits is wrong regardless of
+    intent. The bot identity carries a numeric ID precisely so it cannot
+    collide with a human's username.
+    """
+    body = WORKFLOW.read_text(encoding="utf-8")
+    emails = re.findall(r"user\.email\s+\"([^\"]+)\"", body)
+    assert emails, "the collector sets no commit identity"
+    for email in emails:
+        assert email.startswith("41898282+github-actions[bot]@"), (
+            f"{email} may resolve to a real GitHub account — use the "
+            "numeric bot identity"
+        )

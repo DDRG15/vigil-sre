@@ -103,8 +103,14 @@ jobs:
       - name: Append the new rows
         if: steps.window.outputs.expired == 'false' && steps.window.outputs.skip != 'true'
         run: |
-          git config user.name  "telemetry-collector"
-          git config user.email "telemetry@users.noreply.github.com"
+          # The official GitHub Actions bot identity, numeric ID included.
+          # `<name>@users.noreply.github.com` is GitHub's hidden-email format,
+          # so any word there RESOLVES TO THE REAL ACCOUNT WITH THAT USERNAME:
+          # "telemetry@users.noreply.github.com" credited these commits to a
+          # stranger called telemetry and listed them as a contributor to this
+          # repo. Attribution is not cosmetic — it says who did the work.
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           # An orphan branch: this data has nothing to do with the source
           # history, and 336 commits of measurements would drown main's log.
