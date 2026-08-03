@@ -1,0 +1,156 @@
+name: telemetry
+
+# Two weeks of probe history, collected without leaving a laptop on.
+#
+# The trend comparison needs two full windows: the last seven days against the
+# seven before them. A burst of manual runs cannot produce that — the earlier
+# window is time that had to be measured while it was happening.
+#
+# Read this before trusting the numbers. These runners live in GitHub's
+# datacenters, so what gets recorded is GITHUB's path to each target, not
+# yours. That makes it a consistent vantage point, which is what validates the
+# feature end to end on real history. It is not your network, so thresholds
+# calibrated here do not transfer to a laptop on a home connection — for that,
+# the manual runs are the source.
+#
+# Hourly, not half-hourly: 336 runs over two weeks is 168 samples per window
+# per target, against the 20 the comparison needs. Eight times the requirement
+# at half the runner time. More samples would buy nothing and cost twice.
+#
+# Actions minutes are free and unlimited on public repositories; the 2,000/month
+# cap applies to private ones. The guards below exist anyway — a collector that
+# outlives its purpose is exactly the kind of thing nobody notices.
+
+on:
+  schedule:
+    # GitHub's scheduler is best-effort: runs get delayed under load and are
+    # occasionally skipped. Fine here — the goal is samples spread across every
+    # hour of the day, not a metronome.
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write           # push collected rows
+  actions:  write           # switch itself off when the window closes
+
+concurrency:
+  # Two runs appending to the same file would race on the push. Queue rather
+  # than cancel: a cancelled run is a lost sample, and samples are the point.
+  group: telemetry
+  cancel-in-progress: false
+
+env:
+  # The window, both ends, to the minute. A bare date leaves "the 17th"
+  # ambiguous — does it start or end that day — and an unattended job is
+  # exactly where an ambiguity gets resolved the wrong way for two weeks.
+  # Compared as strings, which is correct because ISO-8601 sorts
+  # lexicographically; the test asserts that property rather than trusting it.
+  COLLECT_FROM:  "2026-08-03T15:00:00Z"
+  COLLECT_UNTIL: "2026-08-17T15:00:00Z"
+  DATA_BRANCH: telemetry
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    # A stuck run cannot burn the 6-hour default. Nothing here legitimately
+    # takes more than two minutes; ten is slack, not a budget.
+    timeout-minutes: 10
+
+    steps:
+      # ---------------------------------------------------------------------
+      # Gate. Decides BEFORE any work whether this run should happen at all.
+      # ---------------------------------------------------------------------
+      - name: Is the collection window still open?
+        id: window
+        run: |
+          NOW=$(date -u +%FT%TZ)
+          if [[ "$NOW" > "$COLLECT_UNTIL" ]]; then
+            echo "expired=true" >> "$GITHUB_OUTPUT"
+            echo "La ventana cerro el $COLLECT_UNTIL (ahora: $NOW). No se sondea."
+          elif [[ "$NOW" < "$COLLECT_FROM" ]]; then
+            # Guards the other end too: a fork, a re-enable, or a clock that
+            # disagrees must not start collecting outside the window either.
+            echo "expired=false" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "La ventana abre el $COLLECT_FROM (ahora: $NOW). Todavia no."
+          else
+            echo "expired=false" >> "$GITHUB_OUTPUT"
+            echo "Recolectando: $COLLECT_FROM -> $COLLECT_UNTIL (ahora: $NOW)."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.window.outputs.expired == 'false' && steps.window.outputs.skip != 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.window.outputs.expired == 'false' && steps.window.outputs.skip != 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: steps.window.outputs.expired == 'false' && steps.window.outputs.skip != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Probe once
+        if: steps.window.outputs.expired == 'false' && steps.window.outputs.skip != 'true'
+        # No webhooks configured, so nothing is dispatched anywhere: the
+        # collector measures, it does not page. `|| true` because main.py
+        # exiting non-zero on a genuinely lost alert would cost the sample it
+        # just took, and the sample is the only reason this job exists.
+        run: |
+          cp .env.example .env
+          python main.py || true
+
+      - name: Append the new rows
+        if: steps.window.outputs.expired == 'false' && steps.window.outputs.skip != 'true'
+        run: |
+          git config user.name  "telemetry-collector"
+          git config user.email "telemetry@users.noreply.github.com"
+
+          # An orphan branch: this data has nothing to do with the source
+          # history, and 336 commits of measurements would drown main's log.
+          git fetch origin "$DATA_BRANCH" --depth=1 2>/dev/null \
+            && git checkout "$DATA_BRANCH" \
+            || git checkout --orphan "$DATA_BRANCH"
+
+          mkdir -p telemetry
+          touch telemetry/probes.ndjson
+
+          # Only rows newer than what is stored. Re-exporting everything would
+          # rewrite the whole file, and git would keep a full copy every hour.
+          # No heredoc: its terminator has to sit at column 0, which breaks
+          # out of this YAML block scalar and makes the whole file unparseable.
+          LAST=$(tail -n 1 telemetry/probes.ndjson | python -c 'import json,sys; s=sys.stdin.read().strip(); print(json.loads(s)["checked_at"] if s else "")')
+          if [ -n "$LAST" ]; then
+            python scripts/export-history.py --since "$LAST" > /tmp/new.ndjson
+            # --since is inclusive, so the boundary row is already stored.
+            grep -vxF -f telemetry/probes.ndjson /tmp/new.ndjson \
+              >> telemetry/probes.ndjson || true
+          else
+            python scripts/export-history.py >> telemetry/probes.ndjson
+          fi
+
+          echo "  filas acumuladas: $(wc -l < telemetry/probes.ndjson)"
+          git add telemetry/probes.ndjson
+          git diff --cached --quiet && echo "  sin filas nuevas" && exit 0
+          git commit -m "telemetry: $(date -u +%FT%TZ)"
+          git push origin "$DATA_BRANCH"
+
+      # ---------------------------------------------------------------------
+      # The finally. Runs whatever happened above — success, failure, timeout,
+      # cancellation. A self-terminating collector that only terminates on the
+      # happy path is one that runs forever the first time something breaks.
+      # ---------------------------------------------------------------------
+      - name: Switch off once the window has closed
+        if: always()
+        continue-on-error: true     # a failure here must not mask the real result
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NOW=$(date -u +%FT%TZ)
+          if [[ "$NOW" > "$COLLECT_UNTIL" ]]; then
+            echo "Desactivando el schedule: la ventana cerro el $COLLECT_UNTIL."
+            gh api -X PUT \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/telemetry.yml/disable" \
+              && echo "  desactivado" \
+              || echo "  no se pudo desactivar por API — desactivalo a mano en Actions"
+          fi
