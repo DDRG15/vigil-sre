@@ -12,6 +12,10 @@ build/
 *.log.*
 state.json
 history.db
+# Datos recolectados: viven SOLO en la rama telemetry. En main serian una
+# copia que el recolector clona y vuelve a subir, mezclando mediciones de esta
+# red con las de los runners de GitHub -- dos cosas distintas en un solo archivo.
+telemetry/
 data/
 
 # Secrets

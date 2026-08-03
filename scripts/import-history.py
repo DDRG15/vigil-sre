@@ -57,6 +57,7 @@ def main() -> int:
     }
 
     inserted = skipped = malformed = 0
+    sources: set[str] = set()
     with con:
         for line in args.ndjson.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -69,6 +70,7 @@ def main() -> int:
                 # cost the other 2,700. Counted and reported, never silent.
                 malformed += 1
                 continue
+            sources.add(row.get("source") or "(sin etiqueta)")
             key = (row.get("url"), row.get("checked_at"))
             if key in seen:
                 skipped += 1
@@ -84,6 +86,23 @@ def main() -> int:
 
     print(f"  {inserted} filas nuevas, {skipped} ya presentes, "
           f"{malformed} lineas ilegibles -> {args.db}")
+
+    if len(sources) > 1:
+        # Loud, and a non-zero exit. Two vantage points in one file average two
+        # different network paths into percentiles that describe neither, and
+        # nothing about the resulting number looks wrong. Refusing is the only
+        # way this stays a mistake somebody notices.
+        print(
+            "\n  *** MEZCLA DE FUENTES: " + ", ".join(sorted(sources)) + "\n"
+            "  Un percentil sobre dos puntos de observacion distintos no\n"
+            "  describe ninguno de los dos. Filtra el archivo por 'source'\n"
+            "  antes de analizarlo, o importa cada fuente a su propia base.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if sources:
+        print(f"  fuente: {sources.pop()}")
     return 0
 
 

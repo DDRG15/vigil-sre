@@ -328,7 +328,11 @@ def test_the_workflow_appends_and_never_truncates() -> None:
     """Asserted against the workflow text, because a single `>` where a `>>`
     belongs is a one-character edit that silently discards two weeks."""
     body   = WORKFLOW.read_text(encoding="utf-8")
-    target = re.escape("telemetry/probes.ndjson")
+    # Derived from the workflow, not hardcoded: renaming the collected
+    # file must not quietly turn this guard into a no-op.
+    match  = re.search(r"telemetry/[\w.-]+\.ndjson", body)
+    assert match, "the workflow names no collected file"
+    target = re.escape(match.group(0))
 
     # A single `>` NOT preceded by another one. Matching the plain substring
     # would flag every correct `>>`, because ">> file" contains "> file" --
@@ -393,3 +397,94 @@ def _seed_db_append(path: Path, *, start: int, count: int) -> None:
                 (stamp, URL, stamp, "UP", 100.0 + i),
             )
     con.close()
+
+
+# =============================================================================
+# E. Vantage points must not mix
+# =============================================================================
+
+
+def test_every_exported_row_can_carry_its_source(tmp_path: Path) -> None:
+    """A latency figure without a vantage point is not a measurement.
+
+    The same target from a home connection and from a datacenter are two
+    numbers about two different network paths; averaged together they describe
+    neither, and nothing about the resulting percentile looks wrong.
+    """
+    db = tmp_path / "history.db"
+    _seed_db(db, 4)
+    out = _run(EXPORT, "--db", str(db), "--source", "github-actions").stdout
+    for line in out.splitlines():
+        assert json.loads(line)["source"] == "github-actions"
+
+
+def test_importing_two_vantage_points_refuses_loudly(tmp_path: Path) -> None:
+    """The guard that turns a silent contamination into a stopped command.
+
+    This actually happened: collected rows leaked into the source branch, the
+    runner cloned them, and one file ended up holding measurements from a home
+    laptop and from GitHub's datacenters with nothing to tell them apart.
+    Nothing failed, and the numbers looked fine.
+    """
+    db = tmp_path / "history.db"
+    _seed_db(db, 4)
+    mine   = _run(EXPORT, "--db", str(db), "--source", "laptop").stdout.splitlines()
+    theirs = _run(EXPORT, "--db", str(db), "--source", "runner").stdout.splitlines()
+
+    mixed = tmp_path / "mixed.ndjson"
+    mixed.write_text("\n".join(mine[:2] + theirs[2:]) + "\n", encoding="utf-8")
+
+    result = _run(IMPORT, str(mixed), "--db", str(tmp_path / "mixed.db"))
+    assert result.returncode == 2, "a mixed file must stop the command"
+    assert "MEZCLA DE FUENTES" in result.stderr
+    assert "laptop" in result.stderr and "runner" in result.stderr
+
+
+def test_a_single_source_imports_and_names_itself(tmp_path: Path) -> None:
+    """The other half: the guard must not block the normal case, and it should
+    say which vantage point the resulting database describes."""
+    db = tmp_path / "history.db"
+    _seed_db(db, 4)
+    single = tmp_path / "single.ndjson"
+    single.write_text(
+        _run(EXPORT, "--db", str(db), "--source", "github-actions").stdout,
+        encoding="utf-8")
+
+    result = _run(IMPORT, str(single), "--db", str(tmp_path / "one.db"))
+    assert result.returncode == 0
+    assert "fuente: github-actions" in result.stdout
+
+
+def test_collected_data_never_lives_in_the_source_branch() -> None:
+    """The leak, as an assertion.
+
+    `git add -A` swept the collected file into main. The runner then cloned it,
+    found the file already full of a laptop's measurements, and appended its
+    own — two network paths in one dataset, unrecoverably.
+    """
+    ignored = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "telemetry/" in ignored, (
+        "collected data must be ignored in the source branch, or a broad "
+        "`git add` will commit it and the collector will clone it back"
+    )
+    tracked = subprocess.run(
+        ["git", "ls-files", "telemetry/"], cwd=str(ROOT),
+        capture_output=True, text=True).stdout.strip()
+    assert not tracked, f"collected data is tracked in the source branch: {tracked}"
+
+
+def test_the_collector_labels_what_it_writes() -> None:
+    """Its file says where it came from, and so does every row inside it."""
+    body = WORKFLOW.read_text(encoding="utf-8")
+    assert "--source github-actions" in body
+    assert "telemetry/github-actions.ndjson" in body
+
+
+def test_the_actions_run_on_a_supported_node() -> None:
+    """Node 20 reached end of life; runners force Node 24 and warn on every
+    run. A warning nobody acts on is training to ignore warnings."""
+    for name in ("telemetry", "ci"):
+        body = (ROOT / ".github" / "workflows" / f"{name}.yml").read_text(
+            encoding="utf-8")
+        assert "actions/checkout@v4" not in body, f"{name}: checkout on Node 20"
+        assert "actions/setup-python@v5" not in body, f"{name}: setup-python on Node 20"

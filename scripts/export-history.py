@@ -38,6 +38,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default="history.db", type=Path)
     parser.add_argument(
+        "--source", default=None,
+        help="Where these measurements were taken. A latency figure is "
+             "meaningless without it: the same target measured from a home "
+             "connection and from a datacenter are two numbers about two "
+             "different paths, and averaged together they describe neither.",
+    )
+    parser.add_argument(
         "--since", default=None,
         help="ISO-8601 UTC. Only rows at or after this instant. Omitted "
              "exports everything, which is what a first run wants.",
@@ -64,7 +71,7 @@ def main() -> int:
 
     out = sys.stdout
     try:
-        _write(out, rows)
+        _write(out, rows, args.source)
     except (BrokenPipeError, OSError):
         # `export-history.py | head` closes the pipe mid-write. That is a
         # normal thing to type and must not look like the export failed, so it
@@ -76,14 +83,20 @@ def main() -> int:
     return 0
 
 
-def _write(out, rows) -> None:
+def _write(out, rows, source: str | None = None) -> None:
     for row in rows:
+        record = dict(zip(COLUMNS, row))
+        if source:
+            # Stamped on every row, not just named in the filename. A file can
+            # be concatenated with another, and once two vantage points share
+            # one file with nothing distinguishing them there is no way back:
+            # every percentile averages two different network paths and
+            # describes neither, and nothing about the number looks wrong.
+            record["source"] = source
         # ensure_ascii=False keeps a URL or an error message readable in the
         # committed file; sort_keys makes two exports of the same row
         # byte-identical, so a re-run cannot produce a spurious diff.
-        out.write(json.dumps(dict(zip(COLUMNS, row)),
-                             ensure_ascii=False, sort_keys=True) + "\n")
-    return 0
+        out.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

@@ -78,10 +78,10 @@ jobs:
             echo "Recolectando: $COLLECT_FROM -> $COLLECT_UNTIL (ahora: $NOW)."
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.window.outputs.expired == 'false' && steps.window.outputs.skip != 'true'
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: steps.window.outputs.expired == 'false' && steps.window.outputs.skip != 'true'
         with:
           python-version: "3.11"
@@ -108,29 +108,38 @@ jobs:
 
           # An orphan branch: this data has nothing to do with the source
           # history, and 336 commits of measurements would drown main's log.
-          git fetch origin "$DATA_BRANCH" --depth=1 2>/dev/null \
-            && git checkout "$DATA_BRANCH" \
-            || git checkout --orphan "$DATA_BRANCH"
+          if git fetch origin "$DATA_BRANCH" --depth=1 2>/dev/null; then
+            git checkout "$DATA_BRANCH"
+          else
+            git checkout --orphan "$DATA_BRANCH"
+            # --orphan keeps the index of the branch it came from, so the
+            # first commit would carry the whole source tree onto a branch
+            # meant to hold one data file. Clearing it is what makes
+            # "orphan" mean what it says.
+            git rm -rf --cached . > /dev/null
+          fi
 
           mkdir -p telemetry
-          touch telemetry/probes.ndjson
+          touch telemetry/github-actions.ndjson
 
           # Only rows newer than what is stored. Re-exporting everything would
           # rewrite the whole file, and git would keep a full copy every hour.
           # No heredoc: its terminator has to sit at column 0, which breaks
           # out of this YAML block scalar and makes the whole file unparseable.
-          LAST=$(tail -n 1 telemetry/probes.ndjson | python -c 'import json,sys; s=sys.stdin.read().strip(); print(json.loads(s)["checked_at"] if s else "")')
+          LAST=$(tail -n 1 telemetry/github-actions.ndjson | python -c 'import json,sys; s=sys.stdin.read().strip(); print(json.loads(s)["checked_at"] if s else "")')
           if [ -n "$LAST" ]; then
-            python scripts/export-history.py --since "$LAST" > /tmp/new.ndjson
+            python scripts/export-history.py --source github-actions \
+              --since "$LAST" > /tmp/new.ndjson
             # --since is inclusive, so the boundary row is already stored.
-            grep -vxF -f telemetry/probes.ndjson /tmp/new.ndjson \
-              >> telemetry/probes.ndjson || true
+            grep -vxF -f telemetry/github-actions.ndjson /tmp/new.ndjson \
+              >> telemetry/github-actions.ndjson || true
           else
-            python scripts/export-history.py >> telemetry/probes.ndjson
+            python scripts/export-history.py --source github-actions \
+              >> telemetry/github-actions.ndjson
           fi
 
-          echo "  filas acumuladas: $(wc -l < telemetry/probes.ndjson)"
-          git add telemetry/probes.ndjson
+          echo "  filas acumuladas: $(wc -l < telemetry/github-actions.ndjson)"
+          git add telemetry/github-actions.ndjson
           git diff --cached --quiet && echo "  sin filas nuevas" && exit 0
           git commit -m "telemetry: $(date -u +%FT%TZ)"
           git push origin "$DATA_BRANCH"
