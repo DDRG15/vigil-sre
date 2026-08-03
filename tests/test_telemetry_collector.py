@@ -508,3 +508,104 @@ def test_the_collector_does_not_impersonate_a_real_account() -> None:
             f"{email} may resolve to a real GitHub account — use the "
             "numeric bot identity"
         )
+
+
+def test_no_commit_in_this_repo_credits_a_stranger() -> None:
+    """The same mistake, caught in the history instead of in the workflow.
+
+    Setting that identity with `git config` and no --global writes it into
+    .git/config, where it silently signs everything committed from this
+    checkout afterwards. Four commits reached the public repo that way and
+    GitHub listed the stranger as a contributor. The workflow test above
+    guards the file; this one guards what actually shipped, which is the only
+    place the damage is visible.
+
+    Needs the full history: CI's default shallow clone fetches one commit, so
+    ci.yml sets fetch-depth: 0 for this.
+    """
+    log = subprocess.run(
+        ["git", "log", "--format=%H%x09%an <%ae>%x09%cn <%ce>"],
+        cwd=str(ROOT), capture_output=True, text=True)
+    if log.returncode != 0:
+        pytest.skip("not a git checkout")
+
+    # Anything@users.noreply.github.com resolves to the account with that
+    # username. GitHub's own form carries the numeric user ID, which cannot
+    # collide with a human's login -- that is the whole reason for the number.
+    noreply = re.compile(r"<(?P<local>[^<>@]+)@users\.noreply\.github\.com>")
+    offenders = []
+    for line in log.stdout.splitlines():
+        sha, _, rest = line.partition("\t")
+        for match in noreply.finditer(rest):
+            local = match.group("local")
+            if not re.fullmatch(r"\d+\+.+", local):
+                offenders.append(f"{sha[:10]}  {rest}")
+
+    assert not offenders, (
+        "commits credited to a GitHub account that may belong to someone "
+        "else:\n  " + "\n  ".join(offenders) + "\n"
+        "Fix the identity and rewrite, then `git config --local --unset "
+        "user.email` so the next commit does not repeat it."
+    )
+
+
+def test_the_runner_can_actually_commit_the_file_it_collects(
+        tmp_path: Path) -> None:
+    """Runs git for real, because this bug is invisible to a text search.
+
+    telemetry/ is gitignored so a broad `git add` cannot sweep collected data
+    into main. The collector's orphan branch starts from main's working tree
+    and inherits that .gitignore -- where the same rule blocks the one file
+    the branch exists to hold. Both rules are correct; they collide.
+
+    A scheduled run probed every target, exported the rows, and then died on
+    `git add` with the measurements in memory. Nothing in the YAML looks
+    wrong, which is why this asserts against git itself: the real .gitignore,
+    the real filename, the real command.
+    """
+    repo = tmp_path / "runner"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+    (repo / ".gitignore").write_text(
+        (ROOT / ".gitignore").read_text(encoding="utf-8"), encoding="utf-8")
+
+    # The exact path the workflow writes, taken from the workflow.
+    body = WORKFLOW.read_text(encoding="utf-8")
+    target = re.search(r"git add -f (\S+)", body)
+    assert target, "the collector no longer force-adds a named path"
+    data = repo / target.group(1)
+    data.parent.mkdir(parents=True, exist_ok=True)
+    data.write_text('{"body_bytes": 1}\n', encoding="utf-8")
+
+    plain = subprocess.run(
+        ["git", "add", target.group(1)], cwd=str(repo),
+        capture_output=True, text=True)
+    assert plain.returncode != 0, (
+        "the .gitignore no longer covers collected data — a broad `git add` "
+        "on main can now commit it, which is the leak this rule prevents"
+    )
+
+    forced = subprocess.run(
+        ["git", "add", "-f", target.group(1)], cwd=str(repo),
+        capture_output=True, text=True)
+    assert forced.returncode == 0, (
+        f"the collector cannot stage its own data file: {forced.stderr}")
+    staged = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"], cwd=str(repo),
+        capture_output=True, text=True).stdout.split()
+    assert staged == [target.group(1)], (
+        f"expected exactly the data file staged, got {staged}")
+
+
+def test_the_collector_never_stages_a_wildcard() -> None:
+    """-f is safe only because it names one path.
+
+    `git add -A -f` or `git add -f .` would override the ignore rule for
+    everything at once, which is the sweep that leaked the data in the first
+    place — with the protection now explicitly disabled.
+    """
+    body = WORKFLOW.read_text(encoding="utf-8")
+    for command in re.findall(r"^\s*git add .*$", body, re.MULTILINE):
+        assert not re.search(r"git add\b.*(-A|--all|\s\.\s*$)", command), (
+            f"the collector stages a wildcard: {command.strip()}"
+        )

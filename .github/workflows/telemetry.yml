@@ -145,7 +145,16 @@ jobs:
           fi
 
           echo "  filas acumuladas: $(wc -l < telemetry/github-actions.ndjson)"
-          git add telemetry/github-actions.ndjson
+          # -f because telemetry/ is in .gitignore, and the runner carries that
+          # .gitignore here: the orphan branch starts from main's working tree.
+          # Both rules are right and they collide. On main the pattern stops a
+          # broad `git add` from sweeping collected data into the source branch
+          # -- the leak that mixed a laptop's measurements with a datacenter's.
+          # On THIS branch that file is the entire point. The -f names one exact
+          # path, so it overrides the rule for the file the rule is not about
+          # and leaves the protection against sweeps intact. Without it the run
+          # probes, exports, and then dies on `git add` with the data in hand.
+          git add -f telemetry/github-actions.ndjson
           git diff --cached --quiet && echo "  sin filas nuevas" && exit 0
           git commit -m "telemetry: $(date -u +%FT%TZ)"
           git push origin "$DATA_BRANCH"

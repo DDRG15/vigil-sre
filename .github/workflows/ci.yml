@@ -12,6 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The default shallow clone fetches one commit, and one of the tests
+          # reads the author of every commit to catch an identity that credits
+          # a stranger. At depth 1 that test inspects a single commit and
+          # passes on a history full of them. 64 commits cost nothing to fetch.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v7
