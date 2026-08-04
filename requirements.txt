@@ -5,12 +5,20 @@
 # Requires: Python 3.11+
 
 # Async HTTP client — replaces requests; drives all probe and webhook calls
-# 3.14.1 closes eleven CVEs carried by 3.13.5 (cookie leakage across
+# 3.14.1 closed eleven CVEs carried by 3.13.5 (cookie leakage across
 # cross-origin redirects, TLS SNI bypass on connection reuse, multipart
 # header injection, and others). None were reachable from this codebase --
 # it uses aiohttp as a client only, with no server, cookies, multipart or
 # digest auth -- but a pin is a bet that nothing grows into them later.
-aiohttp==3.14.1
+#
+# 3.14.3 closes three more, published against 3.14.1 three days after we
+# pinned it: CVE-2026-59881 and CVE-2026-69243 (fixed in 3.14.2) and
+# CVE-2026-69244 (fixed in 3.14.3). Nothing about this project changed --
+# a pin makes the build reproducible AND freezes it while the world keeps
+# finding holes, so the version that was clean on Friday is not on Monday.
+# pip-audit in CI is what turns that from a thing nobody notices into a
+# red build.
+aiohttp==3.14.3
 
 # YAML parser — loads targets.yaml at startup
 PyYAML==6.0.3
