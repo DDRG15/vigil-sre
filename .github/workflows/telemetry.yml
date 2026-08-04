@@ -23,10 +23,21 @@ name: telemetry
 
 on:
   schedule:
-    # GitHub's scheduler is best-effort: runs get delayed under load and are
-    # occasionally skipped. Fine here — the goal is samples spread across every
-    # hour of the day, not a metronome.
-    - cron: "0 * * * *"
+    # :17, not :00. GitHub's scheduler is best-effort — runs get delayed under
+    # load and are occasionally skipped — and :00 is the minute every hourly
+    # cron in the world is written on, so it starts each hour with the longest
+    # queue of the day. Measured here on the first eight hours at "0 * * * *":
+    #
+    #   17:30  19:11  20:49  21:54  22:45  23:55  01:15
+    #
+    # Not one landed on the hour, the median delay was ~50 minutes, and 18:00
+    # never ran at all. A delay costs nothing (the goal is samples spread
+    # across every hour, not a metronome) but a skip costs a sample, and skips
+    # get likelier the longer the queue. An odd minute competes with nobody.
+    #
+    # This does NOT shift the collection window: both ends are compared against
+    # the absolute timestamps in COLLECT_FROM/COLLECT_UNTIL, not the cron.
+    - cron: "17 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -112,9 +123,44 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # An orphan branch: this data has nothing to do with the source
-          # history, and 336 commits of measurements would drown main's log.
+          # ORDER MATTERS, and it is the whole point of this step.
+          #
+          # An orphan branch holds ONE file. Checking it out therefore DELETES
+          # the source tree from the working directory -- including
+          # scripts/export-history.py, the thing that has to run. Runs #4-#9
+          # died exactly there, one per hour, with "No such file or directory",
+          # and run #3 passed because the branch did not exist yet: the very
+          # first run creates it and every run after it hits the deletion.
+          #
+          # So everything that needs the source tree happens BEFORE any
+          # checkout, and the data branch is read without switching to it.
           if git fetch origin "$DATA_BRANCH" --depth=1 2>/dev/null; then
+            HAVE_BRANCH=1
+            # `git show ref:path` reads a file out of a commit without touching
+            # the working tree. That is what makes the ordering possible.
+            LAST=$(git show "origin/$DATA_BRANCH:telemetry/github-actions.ndjson" 2>/dev/null \
+              | tail -n 1 \
+              | python -c 'import json,sys; s=sys.stdin.read().strip(); print(json.loads(s)["checked_at"] if s else "")')
+          else
+            HAVE_BRANCH=0
+            LAST=""
+          fi
+
+          # Exported while the source tree still exists. Only rows newer than
+          # what is stored: re-exporting everything would rewrite the whole
+          # file, and git would keep a full copy of it every hour.
+          # No heredoc: its terminator has to sit at column 0, which breaks
+          # out of this YAML block scalar and makes the whole file unparseable.
+          if [ -n "$LAST" ]; then
+            python scripts/export-history.py --source github-actions \
+              --since "$LAST" > /tmp/new.ndjson
+          else
+            python scripts/export-history.py --source github-actions > /tmp/new.ndjson
+          fi
+          echo "  filas exportadas en esta corrida: $(wc -l < /tmp/new.ndjson)"
+
+          # Only now, with the rows safely outside the repo, switch branches.
+          if [ "$HAVE_BRANCH" = 1 ]; then
             git checkout "$DATA_BRANCH"
           else
             git checkout --orphan "$DATA_BRANCH"
@@ -128,21 +174,11 @@ jobs:
           mkdir -p telemetry
           touch telemetry/github-actions.ndjson
 
-          # Only rows newer than what is stored. Re-exporting everything would
-          # rewrite the whole file, and git would keep a full copy every hour.
-          # No heredoc: its terminator has to sit at column 0, which breaks
-          # out of this YAML block scalar and makes the whole file unparseable.
-          LAST=$(tail -n 1 telemetry/github-actions.ndjson | python -c 'import json,sys; s=sys.stdin.read().strip(); print(json.loads(s)["checked_at"] if s else "")')
-          if [ -n "$LAST" ]; then
-            python scripts/export-history.py --source github-actions \
-              --since "$LAST" > /tmp/new.ndjson
-            # --since is inclusive, so the boundary row is already stored.
-            grep -vxF -f telemetry/github-actions.ndjson /tmp/new.ndjson \
-              >> telemetry/github-actions.ndjson || true
-          else
-            python scripts/export-history.py --source github-actions \
-              >> telemetry/github-actions.ndjson
-          fi
+          # --since is inclusive, so the boundary row is already stored. With an
+          # empty pattern file grep matches nothing and -v lets every line
+          # through, which is exactly right on the first run.
+          grep -vxF -f telemetry/github-actions.ndjson /tmp/new.ndjson \
+            >> telemetry/github-actions.ndjson || true
 
           echo "  filas acumuladas: $(wc -l < telemetry/github-actions.ndjson)"
           # -f because telemetry/ is in .gitignore, and the runner carries that

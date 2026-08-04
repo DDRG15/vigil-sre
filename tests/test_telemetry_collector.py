@@ -250,7 +250,16 @@ def test_the_collector_is_hourly_not_faster() -> None:
     needs. Doubling the rate buys nothing and costs twice the runner time."""
     spec = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     crons = [s["cron"] for s in spec[True]["schedule"]]
-    assert crons == ["0 * * * *"], f"expected hourly, found {crons}"
+    assert len(crons) == 1, f"expected one schedule, found {crons}"
+
+    # The cadence is the claim here, not the minute -- which minute it lands on
+    # is a separate concern with its own test. Pinning the literal string made
+    # this fail when the minute moved off the congested :00 slot, reporting a
+    # cadence change that had not happened.
+    minute, hour, dom, month, dow = crons[0].split()
+    assert minute.isdigit(), f"{crons[0]!r} does not run once per hour"
+    assert (hour, dom, month, dow) == ("*", "*", "*", "*"), (
+        f"{crons[0]!r} is not a plain hourly schedule")
 
 
 # =============================================================================
@@ -595,6 +604,136 @@ def test_the_runner_can_actually_commit_the_file_it_collects(
         capture_output=True, text=True).stdout.split()
     assert staged == [target.group(1)], (
         f"expected exactly the data file staged, got {staged}")
+
+
+def test_checking_out_the_data_branch_deletes_the_source_tree(
+        tmp_path: Path) -> None:
+    """The mechanism behind runs #4-#9, reproduced with real git.
+
+    An orphan branch holds one file. `git checkout` makes the working tree
+    match the branch, so switching to it REMOVES everything the branch does
+    not contain -- scripts/, main.py, all of it. Nothing about the command
+    says so, and the workflow read as if the source tree were still there.
+
+    Run #3 passed because the branch did not exist yet and took the
+    `--orphan` path, which creates it from the current tree. Every run after
+    it found the branch, checked it out, and died on a missing script. A bug
+    that only appears from the second run on is invisible to a first run.
+    """
+    repo = tmp_path / "runner"
+    repo.mkdir()
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], cwd=str(repo), capture_output=True, text=True,
+            check=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.invalid")
+    git("config", "user.name", "t")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "export-history.py").write_text("print(1)\n",
+                                                        encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "source")
+
+    # The data branch, exactly as the workflow builds it.
+    git("checkout", "-q", "--orphan", "data")
+    git("rm", "-rq", "--cached", ".")
+    (repo / "telemetry").mkdir()
+    (repo / "telemetry" / "rows.ndjson").write_text('{"a": 1}\n',
+                                                     encoding="utf-8")
+    git("add", "-f", "telemetry/rows.ndjson")
+    git("commit", "-qm", "data")
+
+    # -f because `git rm --cached` left the source files UNTRACKED in the
+    # working tree, and git refuses to overwrite an untracked file when
+    # switching to a branch that tracks one. The runner never hits this -- it
+    # takes the orphan path once and never switches back -- so it is setup
+    # noise here, not behaviour under test.
+    git("checkout", "-q", "-f", "main")
+
+    script = repo / "scripts" / "export-history.py"
+    assert script.exists(), "precondicion: el script existe en main"
+
+    git("checkout", "-q", "data")
+
+    assert not script.exists(), (
+        "git checkout of a one-file branch no longer removes the source tree "
+        "— if that is genuinely true, the ordering guard below is obsolete; "
+        "verify before deleting it"
+    )
+
+
+def test_the_export_runs_before_any_branch_switch() -> None:
+    """The fix, as an assertion on order rather than on presence.
+
+    Both commands can be in the file and the step still fails: what broke was
+    the sequence. So this compares positions, and treats the whole class --
+    anything that needs the source tree must precede any checkout.
+    """
+    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
+
+    def first_command(pattern: str) -> tuple[int, str] | None:
+        """Line number of the first EXECUTED line matching pattern.
+
+        Comments are skipped deliberately. An earlier version of this test
+        searched the whole file for "scripts/export-history.py" and matched the
+        comment block explaining the ordering, which sits above the checkout —
+        so it compared a comment's position and passed on the broken order.
+        """
+        for number, raw in enumerate(lines, start=1):
+            text = raw.strip()
+            if not text or text.startswith("#"):
+                continue
+            if re.search(pattern, text):
+                return number, text
+        return None
+
+    export = first_command(r"^python\s+scripts/export-history\.py")
+    assert export, "the collector no longer runs the export script"
+
+    checkout = first_command(r"^git\s+checkout\b")
+    assert checkout, "the collector no longer switches to the data branch"
+
+    assert export[0] < checkout[0], (
+        f"line {export[0]} `{export[1]}` runs after line {checkout[0]} "
+        f"`{checkout[1]}`. Checking out the data branch deletes scripts/ from "
+        "the working tree, so the export has to come first."
+    )
+
+
+def test_the_last_row_is_read_without_checking_out() -> None:
+    """Reading the stored tail is what forced the bad ordering.
+
+    The obvious way to find the last stored row is to check out the branch and
+    `tail` the file — and that checkout is the deletion. `git show ref:path`
+    reads the same bytes out of the commit with the working tree untouched,
+    which is what lets the export stay first.
+    """
+    body = WORKFLOW.read_text(encoding="utf-8")
+    assert re.search(r'git show "origin/\$DATA_BRANCH:', body), (
+        "the collector reads the stored rows some other way — if it tails the "
+        "checked-out file again, the ordering fix is undone"
+    )
+
+
+def test_the_schedule_avoids_the_busiest_minute() -> None:
+    """:00 is where every hourly cron in the world lands.
+
+    Measured on the first eight hours at "0 * * * *": not one run started on
+    the hour, the median delay was ~50 minutes, and one hour was skipped
+    outright. A delay costs nothing here; a skip costs a sample.
+    """
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    # `on:` is the YAML 1.1 boolean True, which is why this is not doc["on"].
+    crons = [entry["cron"] for entry in doc[True]["schedule"]]
+    assert crons, "the collector is no longer scheduled"
+    for cron in crons:
+        minute = cron.split()[0]
+        assert minute not in ("0", "00", "*"), (
+            f"cron {cron!r} runs on the congested :00 slot"
+        )
 
 
 def test_the_collector_never_stages_a_wildcard() -> None:
