@@ -31,7 +31,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
@@ -1952,7 +1952,11 @@ def test_report_flag_end_to_end_exits_zero_without_probing(tmp_path: Path) -> No
     the flag and attempted a normal run against a nonexistent target."""
     db_path = tmp_path / "history.db"
     rec = main.HistoryRecorder(db_path)
-    checked_at = "2026-07-30T00:00:00Z"
+    # Relativo: el subproceso corre --report con el reloj real, y una fecha
+    # fija termina fuera de la ventana de 30 dias al mes siguiente. La tabla
+    # sale vacia y el test culpa al reporte de no leer sus propias filas.
+    checked_at = (datetime.now(timezone.utc) - timedelta(hours=1)
+                  ).strftime("%Y-%m-%dT%H:%M:%SZ")
     asyncio.run(rec.record_run(checked_at, [
         main.CheckOutcome(
             url=TARGET_URL, status="UP", checked_at=checked_at,

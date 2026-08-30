@@ -48,7 +48,20 @@ from diagnostics import ProbePhases
 from history import CheckOutcome, HistoryRecorder
 
 URL = "https://example.com"
-NOW = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+# Relativo a ahora, no una fecha escrita a mano.
+#
+# Era datetime(2026, 7, 30): correcto el dia que se escribio y falso un mes
+# despues. _seed_history promete filas "inside every window" y las ventanas se
+# miden contra el reloj real, asi que una fecha fija sale de la ventana sola y
+# tres tests se ponen rojos sin que nadie toque el codigo. Un test cuya
+# correccion depende del dia en que corre no verifica el codigo: verifica el
+# calendario.
+# microsecond=0 no es cosmetico: _stamp() formatea a segundos enteros, asi que
+# un NOW con microsegundos se redondea al escribirlo y vuelve distinto al
+# parsearlo. Las restas de stale_seconds dejan de dar 3600.0 exacto y pasan a
+# dar 3600.000123 -- un test de igualdad que falla por el reloj, no por el
+# codigo.
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _stamp(dt: datetime) -> str:

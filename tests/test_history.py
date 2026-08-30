@@ -172,8 +172,14 @@ async def test_prune_deletes_rows_older_than_retention(tmp_path: Path) -> None:
     await rec.record_run("2020-01-01T00:00:00Z", [
         CheckOutcome(url=URL, status="UP", checked_at="2020-01-01T00:00:00Z", phases=_phases())
     ])
-    await rec.record_run("2026-07-25T07:00:00Z", [
-        CheckOutcome(url=URL, status="UP", checked_at="2026-07-25T07:00:00Z", phases=_phases())
+    # Un dia atras, calculado, no escrito. La fila tiene que caer DENTRO de
+    # la retencion de 30 dias; con una fecha fija eso deja de ser cierto el dia
+    # 31 y el test falla acusando al prune de borrar de mas cuando el prune
+    # esta haciendo exactamente su trabajo.
+    reciente = (datetime.now(timezone.utc) - timedelta(days=1)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await rec.record_run(reciente, [
+        CheckOutcome(url=URL, status="UP", checked_at=reciente, phases=_phases())
     ])
 
     await rec.prune()
@@ -181,7 +187,7 @@ async def test_prune_deletes_rows_older_than_retention(tmp_path: Path) -> None:
     con = sqlite3.connect(db_path)
     remaining = con.execute("SELECT run_started_at FROM probe_results").fetchall()
     con.close()
-    assert remaining == [("2026-07-25T07:00:00Z",)]
+    assert remaining == [(reciente,)]
 
 
 async def test_prune_cascades_to_findings(tmp_path: Path) -> None:
