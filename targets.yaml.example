@@ -40,6 +40,26 @@
 #     timeout_s: 10               # default 5   — for endpoints with a slower SLA
 #     degraded_ttfb_ms: 3000      # default 1500 — for a legitimately slow report
 #     degraded_rtt_ms: 250        # default 100  — for a legitimately distant target
+#     degraded_backend_ms: 2000   # default 500  — for a backend that is normally slow
+# =============================================================================
+#
+# On degraded_backend_ms, with the numbers that produced it. Two weeks of
+# hourly probing (920 measurements, 3-17 August 2026) put the global 500 ms
+# threshold below cloudflare.com's MEDIAN backend time of 587 ms:
+#
+#   target            samples   fires at 500 ms   at 2000 ms
+#   google.com            226              0 %          0 %
+#   cloudflare.com        229           63.8 %        2.6 %
+#
+# A threshold below a target's median is not a threshold. It does not measure
+# an anomaly — it measures normal operation, and an alert that sounds two runs
+# out of three stops being read. The same 500 ms is correct for google.com,
+# where it fires on nothing.
+#
+# Set this from measurement, not from taste: probe for a while, look at where
+# the target actually lives, and pick a number above its p95. Raising it until
+# the noise stops is how you end up with a threshold that only fires on a
+# total outage, which the DOWN state already covers.
 # =============================================================================
 
 # Every entry below sets degraded_rtt_ms: 400 instead of inheriting the 100 ms
@@ -63,6 +83,11 @@ targets:
     degraded_rtt_ms: 400
   - url: https://www.cloudflare.com
     degraded_rtt_ms: 400
+    # Measured, not guessed: 587 ms median backend, 1529 ms p95, over 229
+    # probes. At the 500 ms default this target reported DEGRADED two runs out
+    # of three; at 2000 it fires on 2.6 % — and still fires on its 4315 ms p99,
+    # which is what an actual anomaly looks like here.
+    degraded_backend_ms: 2000
 
   # ── httpbin.org test suite ────────────────────────────────────────────────
   - url: https://httpbin.org/status/200   # always 200 — confirms the probe path works

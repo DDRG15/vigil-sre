@@ -63,6 +63,13 @@ targets:
     degraded_rtt_ms: 400
   - url: https://www.cloudflare.com
     degraded_rtt_ms: 400
+    # 2000, no el global de 500. Medido sobre 229 sondeos del 3 al 17 de agosto
+    # de 2026 desde los runners de GitHub: a 500 ms la regla dispara el 63.8%
+    # de las veces, a 2000 el 2.6%. La mediana de backend de este target es
+    # 587 ms, o sea que el umbral global quedaba por debajo de su mediana y
+    # marcaba su funcionamiento normal como anomalia. El mismo 500 sigue siendo
+    # correcto para google.com, donde no dispara nunca.
+    degraded_backend_ms: 2000
 
   # ── httpbin.org test suite ────────────────────────────────────────────────
   - url: https://httpbin.org/status/200   # always 200 — confirms the probe path works

@@ -251,3 +251,31 @@ def test_the_panels_declare_their_time_column() -> None:
         t = panel["targets"][0]
         if t["queryType"] == "time series":
             assert t["timeColumns"] == ["time"], f"{name} panel {panel['id']}"
+
+
+def test_the_dashboards_describe_the_targets_actually_being_probed() -> None:
+    """targets.yaml dejó de ser la lista viva cuando el dashboard tomó dueñez.
+
+    Desde la fase 23 el monitor lee data/targets.json y el YAML quedó como
+    semilla. Los dashboards se generan desde el YAML —correcto para la data ya
+    recolectada, porque los runners parten de un checkout limpio sin store— pero
+    si el store local diverge, los gráficos nombran series de un sistema
+    distinto al que está corriendo acá.
+
+    No se puede afirmar en CI: data/ está gitignoreada y allá no existe. Este
+    test le habla a la máquina que sí tiene store.
+    """
+    store_path = ROOT / "data" / "targets.json"
+    if not store_path.exists():
+        pytest.skip("sin store local — el YAML es la lista viva")
+
+    import targetstore
+    store = {e["url"] for e in (targetstore.read_store(store_path) or [])}
+    doc = yaml.safe_load((ROOT / "targets.yaml").read_text(encoding="utf-8"))
+    seed = {e["url"] if isinstance(e, dict) else e for e in doc["targets"]}
+
+    assert store == seed, (
+        "el store y targets.yaml difieren, así que los dashboards describen "
+        f"otra lista que la sondeada.\n  solo en el store: {sorted(store - seed)}"
+        f"\n  solo en el YAML : {sorted(seed - store)}\n"
+        "Sincronizá los dos o generá los dashboards desde el store.")

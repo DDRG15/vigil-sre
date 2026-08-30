@@ -732,8 +732,17 @@ not wrong in the abstract; it is wrong for one target, and the per-target
 override that would fix it does not exist yet (`degraded_ttfb_ms` and
 `degraded_rtt_ms` do; a backend equivalent does not).
 
-That is a real gap, found by measuring rather than by reasoning, and it is the
-next thing to build.
+That gap is now closed. `degraded_backend_ms` is a per-target override in the
+same family as `degraded_ttfb_ms` and `degraded_rtt_ms`, and cloudflare.com
+carries 2000 — chosen because it fires on 2.6 % of its probes while still
+firing on its 4315 ms p99, which is what an anomaly looks like on that path.
+Raising a threshold until the noise stops is not calibration; it is a mute with
+a different name, and the test suite asserts the difference.
+
+The number came from measurement, and the shape of the finding is worth more
+than the number: **found by collecting, not by reasoning about it.** Two weeks
+of hourly probes said something that no amount of reading `diagnostics.py`
+would have.
 
 ### One limitation worth knowing before you plan around it
 

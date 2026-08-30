@@ -567,3 +567,122 @@ def test_is_cert_renewed(days, last_seen, renewed) -> None:
     the one unambiguous replacement signal — and the only one available when
     the new certificate is itself under CERT_WARN_DAYS."""
     assert is_cert_renewed(days, last_seen) is renewed
+
+
+# =============================================================================
+# Umbral de backend por target (fase 27) — calibrado con datos, no a ojo
+# =============================================================================
+
+def _backend_phases(ms: float) -> ProbePhases:
+    return ProbePhases(
+        url="https://www.cloudflare.com", http_status=200,
+        rtt_ms=42.0, ttfb_ms=42.0 + ms, server_processing_ms=ms,
+        transfer_ms=5.0, body_bytes=100_000,
+    )
+
+
+def test_the_global_backend_threshold_still_applies_by_default() -> None:
+    """Sin override, el comportamiento no cambia. Un default que se mueve al
+    agregar una perilla reclasifica todos los targets que nadie tocó."""
+    findings = analyze(_backend_phases(600.0))
+    assert CODE_SLOW_BACKEND in {f.code for f in findings}
+
+
+def test_a_per_target_backend_threshold_silences_normal_operation() -> None:
+    """El caso medido: 229 sondeos a cloudflare.com entre el 3 y el 17 de
+    agosto de 2026, mediana de backend 587 ms.
+
+    Con el global de 500 la regla dispara en el 63.8% de los sondeos; con 2000,
+    en el 2.6%. Un umbral por debajo de la mediana de un target no mide una
+    anomalía: mide su funcionamiento normal, y una alerta que suena dos de cada
+    tres veces deja de leerse.
+    """
+    mediana_real = 587.0
+    assert CODE_SLOW_BACKEND in {
+        f.code for f in analyze(_backend_phases(mediana_real))}, (
+        "la mediana medida no dispara con el default — cambió TTFB_BACKEND_SLACK_MS "
+        "y este test ya no describe el problema que motivó la perilla")
+    assert CODE_SLOW_BACKEND not in {
+        f.code for f in analyze(_backend_phases(mediana_real),
+                                backend_slack_ms=2000.0)}
+
+
+def test_the_per_target_threshold_still_fires_on_a_real_anomaly() -> None:
+    """Subir el umbral no puede ser apagar la regla.
+
+    El p99 medido de cloudflare fue 4315 ms — eso sí es una anomalía y tiene
+    que seguir alertando con el umbral nuevo, o la calibración se convirtió en
+    un mute con otro nombre.
+    """
+    p99_real = 4315.0
+    assert CODE_SLOW_BACKEND in {
+        f.code for f in analyze(_backend_phases(p99_real),
+                                backend_slack_ms=2000.0)}
+
+
+def test_the_backend_threshold_is_named_in_the_evidence() -> None:
+    """La evidencia tiene que citar el umbral que se aplicó, no el global.
+
+    Un hallazgo que dice 'threshold 500' mientras el target corre con 2000
+    manda a leer la constante equivocada, que es el tipo de pista falsa que
+    cuesta una hora a las tres de la mañana.
+    """
+    findings = analyze(_backend_phases(2500.0), backend_slack_ms=2000.0)
+    slow = [f for f in findings if f.code == CODE_SLOW_BACKEND]
+    assert slow, "no disparó, no hay evidencia que revisar"
+    assert "2000" in slow[0].evidence
+    assert "500)" not in slow[0].evidence
+
+
+@pytest.mark.asyncio
+async def test_check_url_actually_applies_the_targets_backend_threshold(
+        tmp_path, monkeypatch) -> None:
+    """Que el campo LLEGUE a check_url no prueba que check_url lo USE.
+
+    El test de integración de targetstore verifica lo primero: recorre
+    ALLOWED_KEYS y afirma que cada campo aparece en los kwargs de check_url.
+    Pasa igual si check_url recibe el umbral y despues llama a analyze() sin
+    pasarlo — y una mutacion que borro exactamente esa linea dejo la suite
+    entera en verde.
+
+    Es la misma forma en que la fase 25 quedo completamente inerte con 491
+    tests pasando: todo el cableado presente menos el ultimo tramo. Asi que
+    esto mira el resultado, no el camino: los MISMOS phases producen
+    SLOW_BACKEND con el umbral por defecto y no lo producen con el del target.
+    """
+    import main
+
+    phases = ProbePhases(
+        url="https://www.cloudflare.com", http_status=200,
+        rtt_ms=42.0, ttfb_ms=629.0, server_processing_ms=587.0,
+        transfer_ms=5.0, body_bytes=100_000,
+    )
+
+    async def _fake_probe(*args, **kwargs):
+        return phases
+
+    monkeypatch.setattr(main, "_probe_with_backoff", _fake_probe)
+    monkeypatch.setattr(main, "sample_connection",
+                        lambda *a, **k: _none_coro())
+
+    async def _run(umbral):
+        state = main.StateManager(tmp_path / f"state-{umbral}.json")
+        outcome = await main.check_url(
+            session=None, url="https://www.cloudflare.com", state=state,
+            degraded_backend_ms=umbral,
+        )
+        return {f.code for f in (outcome.findings or [])}
+
+    con_default = await _run(None)
+    con_override = await _run(2000.0)
+
+    assert CODE_SLOW_BACKEND in con_default, (
+        "587 ms no dispara con el umbral global — cambio "
+        "TTFB_BACKEND_SLACK_MS y este test dejo de describir el problema")
+    assert CODE_SLOW_BACKEND not in con_override, (
+        "check_url recibio degraded_backend_ms=2000 y aun asi emitio "
+        "SLOW_BACKEND: el umbral llega al parametro pero no a analyze()")
+
+
+async def _none_coro():
+    return None

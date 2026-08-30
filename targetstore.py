@@ -76,7 +76,8 @@ def _resolve(path: Path | None) -> Path:
 #: believes is in effect.
 ALLOWED_KEYS: frozenset[str] = frozenset({
     "url", "expect_substring", "expected_status", "timeout_s",
-    "degraded_ttfb_ms", "degraded_rtt_ms", "remind", "maintenance",
+    "degraded_ttfb_ms", "degraded_rtt_ms", "degraded_backend_ms",
+    "remind", "maintenance",
 })
 
 #: (minimum, maximum) per numeric field. The same bounds load_targets already
@@ -88,6 +89,7 @@ NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     "timeout_s"       : (0.1, 300),
     "degraded_ttfb_ms": (1, 600_000),
     "degraded_rtt_ms" : (1, 600_000),
+    "degraded_backend_ms": (1, 600_000),
 }
 
 #: The ${VAR_NAME} reference syntax, defined HERE and imported by main.py

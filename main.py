@@ -67,6 +67,7 @@ from diagnostics import (
     CERT_CRIT_DAYS,
     DEGRADED_TTFB_MS,
     RTT_HIGH_MS,
+    TTFB_BACKEND_SLACK_MS,
     ConnectionSample,
     ProbePhases,
     analyze,
@@ -238,6 +239,11 @@ class Target:
     timeout_s               : float | None = None
     degraded_ttfb_ms        : float | None = None
     degraded_rtt_ms         : float | None = None
+    #: Per-target backend threshold. El global de 500 ms disparaba en el 63.8%
+    #: de los sondeos a cloudflare.com y en el 0% de los de google.com, medido
+    #: sobre 920 muestras: un umbral por debajo de la mediana de un target
+    #: (587 ms) no marca una anomalia, marca su funcionamiento normal.
+    degraded_backend_ms     : float | None = None
     #: Opt-in: re-alert on a schedule while this target stays DOWN. Off by
     #: default, and deliberately so — a target you added to watch something
     #: break (a test URL, a known-bad endpoint) would otherwise nag forever.
@@ -436,6 +442,7 @@ def load_targets(
                 timeout_s               =e.get("timeout_s"),
                 degraded_ttfb_ms        =e.get("degraded_ttfb_ms"),
                 degraded_rtt_ms         =e.get("degraded_rtt_ms"),
+                degraded_backend_ms     =e.get("degraded_backend_ms"),
                 remind                  =e.get("remind", False),
                 maintenance             =e.get("maintenance"),
             )
@@ -479,6 +486,10 @@ def load_targets(
                 entry, "degraded_rtt_ms", path, numeric_types=(int, float),
                 minimum=0.1,
             )
+            degraded_backend_ms = _validated_numeric_field(
+                entry, "degraded_backend_ms", path, numeric_types=(int, float),
+                minimum=0.1,
+            )
             if timeout_s is not None:
                 # Not an abort: a legitimately slow endpoint is a valid use
                 # case for a longer timeout_s, but the operator needs to see
@@ -504,6 +515,7 @@ def load_targets(
                 timeout_s=timeout_s,
                 degraded_ttfb_ms=degraded_ttfb_ms,
                 degraded_rtt_ms=degraded_rtt_ms,
+                degraded_backend_ms=degraded_backend_ms,
             ))
         else:
             logger.critical(
@@ -1438,6 +1450,7 @@ async def check_url(
     timeout_s               : float | None = None,
     degraded_ttfb_ms        : float | None = None,
     degraded_rtt_ms         : float | None = None,
+    degraded_backend_ms     : float | None = None,
     expect_substring_display: str   | None = None,
     remind                  : bool  = False,
     maintenance             : list[dict] | None = None,
@@ -1495,6 +1508,10 @@ async def check_url(
     effective_timeout_s = timeout_s if timeout_s is not None else REQUEST_TIMEOUT_S
     effective_degraded_ttfb_ms = degraded_ttfb_ms if degraded_ttfb_ms is not None else DEGRADED_TTFB_MS
     effective_rtt_high_ms = degraded_rtt_ms if degraded_rtt_ms is not None else RTT_HIGH_MS
+    effective_backend_slack_ms = (
+        degraded_backend_ms if degraded_backend_ms is not None
+        else TTFB_BACKEND_SLACK_MS
+    )
 
     # Sample the path out-of-band before the probe: a raw TCP connect for RTT
     # and (for HTTPS) a controlled TLS handshake for TLS time and ALPN/h2.
@@ -1516,7 +1533,11 @@ async def check_url(
         )
         checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        findings = analyze(phases, rtt_high_ms=effective_rtt_high_ms)
+        findings = analyze(
+            phases,
+            rtt_high_ms=effective_rtt_high_ms,
+            backend_slack_ms=effective_backend_slack_ms,
+        )
         _log_diagnostics(url, phases, findings)
         diagnostics = phases_to_dict(phases, findings)
 
@@ -1816,6 +1837,7 @@ async def run_health_checks(
                 timeout_s=t.timeout_s,
                 degraded_ttfb_ms=t.degraded_ttfb_ms,
                 degraded_rtt_ms=t.degraded_rtt_ms,
+                degraded_backend_ms=t.degraded_backend_ms,
                 remind=t.remind,
                 maintenance=t.maintenance,
                 expect_substring_display=t.expect_substring_display,

@@ -424,7 +424,8 @@ def default_window_ceiling_bps(phases: ProbePhases) -> float | None:
 # Rule engine
 # ---------------------------------------------------------------------------
 
-def analyze(phases: ProbePhases, *, rtt_high_ms: float = RTT_HIGH_MS) -> list[Diagnosis]:
+def analyze(phases: ProbePhases, *, rtt_high_ms: float = RTT_HIGH_MS,
+            backend_slack_ms: float = TTFB_BACKEND_SLACK_MS) -> list[Diagnosis]:
     """
     Run every diagnostic rule against *phases* and return the findings.
 
@@ -440,6 +441,16 @@ def analyze(phases: ProbePhases, *, rtt_high_ms: float = RTT_HIGH_MS) -> list[Di
                      chronic false HIGH_RTT_NEEDS_EDGE findings for a target
                      that is legitimately far away; a chronically-false
                      finding gets ignored, which defeats the point of having it.
+        backend_slack_ms:
+                     Per-target override of TTFB_BACKEND_SLACK_MS (rule 4).
+                     Two weeks of hourly probing made the case: at the global
+                     500 ms, cloudflare.com fired on 63.8% of probes while
+                     google.com fired on 0%. Its median backend time is 587 ms,
+                     so the threshold sat BELOW the target's median -- which is
+                     not a threshold but a permanent alarm, measuring normal
+                     operation rather than an anomaly. The number is right for
+                     one target and wrong for the other, and that is what a
+                     per-target override is for.
     """
     findings: list[Diagnosis] = []
 
@@ -495,14 +506,14 @@ def analyze(phases: ProbePhases, *, rtt_high_ms: float = RTT_HIGH_MS) -> list[Di
     # --- Rule 4: slow backend (network exonerated) --------------------------
     if (
         phases.server_processing_ms is not None
-        and phases.server_processing_ms > TTFB_BACKEND_SLACK_MS
+        and phases.server_processing_ms > backend_slack_ms
     ):
         findings.append(Diagnosis(
             code=CODE_SLOW_BACKEND,
             severity=SEVERITY_WARN,
             evidence=(
                 f"server_processing_ms={phases.server_processing_ms:.0f} "
-                f"(TTFB minus RTT, threshold {TTFB_BACKEND_SLACK_MS:.0f})"
+                f"(TTFB minus RTT, threshold {backend_slack_ms:.0f})"
             ),
             recommendation=(
                 "The network already delivered the request — the server sat "

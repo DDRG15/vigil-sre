@@ -47,6 +47,7 @@ FULL_ENTRY: dict = {
     "timeout_s"       : 12.5,
     "degraded_ttfb_ms": 3210.0,
     "degraded_rtt_ms" : 456.0,
+    "degraded_backend_ms": 1789.0,
     "remind"          : True,
     "maintenance"     : [{"days": [0, 6], "start": "02:00", "end": "04:00"}],
 }
@@ -59,6 +60,7 @@ FIELD_TO_KWARG: dict[str, str] = {
     "timeout_s"       : "timeout_s",
     "degraded_ttfb_ms": "degraded_ttfb_ms",
     "degraded_rtt_ms" : "degraded_rtt_ms",
+    "degraded_backend_ms": "degraded_backend_ms",
     "remind"          : "remind",
     "maintenance"     : "maintenance",
 }
