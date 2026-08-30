@@ -213,14 +213,19 @@ infrastructure.
 ├── targets.yaml         URL configuration — the hand-edited seed
 ├── targets.yaml.example Documented template with every per-target field
 ├── scripts/             init-watchdog.sh — provisions the self-hosted watchdog
+│                        export/import-history.py — NDJSON round trip for collection
+│                        build-grafana-dashboards.py — generates the dashboards below
+├── grafana/             Provisioned datasource + three generated dashboards. The
+│                        JSON is built from targets.yaml, never hand-edited
 ├── Dockerfile           Multi-stage, non-root, health-checked production image
 ├── docker-compose.yml   Standard deployment manifest
 ├── .dockerignore        Build context exclusion list — image contains no dev artifacts
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               498-test suite: probes, state, alerts, diagnostics, history,
-│                        dashboard, target store, reminders, trend, maintenance, packaging
+├── tests/               576-test suite: probes, state, alerts, diagnostics, history,
+│                        dashboard, target store, reminders, trend, maintenance,
+│                        packaging, telemetry collector, Grafana dashboards
 ├── .github/             CI: pytest, then docker build + run a real health-check cycle
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
@@ -667,6 +672,77 @@ an API deriving the same number from the same rows and printing different answer
 is the kind of bug where both sides pass their own tests.
 
 ---
+
+## Grafana: reading two weeks of collected history
+
+The built-in dashboard answers "what is happening now". This answers "what has
+been happening", which is a different question and needs a different tool —
+fourteen days of phase measurements do not fit in a status page.
+
+```bash
+# 1. Rebuild a database from the collected NDJSON
+python scripts/import-history.py telemetry/github-actions.ndjson --db collected.db
+
+# 2. Start Grafana (its own profile — it does not come up with the monitor)
+docker compose --profile analisis up -d grafana
+
+# 3. http://127.0.0.1:3000 — three dashboards, already provisioned
+```
+
+Grafana sits behind a compose profile because it is an analysis tool, not part
+of the monitor. A service that starts alongside everything else and nobody
+opens is memory spent and one more surface exposed.
+
+### The dashboards are generated, not written
+
+`scripts/build-grafana-dashboards.py` reads `targets.yaml` and emits the JSON.
+A Grafana panel names its series in SQL, so with targets typed into the queries
+by hand, adding a target to the monitor leaves it invisible in the graphs — and
+nothing fails. The panel keeps drawing the old series and looks perfectly
+healthy. It is the same desynchronisation that left the Dockerfile copying
+three of six modules for five phases: **a file that should have changed and did
+not change appears in no diff.**
+
+CI runs `--check`, so adding a target without regenerating fails in that same
+commit rather than months later.
+
+The threshold lines the panels draw are asserted against the constants
+`diagnostics.py` actually applies. A dashboard drawing 900 ms while the code
+alerts at 500 ms does not look wrong — it looks like a measurement, and someone
+reads "this is below the line" and concludes it will not alert.
+
+### What the first collection run found
+
+Two weeks of hourly probing from GitHub's runners — 920 measurements, 231 of
+239 runs successful — produced one clear result:
+
+| target | samples | **500 ms (current)** | 1000 ms | 2000 ms |
+|---|---|---|---|---|
+| google.com | 226 | **0 %** | 0 % | 0 % |
+| cloudflare.com | 229 | **63.8 %** | 17.9 % | 2.6 % |
+
+`TTFB_BACKEND_SLACK_MS = 500` fires on 63.8 % of probes to cloudflare.com,
+which is why that target reported DEGRADED two out of every three runs. Its
+median backend time is 587 ms.
+
+**A threshold set below a target's median is not a threshold. It is a permanent
+alarm** — it does not measure an anomaly, it measures normal operation. The
+same 500 ms is correct for google.com, where it fires on nothing. The number is
+not wrong in the abstract; it is wrong for one target, and the per-target
+override that would fix it does not exist yet (`degraded_ttfb_ms` and
+`degraded_rtt_ms` do; a backend equivalent does not).
+
+That is a real gap, found by measuring rather than by reasoning, and it is the
+next thing to build.
+
+### One limitation worth knowing before you plan around it
+
+The SQLite datasource reads a file on the Grafana server's disk. Grafana Cloud
+runs on Grafana's infrastructure, so it cannot reach a database on your laptop
+— these dashboards import into Cloud fine, but they will find no data there.
+Using Cloud means first putting the rows somewhere it can reach (a managed
+Postgres, or pushing metrics to its Prometheus), which is a larger change than
+swapping a datasource.
 
 ## Who watches the watchman
 

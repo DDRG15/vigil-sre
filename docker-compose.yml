@@ -104,3 +104,42 @@ services:
       # service to publish.
       - "127.0.0.1:8000:8000"
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Grafana — visualización de la telemetría recolectada.
+  #
+  # Está en el perfil "analisis" y NO arranca con `docker compose up`: sirve
+  # para mirar un período de recolección ya cerrado, no para monitorear. Un
+  # servicio que se levanta con todo lo demás y nadie mira es consumo de
+  # memoria y una superficie más.
+  #
+  #   docker compose --profile analisis up -d grafana
+  #   http://127.0.0.1:3000        usuario admin, contraseña admin
+  #
+  # Necesita collected.db, que se arma con:
+  #   python scripts/import-history.py telemetry/github-actions.ndjson --db collected.db
+  # ---------------------------------------------------------------------------
+  grafana:
+    profiles: ["analisis"]
+    image: grafana/grafana:11.6.0
+    environment:
+      # SQLite no viene en el core de Grafana. El plugin lo agrega y se instala
+      # al arrancar; requiere red la primera vez.
+      - GF_INSTALL_PLUGINS=frser-sqlite-datasource
+      # Sin login para una herramienta de análisis local en loopback. Publicar
+      # este puerto con esto activo entrega la instancia a cualquiera que llegue
+      # — por eso el puerto está atado a 127.0.0.1 abajo y no debe cambiarse
+      # sin sacar estas dos líneas primero.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # :ro — Grafana analiza esta base, no la escribe. Un bug de plugin que
+      # intente escribir falla ruidosamente en vez de corromper el dataset que
+      # costó dos semanas juntar.
+      - ./collected.db:/data/collected.db:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped

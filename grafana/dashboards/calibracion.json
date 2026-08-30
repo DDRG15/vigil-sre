@@ -1,0 +1,243 @@
+{
+  "uid": "vigil-calibracion",
+  "title": "vigil-sre · Calibración de umbrales",
+  "description": "A qué porcentaje del tiempo dispararía cada umbral candidato, medido sobre 920 sondeos reales del 3 al 17 de agosto de 2026.",
+  "tags": [
+    "vigil-sre"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "",
+  "time": {
+    "from": "2026-08-03T17:00:00.000Z",
+    "to": "2026-08-17T16:00:00.000Z"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Backend: % de sondeos que superarían cada umbral",
+      "description": "Cada celda es la tasa de disparo si ese fuera el umbral. La columna '500 ms (hoy)' es el estado actual: en cloudflare.com dispara el 63.8% de las veces, que es por qué aparece DEGRADED dos de cada tres sondeos.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  url AS target,\n  COUNT(*) AS muestras,\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 500 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"500 ms (hoy)\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 750 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"750 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 1000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"1000 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 1500 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"1500 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 2000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"2000 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 3000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"3000 ms\"\nFROM probe_results\nWHERE server_processing_ms IS NOT NULL\nGROUP BY url ORDER BY url",
+          "rawQueryText": "SELECT\n  url AS target,\n  COUNT(*) AS muestras,\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 500 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"500 ms (hoy)\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 750 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"750 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 1000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"1000 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 1500 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"1500 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 2000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"2000 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 3000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"3000 ms\"\nFROM probe_results\nWHERE server_processing_ms IS NOT NULL\nGROUP BY url ORDER BY url",
+          "queryType": "table",
+          "timeColumns": [],
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "cellOptions": {
+              "type": "color-background"
+            }
+          },
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Mediana del backend contra el umbral vigente",
+      "description": "Margen positivo significa que el umbral está POR DEBAJO de la mediana del target: no mide una anomalía, mide el funcionamiento normal. Un umbral así no se puede silenciar sin apagar la regla entera.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "WITH r AS (\n  SELECT url, server_processing_ms AS v,\n         CUME_DIST() OVER (PARTITION BY url ORDER BY server_processing_ms) AS cd\n  FROM probe_results WHERE server_processing_ms IS NOT NULL\n)\nSELECT url AS target,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END)) AS p50,\n  500 AS umbral_actual,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END))\n    - 500 AS margen\nFROM r GROUP BY url ORDER BY margen DESC",
+          "rawQueryText": "WITH r AS (\n  SELECT url, server_processing_ms AS v,\n         CUME_DIST() OVER (PARTITION BY url ORDER BY server_processing_ms) AS cd\n  FROM probe_results WHERE server_processing_ms IS NOT NULL\n)\nSELECT url AS target,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END)) AS p50,\n  500 AS umbral_actual,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END))\n    - 500 AS margen\nFROM r GROUP BY url ORDER BY margen DESC",
+          "queryType": "table",
+          "timeColumns": [],
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "margen"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 0
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {}
+    },
+    {
+      "id": 3,
+      "type": "histogram",
+      "title": "Distribución del tiempo de backend",
+      "description": "Dónde vive cada target. Si la masa de un target está a la derecha del umbral, el umbral no le corresponde.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN server_processing_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN server_processing_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN server_processing_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN server_processing_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN server_processing_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN server_processing_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN server_processing_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN server_processing_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Backend en el tiempo, con el umbral vigente marcado",
+      "description": "La línea roja es TTFB_BACKEND_SLACK_MS = 500 de diagnostics.py. Todo lo que queda encima produjo un SLOW_BACKEND.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN server_processing_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN server_processing_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN server_processing_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN server_processing_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN server_processing_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN server_processing_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN server_processing_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN server_processing_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 500.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ]
+}

@@ -16,6 +16,9 @@ history.db
 # copia que el recolector clona y vuelve a subir, mezclando mediciones de esta
 # red con las de los runners de GitHub -- dos cosas distintas en un solo archivo.
 telemetry/
+# Base reconstruida desde el NDJSON recolectado. Es data, no codigo:
+# se regenera con scripts/import-history.py en un comando.
+collected.db
 data/
 
 # Secrets

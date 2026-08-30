@@ -30,6 +30,14 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v
 
+      - name: Dashboards de Grafana al dia con targets.yaml
+        # Agregar un target y no regenerar lo deja invisible en los graficos, y
+        # no falla nada: los paneles siguen dibujando las series viejas y se ven
+        # sanos. Un archivo que debia cambiar y no cambio no aparece en ningun
+        # diff -- la misma clase de desincronizacion que dejo el Dockerfile
+        # copiando tres de seis modulos durante cinco fases.
+        run: python scripts/build-grafana-dashboards.py --check
+
       - name: Audit dependencies for known CVEs
         # Twenty phases shipped with three pinned dependencies and nothing
         # checking whether any of them had a published CVE. Pinning makes the

@@ -1,0 +1,20 @@
+# Datasource provisionado por archivo, no por la UI.
+#
+# Una fuente de datos creada a mano vive solo en el volumen de ese contenedor:
+# se pierde al recrearlo y no existe en la máquina de nadie más. Los dashboards
+# la referencian por uid, así que ese uid tiene que ser el mismo en toda
+# instalación o los paneles abren sin datasource y hay que reasignarla a mano
+# panel por panel.
+apiVersion: 1
+
+datasources:
+  - name: vigil-sre (SQLite)
+    uid: vigil-sqlite          # el uid que citan los dashboards generados
+    type: frser-sqlite-datasource
+    access: proxy
+    isDefault: true
+    jsonData:
+      # Montado read-only desde el compose. Grafana no tiene por qué poder
+      # escribir en la base que analiza, y un :ro convierte un error de
+      # configuración en un fallo ruidoso en vez de una corrupción silenciosa.
+      path: /data/collected.db

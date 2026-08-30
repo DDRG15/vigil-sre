@@ -1,0 +1,201 @@
+{
+  "uid": "vigil-estado",
+  "title": "vigil-sre · Estado y disponibilidad",
+  "description": "Qué tan seguido respondió cada target, y cuándo no.",
+  "tags": [
+    "vigil-sre"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "",
+  "time": {
+    "from": "2026-08-03T17:00:00.000Z",
+    "to": "2026-08-17T16:00:00.000Z"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Disponibilidad por target",
+      "description": "DEGRADED cuenta como disponible: el target respondió. La lentitud se mira en el dashboard de fases.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  url AS target,\n  COUNT(*) AS sondeos,\n  ROUND(100.0 * SUM(CASE WHEN status IN ('UP','DEGRADED') THEN 1 ELSE 0 END)\n        / COUNT(*), 2) AS uptime_pct,\n  SUM(CASE WHEN status='DEGRADED' THEN 1 ELSE 0 END) AS degradados,\n  SUM(CASE WHEN status='DOWN' THEN 1 ELSE 0 END) AS caidos\nFROM probe_results\nGROUP BY url\nORDER BY uptime_pct ASC",
+          "rawQueryText": "SELECT\n  url AS target,\n  COUNT(*) AS sondeos,\n  ROUND(100.0 * SUM(CASE WHEN status IN ('UP','DEGRADED') THEN 1 ELSE 0 END)\n        / COUNT(*), 2) AS uptime_pct,\n  SUM(CASE WHEN status='DEGRADED' THEN 1 ELSE 0 END) AS degradados,\n  SUM(CASE WHEN status='DOWN' THEN 1 ELSE 0 END) AS caidos\nFROM probe_results\nGROUP BY url\nORDER BY uptime_pct ASC",
+          "queryType": "table",
+          "timeColumns": [],
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "uptime_pct"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 95
+                    },
+                    {
+                      "color": "green",
+                      "value": 99.5
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {}
+    },
+    {
+      "id": 2,
+      "type": "state-timeline",
+      "title": "Estado en el tiempo  (2=UP  1=DEGRADED  0=DOWN)",
+      "description": "Una banda por target. Los huecos son corridas que el scheduler de GitHub se salteó, no caídas.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  MIN(CASE WHEN url = 'https://www.google.com' THEN CASE status WHEN 'UP' THEN 2 WHEN 'DEGRADED' THEN 1 ELSE 0 END END) AS \"google.com\",\n  MIN(CASE WHEN url = 'https://www.github.com' THEN CASE status WHEN 'UP' THEN 2 WHEN 'DEGRADED' THEN 1 ELSE 0 END END) AS \"github.com\",\n  MIN(CASE WHEN url = 'https://www.cloudflare.com' THEN CASE status WHEN 'UP' THEN 2 WHEN 'DEGRADED' THEN 1 ELSE 0 END END) AS \"cloudflare.com\",\n  MIN(CASE WHEN url = 'https://httpbin.org/status/200' THEN CASE status WHEN 'UP' THEN 2 WHEN 'DEGRADED' THEN 1 ELSE 0 END END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  MIN(CASE WHEN url = 'https://www.google.com' THEN CASE status WHEN 'UP' THEN 2 WHEN 'DEGRADED' THEN 1 ELSE 0 END END) AS \"google.com\",\n  MIN(CASE WHEN url = 'https://www.github.com' THEN CASE status WHEN 'UP' THEN 2 WHEN 'DEGRADED' THEN 1 ELSE 0 END END) AS \"github.com\",\n  MIN(CASE WHEN url = 'https://www.cloudflare.com' THEN CASE status WHEN 'UP' THEN 2 WHEN 'DEGRADED' THEN 1 ELSE 0 END END) AS \"cloudflare.com\",\n  MIN(CASE WHEN url = 'https://httpbin.org/status/200' THEN CASE status WHEN 'UP' THEN 2 WHEN 'DEGRADED' THEN 1 ELSE 0 END END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 90
+          },
+          "min": 0,
+          "max": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "green",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never"
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Targets caídos simultáneamente",
+      "description": "Más de uno a la vez apunta al punto de observación —el runner— y no a los targets.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  SUM(CASE WHEN status='DOWN' THEN 1 ELSE 0 END) AS caidos\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  SUM(CASE WHEN status='DOWN' THEN 1 ELSE 0 END) AS caidos\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ]
+}
