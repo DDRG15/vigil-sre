@@ -1,0 +1,123 @@
+# =============================================================================
+# Dockerfile — SRE Health Checker v3
+# =============================================================================
+#
+# Build:    docker build -t sre-health-checker .
+#
+# state.json needs a DIRECTORY bind mount, not a single-file one — see the
+# STATE_FILE_PATH comment in docker-compose.yml for why (rename() onto a
+# bind-mounted single file fails with EBUSY; a directory mount doesn't have
+# this problem). history.db needs one too, for a different reason: SQLite
+# writes a rollback journal next to the database during every commit, and with
+# only the .db file mounted that journal lives in the container layer, not on
+# the host. See the HISTORY_DB_PATH comment in docker-compose.yml. Both files
+# therefore live under /app/data, which is the one directory you mount.
+#
+# Run once: docker run --rm \
+#               --env-file .env \
+#               -e STATE_FILE_PATH=/app/data/state.json \
+#               -e HISTORY_DB_PATH=/app/data/history/history.db \
+#               -v "$(pwd)/data:/app/data" \
+#               -v "$(pwd)/targets.yaml:/app/targets.yaml:ro" \
+#               sre-health-checker
+#
+# Run on a schedule (every 60 s via shell loop):
+#   docker run --rm --env-file .env \
+#       -e STATE_FILE_PATH=/app/data/state.json \
+#       -e HISTORY_DB_PATH=/app/data/history/history.db \
+#       -v "$(pwd)/data:/app/data" \
+#       -v "$(pwd)/targets.yaml:/app/targets.yaml:ro" \
+#       sre-health-checker \
+#       sh -c 'while true; do python main.py; sleep 60; done'
+# =============================================================================
+
+
+# ── Stage 1: dependency builder ───────────────────────────────────────────────
+# Use the full slim image to compile any C-extension wheels (e.g. aiohttp's
+# optional speedups).  This layer is never shipped in the final image.
+FROM python:3.11-slim AS builder
+
+# Prevent .pyc files and enable unbuffered stdout/stderr for clean log streaming.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /build
+
+# Copy only the dependency manifest first so Docker's layer cache is
+# invalidated only when requirements actually change — not on every code edit.
+COPY requirements.txt .
+
+# Install into an isolated prefix so copying to the final stage is surgical.
+RUN pip install --upgrade pip --no-cache-dir \
+ && pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+
+# ── Stage 2: lean runtime image ───────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+# ── Security: run as a non-root user ──────────────────────────────────────────
+# Creating a dedicated user with no login shell and no home directory is a
+# Docker hardening best practice; it limits blast radius if the container is
+# ever compromised. The shell is stated, not left to useradd's default: a
+# --system account without -s gets /bin/sh.
+RUN groupadd --system sre \
+ && useradd --system --gid sre --no-create-home --shell /usr/sbin/nologin sre
+
+# The base image ships pip, setuptools and wheel, and nothing here uses them:
+# the dependencies arrive pre-built from the builder stage. Left in, they are a
+# way to fetch and install code from inside a compromised container, under a
+# comment further down that says the runtime image has no pip. Removed while
+# still root; USER sre comes later.
+RUN python -m pip uninstall -y pip setuptools wheel
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # Tell Python where to find the packages installed in the builder stage.
+    PYTHONPATH=/app/site-packages
+
+WORKDIR /app
+
+# Copy pre-built packages from the builder stage — no pip, no compiler needed
+# in the runtime image, which keeps it small and reduces the attack surface.
+COPY --from=builder /install/lib/python3.11/site-packages /app/site-packages
+
+# Copy every application module. NOT one COPY per file: that list silently
+# desynchronised twice, and the second time left the image unable to start at
+# all, because a new module was never added to it.
+# A build copying three of six files is a perfectly successful build, so nothing
+# fails until the container runs. Copying the package and filtering through
+# .dockerignore inverts the failure mode: forgetting to exclude something bakes
+# in one extra file, while forgetting to include one no longer breaks startup.
+# targets.yaml and .env are expected to be bind-mounted at runtime (see above)
+# so they are NOT baked into the image — this keeps secrets out of image layers.
+COPY *.py ./
+
+# state.json (ephemeral fallback path), /app/data (the STATE_FILE_PATH
+# directory docker-compose.yml mounts — see its comment for why state.json
+# needs a directory mount, not a single-file one) and /app/data/history (where
+# HISTORY_DB_PATH points under compose) must all be writable by the sre user.
+# When bind-mounted from the host, the host path's own permissions apply
+# instead; these just cover the ephemeral, non-mounted run.
+RUN install -d -o sre -g sre /app /app/data /app/data/history \
+ && touch /app/state.json && chown sre:sre /app/state.json
+
+# Drop privileges before the process starts.
+USER sre
+
+# Healthcheck: import the actual application module AND load its config, not
+# just prove the module imports. `import main` alone passed even with a
+# missing/malformed ${VAR_NAME} reference in targets.yaml (main.py exits 1 on
+# that at run time, inside load_targets -- a function `import main` never
+# calls), so a container stuck exiting 1 every cycle still reported healthy.
+# The logger is muted to CRITICAL so the "Loaded N target(s)" INFO line
+# doesn't write every 30s (2,880/day) on top of the healthcheck's own output --
+# the RotatingFileHandler caps total size, but there's no reason to spend that
+# budget on a probe that runs a full order of magnitude more often than the
+# service itself. Docker marks the container unhealthy if this fails.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import logging, main; logging.getLogger('sre.health_checker').setLevel(logging.CRITICAL); main.load_targets(); print('main OK')" || exit 1
+
+# Default command — runs one full check cycle and exits.
+# Pair with a CronJob (Kubernetes) or --restart=always + sleep loop (Docker)
+# to run repeatedly.
+CMD ["python", "main.py"]

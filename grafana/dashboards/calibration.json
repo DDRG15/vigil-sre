@@ -1,0 +1,243 @@
+{
+  "uid": "vigil-calibration",
+  "title": "vigil-sre · Threshold calibration",
+  "description": "What share of each target's probes each candidate backend threshold would flag, computed over every probe in the mounted database. The time-series panel opens on the last 7 days; widen the range if the mounted database holds older probes.",
+  "tags": [
+    "vigil-sre"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Backend: % of probes that would exceed each threshold",
+      "description": "Each cell is the firing rate if that value were the threshold, over every probe in the mounted database that has a backend time. The '500 ms (current)' column is what the monitor applies by default: a target whose rate there is high is being flagged for its normal operation, not for an anomaly.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  url AS target,\n  COUNT(*) AS samples,\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 500 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"500 ms (current)\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 750 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"750 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 1000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"1000 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 1500 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"1500 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 2000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"2000 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 3000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"3000 ms\"\nFROM probe_results\nWHERE server_processing_ms IS NOT NULL\nGROUP BY url ORDER BY url",
+          "rawQueryText": "SELECT\n  url AS target,\n  COUNT(*) AS samples,\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 500 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"500 ms (current)\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 750 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"750 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 1000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"1000 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 1500 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"1500 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 2000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"2000 ms\",\n  ROUND(100.0 * SUM(CASE WHEN server_processing_ms > 3000 THEN 1 ELSE 0 END)\n        / COUNT(*), 1) AS \"3000 ms\"\nFROM probe_results\nWHERE server_processing_ms IS NOT NULL\nGROUP BY url ORDER BY url",
+          "queryType": "table",
+          "timeColumns": [],
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "cellOptions": {
+              "type": "color-background"
+            }
+          },
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Backend median against the current threshold",
+      "description": "Each target's median backend time over every probe in the mounted database, minus the default threshold (500 ms). A positive margin means the threshold sits BELOW the target's median: it does not measure an anomaly, it measures normal operation. A threshold like that cannot be silenced without turning the whole rule off. A target that sets degraded_backend_ms is judged against its own value, not this one.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "WITH r AS (\n  SELECT url, server_processing_ms AS v,\n         CUME_DIST() OVER (PARTITION BY url ORDER BY server_processing_ms) AS cd\n  FROM probe_results WHERE server_processing_ms IS NOT NULL\n)\nSELECT url AS target,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END)) AS p50,\n  500 AS current_threshold,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END))\n    - 500 AS margin\nFROM r GROUP BY url ORDER BY margin DESC",
+          "rawQueryText": "WITH r AS (\n  SELECT url, server_processing_ms AS v,\n         CUME_DIST() OVER (PARTITION BY url ORDER BY server_processing_ms) AS cd\n  FROM probe_results WHERE server_processing_ms IS NOT NULL\n)\nSELECT url AS target,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END)) AS p50,\n  500 AS current_threshold,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END))\n    - 500 AS margin\nFROM r GROUP BY url ORDER BY margin DESC",
+          "queryType": "table",
+          "timeColumns": [],
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "margin"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 0
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {}
+    },
+    {
+      "id": 3,
+      "type": "histogram",
+      "title": "Backend time distribution",
+      "description": "How each target's backend times are distributed. If a target's mass sits to the right of the threshold, the threshold does not fit that target.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN server_processing_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN server_processing_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN server_processing_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN server_processing_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN server_processing_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN server_processing_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN server_processing_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN server_processing_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Backend over time, with the current threshold marked",
+      "description": "The red line is the default backend threshold, TTFB_BACKEND_SLACK_MS = 500 in diagnostics.py. A probe above it is flagged SLOW_BACKEND unless its target sets degraded_backend_ms.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN server_processing_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN server_processing_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN server_processing_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN server_processing_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN server_processing_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN server_processing_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN server_processing_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN server_processing_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 500.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+# =============================================================================
+# targets.yaml — SRE Health Checker target configuration
+# =============================================================================
+#
+# Add, remove, or comment out URLs here without touching any Python code.
+# Every round is a fresh process that loads the list again, so a change is
+# probed on the next cycle -- no restart. This file is the SEED: once the list
+# has been saved from the dashboard editor or targetctl.py it lives in
+# data/targets.json, and edits here are no longer read.
+#
+# Rules:
+#   • Every entry must be a fully-qualified URL (include https:// or http://).
+#   • Indentation must be consistent (2 spaces recommended).
+#   • Lines beginning with # are comments and are ignored.
+#
+# Content assertion (optional): a plain string entry is a URL with no content
+# check — any 200 counts as healthy. To also assert the body, use the object
+# form instead of a bare string:
+#
+#   - url: https://api.yourcompany.com/health
+#     expect_substring: '"status":"ok"'
+#
+# A 200 whose body does NOT contain expect_substring counts as a probe
+# failure, same as a timeout or a 503 — a status code alone cannot tell a
+# real response from a server returning 200 with an error page.
+#
+# If expect_substring is a secret rather than a public fixture, reference an
+# environment variable instead of writing it here (this file is committed to
+# git):
+#
+#   - url: https://api.yourcompany.com/private-health
+#     expect_substring: ${HEALTH_TOKEN}   # resolved from .env, never logged
+#
+
+# Per-target overrides (optional): a single global threshold produces
+# chronic false positives for a target with a different SLA or a
+# legitimately-distant network path — a threshold that's always wrong gets
+# ignored, which defeats having it. Every field below falls back to the
+# module default when omitted:
+#
+#   - url: https://api.yourcompany.com/health
+#     expected_status: 204       # default 200 — for endpoints that answer 204/202
+#     timeout_s: 10               # default 5   — for endpoints with a slower SLA
+#     degraded_ttfb_ms: 3000      # default 1500 — for a legitimately slow report
+#     degraded_rtt_ms: 250        # default 100  — for a legitimately distant target
+# =============================================================================
+
+# Every entry below sets degraded_rtt_ms: 400 instead of inheriting the 100 ms
+# default. That default assumes the probe sits near what it watches. It does
+# not here: these are public endpoints reached over a home/office link, and
+# measured RTT ranges 109-235 ms depending on the hour. Under the default,
+# GitHub and httpbin sat permanently DEGRADED for having ordinary internet
+# latency -- a claim about this network, not about them.
+#
+# Chronic false DEGRADED is how an operator learns to ignore amber, which is
+# the exact failure the per-target overrides exist to prevent. 400 ms clears
+# the observed range with headroom, so it still fires on a real routing change
+# while staying quiet on a normal Tuesday. The number should describe the path
+# being measured -- raise it if your link is slower.
+
+targets:
+  # ── Reliable public endpoints (sanity baselines) ──────────────────────────
+  - url: https://www.google.com
+    degraded_rtt_ms: 400
+  - url: https://www.github.com
+    degraded_rtt_ms: 400
+  - url: https://www.cloudflare.com
+    degraded_rtt_ms: 400
+    # 2000, not the global 500. Measured over 229 probes between 3 and 17
+    # August 2026 from GitHub's runners: at 500 ms the rule fires 63.8% of the
+    # time, at 2000 it fires 2.6%. This target's median backend time is 587 ms,
+    # so the global threshold sat below its median and flagged normal operation
+    # as an anomaly. The same 500 is still correct for google.com, where it
+    # never fires.
+    degraded_backend_ms: 2000
+
+  # ── httpbin.org test suite ────────────────────────────────────────────────
+  - url: https://httpbin.org/status/200   # always 200 — confirms the probe path works
+    degraded_rtt_ms: 400
+    # No trend alerts from this target. Measured over its 230 collected probes
+    # with sliding 3-day windows: its p95 moves a MEDIAN of 57.7% between
+    # adjacent windows, against 5.7% for google.com and 12.4% for cloudflare.
+    # Its median move is above the 50% threshold, so it would fire on 63.3% of
+    # evaluations and account for nearly every trend alert the system sends.
+    #
+    # Raising its own threshold was the alternative and it is worse. Silencing
+    # it needs ~165%, and this endpoint is DOWN 38.7% of the time, so its p95
+    # describes whichever probes happened to succeed. A move that large means
+    # "this window drew a different subset", not "the backend got slower" --
+    # calibrated and meaningless, and too high to catch real degradation
+    # anyway. The problem is sample validity, and no threshold fixes that.
+    #
+    # Probing continues, uptime and percentiles are still recorded, --report
+    # still prints its trend line. Only the alert is off.
+    trend_alerts: false
+
+  # ── PLACEHOLDER: your own services ───────────────────────────────────────
+  # These are placeholders. Uncomment and replace with your actual URLs.
+  # - https://api.yourcompany.com/health
+  # - https://app.yourcompany.com
+  # - https://status.yourcompany.com

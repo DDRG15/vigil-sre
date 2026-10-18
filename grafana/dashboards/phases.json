@@ -1,0 +1,293 @@
+{
+  "uid": "vigil-phases",
+  "title": "vigil-sre · Latency phases",
+  "description": "Where the time goes: DNS, TCP, TLS, backend, transfer. Opens on the last 7 days; widen the range if the mounted database holds older probes. The percentile tables cover every probe in the mounted database, whatever the range.",
+  "tags": [
+    "vigil-sre"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "TTFB — time to first byte",
+      "description": "The measure closest to 'how long did it take'.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN ttfb_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN ttfb_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN ttfb_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN ttfb_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN ttfb_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN ttfb_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN ttfb_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN ttfb_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "RTT — TCP round trip",
+      "description": "Physical distance. Server tuning does not improve it; moving the content closer does.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN rtt_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN rtt_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN rtt_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN rtt_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN rtt_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN rtt_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN rtt_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN rtt_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "DNS resolution",
+      "description": "",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN dns_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN dns_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN dns_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN dns_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN dns_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN dns_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN dns_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN dns_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "TLS handshake",
+      "description": "New connections only; reused ones do not pay it.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN tls_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN tls_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN tls_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN tls_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN tls_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN tls_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN tls_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN tls_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Backend processing  (TTFB − RTT)",
+      "description": "Null when there were redirects: phase attribution is not valid across hops, so it is reported empty instead of made up.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN server_processing_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN server_processing_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN server_processing_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN server_processing_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "rawQueryText": "SELECT\n  CAST(strftime('%s', run_started_at) AS INTEGER) AS time,\n  AVG(CASE WHEN url = 'https://www.google.com' THEN server_processing_ms END) AS \"google.com\",\n  AVG(CASE WHEN url = 'https://www.github.com' THEN server_processing_ms END) AS \"github.com\",\n  AVG(CASE WHEN url = 'https://www.cloudflare.com' THEN server_processing_ms END) AS \"cloudflare.com\",\n  AVG(CASE WHEN url = 'https://httpbin.org/status/200' THEN server_processing_ms END) AS \"httpbin.org\"\nFROM probe_results\nGROUP BY time\nORDER BY time",
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "format": "time series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "TTFB percentiles (ms)",
+      "description": "Nearest-rank with CUME_DIST — the same method as --report.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "WITH r AS (\n  SELECT url, ttfb_ms AS v,\n         CUME_DIST() OVER (PARTITION BY url ORDER BY ttfb_ms) AS cd\n  FROM probe_results WHERE ttfb_ms IS NOT NULL\n)\nSELECT url AS target, COUNT(*) AS n,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END)) AS p50,\n  ROUND(MIN(CASE WHEN cd >= 0.95 THEN v END)) AS p95,\n  ROUND(MIN(CASE WHEN cd >= 0.99 THEN v END)) AS p99,\n  ROUND(MAX(v)) AS max\nFROM r GROUP BY url ORDER BY p95 DESC",
+          "rawQueryText": "WITH r AS (\n  SELECT url, ttfb_ms AS v,\n         CUME_DIST() OVER (PARTITION BY url ORDER BY ttfb_ms) AS cd\n  FROM probe_results WHERE ttfb_ms IS NOT NULL\n)\nSELECT url AS target, COUNT(*) AS n,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END)) AS p50,\n  ROUND(MIN(CASE WHEN cd >= 0.95 THEN v END)) AS p95,\n  ROUND(MIN(CASE WHEN cd >= 0.99 THEN v END)) AS p99,\n  ROUND(MAX(v)) AS max\nFROM r GROUP BY url ORDER BY p95 DESC",
+          "queryType": "table",
+          "timeColumns": [],
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Backend percentiles (ms)",
+      "description": "The same percentiles over backend processing time (TTFB minus RTT). Redirected probes carry no value and are left out, not counted as zero.",
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "vigil-sqlite"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "vigil-sqlite"
+          },
+          "queryText": "WITH r AS (\n  SELECT url, server_processing_ms AS v,\n         CUME_DIST() OVER (PARTITION BY url ORDER BY server_processing_ms) AS cd\n  FROM probe_results WHERE server_processing_ms IS NOT NULL\n)\nSELECT url AS target, COUNT(*) AS n,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END)) AS p50,\n  ROUND(MIN(CASE WHEN cd >= 0.95 THEN v END)) AS p95,\n  ROUND(MIN(CASE WHEN cd >= 0.99 THEN v END)) AS p99,\n  ROUND(MAX(v)) AS max\nFROM r GROUP BY url ORDER BY p95 DESC",
+          "rawQueryText": "WITH r AS (\n  SELECT url, server_processing_ms AS v,\n         CUME_DIST() OVER (PARTITION BY url ORDER BY server_processing_ms) AS cd\n  FROM probe_results WHERE server_processing_ms IS NOT NULL\n)\nSELECT url AS target, COUNT(*) AS n,\n  ROUND(MIN(CASE WHEN cd >= 0.50 THEN v END)) AS p50,\n  ROUND(MIN(CASE WHEN cd >= 0.95 THEN v END)) AS p95,\n  ROUND(MIN(CASE WHEN cd >= 0.99 THEN v END)) AS p99,\n  ROUND(MAX(v)) AS max\nFROM r GROUP BY url ORDER BY p95 DESC",
+          "queryType": "table",
+          "timeColumns": [],
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ]
+}

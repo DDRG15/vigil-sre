@@ -1,0 +1,14 @@
+# Allowlist: the build context is empty unless a line below puts something back.
+#
+# The Dockerfile copies `requirements.txt` and `*.py`, and nothing else. A
+# denylist here has to name every file that must stay out of the image
+# (.env, state.json, history.db, a stray notes file), and the one it forgets is
+# baked into a layer. With `COPY *.py ./` the wildcard decides what ships, so
+# this file decides what the wildcard can see: a new file is excluded until
+# someone argues for it.
+#
+# targets.yaml and .env are bind-mounted at runtime and must never be image
+# content; history.db holds every measurement ever taken.
+*
+!requirements.txt
+!*.py

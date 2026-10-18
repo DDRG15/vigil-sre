@@ -1,0 +1,18 @@
+# Loads the dashboards from disk on every start.
+#
+# allowUiUpdates stays false on purpose: the JSON is GENERATED from
+# targets.yaml. Allowing edits through the UI creates two sources of truth, and
+# the UI one wins until somebody regenerates and overwrites it without warning.
+apiVersion: 1
+
+providers:
+  - name: vigil-sre
+    orgId: 1
+    folder: vigil-sre
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

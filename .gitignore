@@ -1,0 +1,47 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Runtime artifacts
+*.log
+*.log.*
+state.json
+history.db
+# A history database rebuilt by scripts/import-history.py from an NDJSON export.
+# It is regenerable data, not code.
+collected.db
+# Runtime state: state.json, targets.json, the watchdog's database and the
+# history database all live under data/. None of it commits.
+#
+# One file is the exception, and it is not data: data/history/.gitkeep. The
+# compose file bind-mounts ./data/history, and a bind mount of a host directory
+# that does not exist is created by the Docker daemon -- as root on Linux, where
+# the non-root container user then cannot write to it. Shipping the directory
+# with the clone means it already exists, owned by whoever cloned. The pattern
+# is `data/*`, not `data/`: git cannot re-include a file under a directory it
+# has excluded as a whole, so the exclusion has to stop one level down.
+data/*
+!data/history/
+data/history/*
+!data/history/.gitkeep
+
+# Secrets
+.env
+
+# Tests & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
+*.zip

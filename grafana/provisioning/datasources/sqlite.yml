@@ -1,0 +1,20 @@
+# Provisioned from a file, not created through the UI.
+#
+# A datasource added by hand lives only in that container's volume: it is lost
+# when the container is recreated and does not exist on anyone else's machine.
+# The dashboards reference it by uid, so that uid has to be identical in every
+# installation, or the panels open with no datasource and have to be reassigned
+# by hand, one panel at a time.
+apiVersion: 1
+
+datasources:
+  - name: vigil-sre (SQLite)
+    uid: vigil-sqlite          # the uid the generated dashboards cite
+    type: frser-sqlite-datasource
+    access: proxy
+    isDefault: true
+    jsonData:
+      # Mounted read-only from compose. Grafana has no business writing to the
+      # database it analyses, and :ro turns a misconfiguration into a loud
+      # failure instead of silent corruption.
+      path: /data/collected.db

@@ -1,0 +1,300 @@
+services:
+  health-checker:
+    build: .
+    env_file: .env
+    environment:
+      # state.json must live on a bind-mounted DIRECTORY, not a bind-mounted
+      # single file: StateManager writes atomically via a tmp-file rename,
+      # and the OS refuses to rename() a file onto an active mount point —
+      # which is exactly what a single-file bind mount target is. Unset,
+      # this would silently fail on every write (reproduce it by bind-mounting
+      # a single file and renaming a temp file onto it: rename() fails EBUSY).
+      - STATE_FILE_PATH=/app/data/state.json
+      # The history database lives in a mounted DIRECTORY too, for two reasons
+      # that both bit a clean clone. (1) history.db is gitignored, so it does
+      # not exist before the first run, and a single-file bind mount from a
+      # path that does not exist makes Docker create a DIRECTORY there: the
+      # monitor then logged "unable to open database file" every round and
+      # recorded nothing, for as long as the install lived. (2) SQLite's
+      # rollback journal is created NEXT TO the database during every write
+      # transaction. With only the .db file mounted, the journal was created in
+      # the container's layer and not on the host (measured), so a SIGKILL during
+      # a commit followed by a container recreate lost the hot journal SQLite
+      # needs to recover the file. A directory mount keeps both files together
+      # on the host. The variable is the same pattern as STATE_FILE_PATH; the
+      # directory ships in the repo (data/history/.gitkeep) so it exists, and is
+      # owned by whoever cloned, before Docker can create it as root.
+      - HISTORY_DB_PATH=/app/data/history/history.db
+    volumes:
+      - ./targets.yaml:/app/targets.yaml:ro
+      - ./data:/app/data
+      # Nested inside the ./data mount above, and redundant for THIS service on
+      # purpose: it states where the history lives, and it is the line the
+      # dashboard's read-only variant below is the mirror of.
+      - ./data/history:/app/data/history
+    restart: unless-stopped
+    # `docker compose stop` used to end in SIGKILL every time (measured:
+    # 12.6 s, exit 137). PID 1 here is the `sh` running the loop, and the
+    # kernel ignores a signal PID 1 has no handler for, so SIGTERM did nothing;
+    # compose waited its 10 s default and killed the container, mid-round or
+    # not. main.py already finishes its in-flight checks on SIGTERM -- it just
+    # never received one.
+    #
+    # The round and the pause both run in the background and the shell `wait`s
+    # on them, because sh defers a trap until a FOREGROUND child exits: a trap
+    # over a plain `python main.py` would still wait out the round. The trap
+    # forwards SIGTERM to whichever is running, waits for it to finish, and
+    # exits 0 -- a stop that was asked for is not a failure, and `restart:
+    # unless-stopped` leaves a stopped container alone either way.
+    #
+    # A round that fails (an alert nobody received, a state file that did not
+    # persist) still ends the container with status 1 and restart brings it back,
+    # but only after the pause. Exiting at once made the restart policy the
+    # clock: Docker's backoff resets after 10 s of uptime, a round outlasts that,
+    # so a persistent failure (a dead webhook beside a DOWN target) re-ran rounds
+    # back to back, hammering every target and the webhook with no pause, where
+    # the failure path promises a retry sixty seconds later. `rc` carries the
+    # round's status across the pause, which is waited out in the background like
+    # any other so a stop during it is still forwarded and still exits 0.
+    # `pid=` after each wait clears a finished process so the trap never signals
+    # a recycled PID.
+    #
+    # `$$` is compose's escape for a literal `$`.
+    command:
+      - sh
+      - -c
+      - |
+        trap 'if [ -n "$$pid" ]; then kill -TERM "$$pid" 2>/dev/null; wait "$$pid"; fi; exit 0' TERM
+        while true; do
+          python main.py &
+          pid=$$!
+          wait "$$pid"
+          rc=$$?
+          pid=
+          sleep 60 &
+          pid=$$!
+          wait "$$pid"
+          pid=
+          [ "$$rc" -eq 0 ] || exit 1
+        done
+    # Longer than the worst round that can be mid-flight when the stop lands:
+    # an alert delivery is 75 s per channel (3 attempts x 5 s + two capped 30 s
+    # Retry-After sleeps), channels run in parallel, and the probe that raised
+    # the alert can have taken up to the 60 s run budget. A stop is allowed to
+    # finish delivering what it started; killing it there is a lost alert. The
+    # grace is a ceiling, not a delay: an idle monitor stops in a second.
+    # tests/test_deployment.py computes the floor from the constants.
+    stop_grace_period: 150s
+
+  # The read-only API and the dashboard it serves. A separate
+  # service and not a thread inside health-checker, because health-checker is not
+  # a long-lived process: it runs one cycle and exits, and the loop above restarts
+  # it every 60 seconds. An HTTP server living in there would die every minute.
+  dashboard:
+    build: .
+    environment:
+      - STATE_FILE_PATH=/app/data/state.json
+      - HISTORY_DB_PATH=/app/data/history/history.db
+      # 0.0.0.0 INSIDE the container is required, not a loosening: a process
+      # bound to the container's own loopback is unreachable through a port
+      # mapping. The isolation lives in the "127.0.0.1:" of the ports entry
+      # below, on the host side, which is where it actually holds. api.py logs
+      # a warning when it binds off-loopback and that warning is correct here —
+      # it states exactly what is happening.
+      - API_HOST=0.0.0.0
+    env_file: .env      # API_WRITE_TOKEN: without it, writes are rejected
+    volumes:
+      # data/ is writable now, and ONLY because the target editor lives here:
+      # this process owns data/targets.json. The read-only guarantee narrowed
+      # rather than disappeared -- the history directory stays :ro, and sqlite
+      # still opens the database with mode=ro, so the reader still cannot
+      # corrupt the writer's history. What it can now touch is one file it is
+      # the sole author of.
+      #
+      # The :ro line below is NOT redundant with the writable ./data above, and
+      # it is what keeps the guarantee: without it, data/history would be
+      # reachable read-write through the parent mount. A nested mount wins over
+      # its parent, so this one makes the whole directory read-only here.
+      #
+      # One consequence of mounting a directory instead of a file: this reader
+      # now sees the writer's rollback journal. During a normal commit that is
+      # harmless (the writer holds the lock, so the journal is not "hot"). After
+      # a writer killed mid-commit the journal IS hot, and a mode=ro reader
+      # cannot roll it back: history queries return an error until the monitor's
+      # next round recovers the file. That is the right trade -- the alternative
+      # is the monitor losing the journal outright -- and it heals itself within
+      # one cycle.
+      - ./data:/app/data
+      - ./data/history:/app/data/history:ro
+      # The seed the monitor runs on until the first save from the editor, and
+      # the list the editor has to open on. Without it GET /api/targets cannot
+      # see the file, answers with a seed_error, and the editor opens empty --
+      # warned, but showing none of the targets being probed. Read-only: this
+      # process writes the store, never the seed.
+      - ./targets.yaml:/app/targets.yaml:ro
+    ports:
+      # Bound to the host's loopback deliberately. This endpoint has NO
+      # authentication and publishes the operational map — which targets exist,
+      # when they fail, with what error. Publishing it is a decision; "8787:8787"
+      # is how you back into it by accident.
+      - "127.0.0.1:8787:8787"
+    restart: unless-stopped
+    command: ["python", "api.py"]
+    healthcheck:
+      # The probe's healthcheck loads config; this one has to prove the socket
+      # answers, which is the only thing this service exists to do.
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/status', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5s
+      retries: 3
+
+  # The dead-man's switch, self-hosted, so a clone of this repo demonstrates it
+  # without anyone signing up for anything.
+  #
+  # Read this before trusting it: a watchdog that shares a machine with what it
+  # watches cannot report that the machine died. It catches the probe container
+  # crashing. It does not catch Docker stopping, the host powering off, or the
+  # network dropping — and those are the failures that matter most, because
+  # they are the ones where nobody is left inside to speak.
+  #
+  # So this service is for REPRODUCIBILITY, not for vigilance. For real
+  # operation, point HEARTBEAT_URL at an external instance (healthchecks.io or
+  # your own, somewhere else). The code does not care which: it is one URL.
+  #
+  # It notifies nobody. No SMTP, no webhook, on purpose — evidence lives in its
+  # own event log at http://127.0.0.1:8000, which is more convincing than an
+  # email anyway, and costs the reader zero notifications.
+  #
+  # Behind the "demo-watchdog" profile, so `docker compose up -d --build` on a
+  # fresh clone starts the monitor and the dashboard and nothing else.
+  # Reproduced on a clean clone: with the demo in the default set, the README
+  # quickstart (`cp .env.example .env`, then `up`) exited 1 with
+  # `service "watchdog-guard" didn't complete successfully`, because
+  # .env.example has no WATCHDOG_SECRET_KEY -- it cannot have one, the key is
+  # generated per install. A first install failing on a demo nobody asked for is
+  # the worst place for this guard to fire. Opting in is one flag:
+  #
+  #   ./scripts/init-watchdog.sh        (first run: writes the key into .env)
+  #   docker compose --profile demo-watchdog up -d watchdog
+  #   ./scripts/init-watchdog.sh        (second run: creates the check)
+  #
+  # The guard and the watchdog share the profile, so the guard is never left out
+  # of the set that starts the watchdog. The guard's own property is unchanged:
+  # with the profile active and the key empty, `up` fails before the watchdog
+  # starts. `stop`, `down`, `ps` and `config` never touch the key, profile or no
+  # profile.
+  #
+  # The key check, moved out of compose interpolation and into a service.
+  #
+  # It used to be `${WATCHDOG_SECRET_KEY:?...}` on the watchdog's own SECRET_KEY.
+  # Compose interpolates before running ANY subcommand, so that guard also broke
+  # `stop`, `down`, `logs`, `ps` and even `config --services`: the configuration
+  # could not be inspected without the key, let alone shut down. Being able to
+  # stop a system must never depend on its configuration being valid, because a
+  # broken config is exactly when stopping matters most.
+  #
+  # `:-` alone was the tempting one-line fix and it is wrong. Verified against
+  # healthchecks/healthchecks:latest: with SECRET_KEY empty
+  # the container STAYS UP -- `Up 26 seconds (health: starting)` -- serving 500s
+  # rather than exiting. Django does reject an empty key
+  # (`ImproperlyConfigured: The SECRET_KEY setting must not be empty`), but uWSGI
+  # keeps the master process alive around it, and the image ships no entrypoint
+  # to turn that into a non-zero exit. Under `restart: unless-stopped` it would
+  # look alive in `docker ps` while signing session cookies with nothing.
+  #
+  # So the refusal has to be somebody's job, and it is this service's. It exits
+  # non-zero before the watchdog is allowed to start, which fails `up` loudly and
+  # leaves every other subcommand working.
+  watchdog-guard:
+    profiles: ["demo-watchdog"]
+    image: busybox:1.37
+    environment:
+      - WATCHDOG_SECRET_KEY=${WATCHDOG_SECRET_KEY:-}
+    command:
+      - sh
+      - -c
+      - |
+        if [ -z "$${WATCHDOG_SECRET_KEY}" ]; then
+          echo "WATCHDOG_SECRET_KEY is empty or not set." >&2
+          echo "Run scripts/init-watchdog.sh and try again." >&2
+          exit 1
+        fi
+        echo "WATCHDOG_SECRET_KEY is set."
+
+  watchdog:
+    profiles: ["demo-watchdog"]
+    image: healthchecks/healthchecks:latest
+    depends_on:
+      # Nothing about the watchdog starts until the guard has exited 0.
+      watchdog-guard:
+        condition: service_completed_successfully
+    environment:
+      # Generated per install by scripts/init-watchdog.sh, never a literal.
+      # A hardcoded key would be byte-identical in every clone of a public
+      # repo, and Django signs session cookies with it: anyone could forge
+      # a session for the demo superuser without guessing anything. Today
+      # the port is loopback-only so that is unreachable — but "publish it
+      # to the team" is a one-line change to the ports entry below, and
+      # nobody making it would think to rotate a key that already works.
+      # `:-`, not `:?`. The refusal lives in watchdog-guard above, so that an
+      # empty key still fails `up` while `stop` and `config` keep working.
+      - SECRET_KEY=${WATCHDOG_SECRET_KEY:-}
+      - DEBUG=False
+      - ALLOWED_HOSTS=*
+      - CSRF_TRUSTED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000
+      - DB=sqlite
+      - DB_NAME=/data/hc.sqlite
+      - SITE_ROOT=http://127.0.0.1:8000
+      # No EMAIL_HOST: an unconfigured backend sends nothing. Deliberate.
+      - SUPERUSER_EMAIL=demo@vigil.local
+      - SUPERUSER_PASSWORD=vigil-demo
+      - REGISTRATION_OPEN=False
+    volumes:
+      - ./data/watchdog:/data
+    ports:
+      # Loopback only, same rule as the dashboard: this is a local demo, not a
+      # service to publish.
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Grafana — visualisation of the probe history.
+  #
+  # Behind the "analysis" profile, so it does NOT come up with
+  # `docker compose up`: it exists to look at a history that has already been
+  # recorded, not to monitor. A service that starts alongside everything
+  # else and nobody opens is memory spent and one more surface exposed.
+  #
+  #   docker compose --profile analysis up -d grafana
+  #   http://127.0.0.1:3000
+  #
+  # Needs collected.db, built from an export of the history database:
+  #   python scripts/export-history.py --db data/history/history.db > history.ndjson
+  #   python scripts/import-history.py history.ndjson --db collected.db
+  # ---------------------------------------------------------------------------
+  grafana:
+    profiles: ["analysis"]
+    image: grafana/grafana:11.6.0
+    environment:
+      # Grafana core has no SQLite datasource. This plugin adds one and is
+      # installed at startup; the first run needs network access.
+      - GF_INSTALL_PLUGINS=frser-sqlite-datasource
+      # No login for a local analysis tool bound to loopback. Publishing this
+      # port with anonymous access on hands the instance to anyone who can
+      # reach it — which is why the port below is pinned to 127.0.0.1 and must
+      # not be changed without removing these two lines first.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # :ro — Grafana analyses this database, it does not write to it. A plugin
+      # bug that tries to write fails loudly instead of corrupting the dataset
+      # that took weeks of probing to accumulate.
+      - ./collected.db:/data/collected.db:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped

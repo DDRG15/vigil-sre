@@ -1,0 +1,8 @@
+# Line endings are the repository's decision, not each clone's core.autocrlf.
+# A shell script that reaches a Linux container with CRLF fails with "bad
+# interpreter: /bin/sh^M: No such file or directory" for a file that is plainly
+# there. LF in the index and LF on checkout, on every platform.
+* text=auto eol=lf
+
+# Run by a Linux shell: never CRLF, even if git's content detection is fooled.
+*.sh text eol=lf

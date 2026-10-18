@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The default shallow clone fetches one commit, and one of the tests
+          # reads the author of every commit to catch an identity that credits
+          # a stranger. At depth 1 that test inspects a single commit and
+          # passes on a history full of them. 64 commits cost nothing to fetch.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+      - name: Grafana dashboards in sync with the target list
+        # Adding a target without regenerating leaves it invisible in the
+        # graphs, and nothing fails: the panels keep drawing the old series and
+        # look perfectly healthy. A file that should have changed and did not
+        # appears in no diff -- the same desynchronisation that left the
+        # Dockerfile copying three of six modules for five releases.
+        run: python scripts/build-grafana-dashboards.py --check
+
+      - name: Audit dependencies for known CVEs
+        # Twenty releases shipped with three pinned dependencies and nothing
+        # checking whether any of them had a published CVE. Pinning makes the
+        # build reproducible; it also means the versions never move on their
+        # own, so a reproducible build is a photograph of a state that ages.
+        # aiohttp carries every outbound request this project makes and has a
+        # real history of CVEs. pip-audit is PyPA's, queries the OSV database,
+        # and lives in CI — it adds nothing to requirements.txt.
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+  docker:
+    name: docker build & run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t vigil-sre .
+
+      - name: Verify the image can import every entrypoint it ships
+        # A `docker build` succeeding proves nothing about whether the app can
+        # start -- a build that COPYs three of six modules is a perfectly
+        # successful build, and this step is what catches it. Every entrypoint
+        # is named, not just main: an earlier revision shipped an image that
+        # could not import notifiers, api or dashboard while `import main`
+        # alone was the whole check.
+        run: |
+          docker run --rm --entrypoint python vigil-sre -c "import main; print('main OK')"
+          docker run --rm --entrypoint python vigil-sre -c "import api, dashboard, notifiers; print('api OK')"
+
+      - name: Run one real health-check cycle end-to-end
+        # Exercises the actual deployment path (docker-compose.yml, the real
+        # targets.yaml smoke-test targets, state.json/history.db writes) —
+        # not just an import. main.py exits 0 regardless of target status
+        # unless --strict is passed, so this only fails on an unhandled crash
+        # or on an alert that reached no channel.
+        #
+        # That second case is why a receiver runs here. .env.example holds a
+        # placeholder Discord URL that answers 400,
+        # so the alerts reach nobody and main.py exits 1 -- correctly, since an
+        # undelivered alert is a monitor failure (an EMPTY URL exits 1 as well).
+        # This job was green only while state.json could not be written on the
+        # Linux runner, which hid the lost alerts. The rule stays; the
+        # destination changes: DISCORD_WEBHOOK_URL points at a sink started
+        # below, and the next step proves it received something.
+        #
+        # Something must be sent for that proof to mean anything, and the
+        # shipped targets cannot promise it: all four are healthy endpoints, and
+        # a healthy target seen for the first time is recorded, not announced.
+        # On a runner where all four answer, the cycle would alert nobody and
+        # "at least one POST" would fail for a network that worked. So this job
+        # adds one target that cannot answer -- a refused port on the
+        # container's own loopback. Its first sighting is a DOWN, which alerts
+        # once, so the delivery path is exercised on every run, whatever the
+        # shipped targets do. It is appended to the checkout's copy only; the
+        # committed targets.yaml is not changed.
+        #
+        # `docker compose run` has no --add-host, and a container never reaches
+        # the host's 127.0.0.1, so the sink listens on 0.0.0.0 and the URL
+        # carries the runner's own address (any host interface answers from a
+        # bridge network). `-e` outranks .env, so the copy of .env.example
+        # below stays exactly what the quickstart creates. The cycle's exit
+        # code is the step's: bash -e fails the job on non-zero, nothing here
+        # swallows it.
+        #
+        # The setup is the README quickstart and nothing else. This job used to
+        # inject a WATCHDOG_SECRET_KEY and pre-create an empty history.db, which
+        # are exactly the two steps the quickstart does not tell a reader to
+        # take -- so it passed while a clean clone failed (`up` exited 1, and
+        # history.db was born as a directory). If either becomes necessary
+        # again, this job must go red, not quietly supply it.
+        run: |
+          cp .env.example .env
+          # The container's non-root user is not the runner's user, so on a
+          # Linux host it cannot write to a checked-out data/ it does not own.
+          # Docker Desktop (Windows, macOS) does not enforce this, which is why
+          # the quickstart works there without it. This one line is the Linux
+          # prerequisite the README documents; it is not a workaround for the
+          # history directory, which already exists from the clone.
+          chmod -R a+rwX data
+          docker compose build
+
+          printf '  - url: http://127.0.0.1:9/ci-guaranteed-down\n' >> targets.yaml
+
+          python3 scripts/ci-webhook-receiver.py --port 8089 \
+            --log "$RUNNER_TEMP/webhook-hits.ndjson" &
+          RECEIVER_PID=$!
+          trap 'kill "$RECEIVER_PID"' EXIT
+          curl -fsS -o /dev/null --retry 10 --retry-connrefused --retry-delay 1 \
+            http://127.0.0.1:8089/
+
+          HOST_IP=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')
+          test -n "$HOST_IP"
+          docker compose run --rm -e DISCORD_WEBHOOK_URL="http://$HOST_IP:8089/hook" health-checker python main.py
+
+      - name: The alert reached the receiver
+        # Exit 0 alone proves nothing was lost; a run that fired no alert exits
+        # 0 too. A POST in the receiver's log is delivery, seen from outside.
+        run: |
+          HITS=$(wc -l < "$RUNNER_TEMP/webhook-hits.ndjson")
+          echo "POSTs received: $HITS"
+          cat "$RUNNER_TEMP/webhook-hits.ndjson"
+          test "$HITS" -ge 1
+
+      - name: The runtime files landed on the host as files
+        # The failure this guards left no error anywhere: a directory sat where
+        # history.db belonged and the monitor logged and carried on, round
+        # after round. Only an observer that looks at the host afterwards
+        # cannot be fooled by that.
+        run: |
+          test -f data/state.json
+          test -f data/history/history.db

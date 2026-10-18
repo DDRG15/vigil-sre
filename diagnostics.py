@@ -1,0 +1,1121 @@
+"""
+diagnostics.py — BDP / Latency-Bandwidth Diagnostics engine for vigil-sre.
+
+What this module answers
+------------------------
+main.py answers "UP or DOWN?".  This module answers the next question:
+"it is slow — WHY, and what would you tune?"
+
+Every probe already opens a TCP connection, performs a TLS handshake, waits
+for the server, and downloads a body.  Each of those phases carries a
+distinct diagnostic signal:
+
+    DNS lookup      → resolver health
+    TCP connect     → round-trip time (physics: distance + routing)
+    TLS handshake   → protocol overhead (TLS 1.3 vs 1.2, resumption)
+    TTFB − RTT      → server-side processing time (backend, not network)
+    body transfer   → goodput → effective TCP window → BDP estimate
+
+Measurement honesty
+-------------------
+The bandwidth-delay product needs two inputs: RTT and bandwidth.  RTT is
+sampled reliably with a dedicated raw TCP connect.  Bandwidth is NOT —
+a health endpoint returning 5 KB finishes inside the TCP slow-start ramp
+and tells you nothing about the path's capacity.  Therefore every
+bandwidth-derived number in this module carries an explicit confidence
+field: HIGH only when the response body was large enough
+(≥ BANDWIDTH_MIN_SAMPLE_BYTES) to exercise the window; INSUFFICIENT_SAMPLE
+otherwise, in which case no bandwidth rule is allowed to fire.  A diagnosis
+based on a 5 KB sample is not a diagnosis — it is noise wearing a lab coat.
+
+This module is pure computation plus one tiny network helper
+(measure_tcp_rtt).  It performs no logging, no state writes, and no
+alerting — main.py owns all side effects.
+
+Python  : 3.11+
+Depends : aiohttp (TraceConfig only), stdlib.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import ssl
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+
+import aiohttp
+
+# ---------------------------------------------------------------------------
+# Thresholds — module constants, same convention as main.py's constant block.
+# Each one names the exact trigger of a diagnostic rule.
+# ---------------------------------------------------------------------------
+RTT_HIGH_MS               : float = 100.0    # above this, distance is the problem
+DNS_SLOW_MS               : float = 200.0    # above this, the resolver is the problem
+TTFB_BACKEND_SLACK_MS     : float = 500.0    # TTFB − RTT above this → backend slow
+TLS_OVERHEAD_SLACK_MS     : float = 50.0     # tolerance on top of 2×RTT for TLS
+BANDWIDTH_MIN_SAMPLE_BYTES: int   = 262_144  # 256 KB — below this, no BW verdicts
+DEFAULT_WINDOW_BYTES      : int   = 65_536   # classic 64 KB window (no scaling)
+WINDOW_LIMITED_FACTOR     : float = 0.9      # eff. window below 90% of 64 KB → limited
+CERT_WARN_DAYS            : int   = 30
+CERT_CRIT_DAYS            : int   = 7
+RTT_PROBE_TIMEOUT_S       : float = 2.0      # raw TCP/TLS connect sample timeout
+DEGRADED_TTFB_MS          : float = 1_500.0  # UP but slower than this → DEGRADED
+
+CONFIDENCE_HIGH        : str = "HIGH"
+CONFIDENCE_INSUFFICIENT: str = "INSUFFICIENT_SAMPLE"
+
+SEVERITY_INFO    : str = "info"
+SEVERITY_WARN    : str = "warn"
+SEVERITY_CRITICAL: str = "critical"
+
+# Diagnosis codes. Kept as constants so the DEGRADED policy and the tests
+# reference the same strings the rules emit — a typo cannot silently unlink them.
+CODE_HIGH_RTT         : str = "HIGH_RTT_NEEDS_EDGE"
+CODE_SLOW_DNS         : str = "SLOW_DNS"
+CODE_TLS_OVERHEAD     : str = "TLS_HANDSHAKE_OVERHEAD"
+CODE_SLOW_BACKEND     : str = "SLOW_BACKEND"
+CODE_WINDOW_LIMITED   : str = "WINDOW_LIMITED"
+CODE_CERT_EXPIRING    : str = "CERT_EXPIRING"
+CODE_HTTP2_UNSUPPORTED: str = "HTTP2_NOT_SUPPORTED"
+
+# A service is DEGRADED when the probe succeeds but one of these performance
+# findings fires. CERT_EXPIRING is excluded — an expiring cert is a scheduled
+# future outage, not present degradation. HTTP2_NOT_SUPPORTED is excluded — it
+# is an optimization hint, not a symptom the user is feeling right now.
+DEGRADING_FINDING_CODES: frozenset[str] = frozenset({
+    CODE_HIGH_RTT,
+    CODE_SLOW_DNS,
+    CODE_TLS_OVERHEAD,
+    CODE_SLOW_BACKEND,
+    CODE_WINDOW_LIMITED,
+})
+
+
+# ---------------------------------------------------------------------------
+# Data contracts
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProbePhases:
+    """
+    Per-phase timing breakdown of one successful probe.
+
+    Every field that cannot always be measured is Optional and every
+    consumer must tolerate None:
+      * dns_ms            — None when the resolver cache hit or the target
+                            is an IP literal (no lookup happened).
+      * connect_total_ms  — None when the connection was reused from the pool.
+      * rtt_ms            — None when the raw TCP sample failed (firewall,
+                            transient refusal).  Diagnostics degrade, the
+                            probe itself never fails because of this.
+      * tls_ms            — derived (connect_total − rtt); only meaningful on
+                            a fresh HTTPS connection with a valid RTT sample.
+      * server_processing_ms
+                          — None on any redirected response: ttfb_ms spans the
+                            entire chain while dns/connect describe only the
+                            last hop, so the subtraction would bill the earlier
+                            hops' round trips to "the server thinking". Also
+                            None when rtt_ms is missing, or when the remainder
+                            comes out negative. github.com redirects, so across
+                            230 probes it produced a number zero times — an
+                            empty column for it in the phase dashboard is the
+                            design working, not a collection bug.
+      * goodput_bps       — None when the transfer completed faster than the
+                            clock resolution (division by ~zero is a lie).
+      * tls_cert_days_left— None for plain HTTP or when the transport does
+                            not expose the peer certificate.
+    """
+
+    url                 : str
+    http_status         : int
+    ttfb_ms             : float
+    transfer_ms         : float
+    body_bytes          : int
+    connection_reused   : bool  = False
+    dns_ms              : float | None = None
+    connect_total_ms    : float | None = None
+    rtt_ms              : float | None = None
+    tls_ms              : float | None = None
+    server_processing_ms: float | None = None
+    goodput_bps         : float | None = None
+    tls_cert_days_left  : int   | None = None
+    alpn_protocol       : str   | None = None   # e.g. "h2", "http/1.1"; None if unknown
+    h2_supported        : bool  | None = None   # server offered h2 in ALPN; None if untested
+
+
+@dataclass
+class Diagnosis:
+    """One actionable finding produced by analyze()."""
+
+    code          : str   # stable identifier, e.g. "WINDOW_LIMITED"
+    severity      : str   # SEVERITY_INFO | SEVERITY_WARN | SEVERITY_CRITICAL
+    evidence      : str   # the measured numbers that triggered the rule
+    recommendation: str   # what to change — and what tuning will NOT fix
+
+
+# ---------------------------------------------------------------------------
+# Connection sampling — raw TCP RTT + a controlled TLS handshake
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConnectionSample:
+    """
+    What one out-of-band connection sample measured, before the HTTP probe.
+
+    Every field is Optional and every consumer tolerates None:
+      * rtt_ms        — None when the TCP connect failed (firewall, refusal).
+      * tls_ms        — None for plain HTTP, or when the TLS sample failed /
+                        the subtraction went negative (measurement noise).
+      * alpn_protocol — the protocol the server negotiated when offered both
+                        h2 and http/1.1; None when not sampled or unsupported.
+      * h2_supported  — True/False derived from alpn_protocol; None if untested.
+    """
+
+    rtt_ms       : float | None = None
+    tls_ms       : float | None = None
+    alpn_protocol: str   | None = None
+    h2_supported : bool  | None = None
+
+
+def host_port_from_url(url: str) -> tuple[str, int] | None:
+    """
+    Extract (hostname, port) from *url* for the connection sample.
+
+    Returns None for URLs without a hostname — the caller skips the sample
+    and diagnostics degrade gracefully. The same for a URL urlsplit cannot
+    take apart: it raises ValueError for a port outside 0-65535 or one that is
+    not a number ("http://host:99999/", "http://host:abc/") and for a
+    malformed IPv6 literal ("http://[::1/"). Those load fine from YAML, so
+    they reach this function, and an exception here used to leave check_url
+    before the probe's own error handling.
+    """
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    return hostname, port or (443 if parts.scheme == "https" else 80)
+
+
+#: What a connection sample can raise that means "no sample", never "bug".
+#: OSError and the timeout are the network saying no. ValueError is a host the
+#: resolver refuses to encode: UnicodeError (the IDNA codec on "example..com")
+#: is a ValueError and NOT an OSError, which is how it used to get out.
+#: OverflowError is a port the socket layer rejects outright (Linux; Windows
+#: truncates it instead, so the port is range-checked before connecting too).
+_SAMPLE_ERRORS: tuple[type[BaseException], ...] = (
+    OSError, ValueError, OverflowError, asyncio.TimeoutError)
+
+
+async def _timed_tcp_connect(
+    host: str, port: int, timeout_s: float
+) -> float | None:
+    """One raw TCP connect (SYN → SYN-ACK), timed and closed. ms or None."""
+    start = time.monotonic()
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout_s
+        )
+    except _SAMPLE_ERRORS:
+        return None
+
+    rtt_ms = (time.monotonic() - start) * 1000.0
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass  # the sample is already taken; a noisy close changes nothing
+    return rtt_ms
+
+
+def _permissive_tls_context() -> ssl.SSLContext:
+    """
+    A TLS context that completes the handshake even against an invalid or
+    self-signed certificate, and offers both h2 and http/1.1 in ALPN.
+
+    Verification is disabled on purpose: this context times the handshake and
+    reads the negotiated ALPN — it never trusts the peer and never carries
+    application data. Certificate expiry is read from the *validated* aiohttp
+    probe connection, not here, so disabling verification here loses nothing.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+    except NotImplementedError:
+        pass  # ancient OpenSSL without ALPN — alpn stays None, rule stays quiet
+    return ctx
+
+
+async def sample_connection(
+    host: str,
+    port: int,
+    use_tls: bool,
+    server_hostname: str | None = None,
+    timeout_s: float = RTT_PROBE_TIMEOUT_S,
+) -> ConnectionSample:
+    """
+    Sample the path out-of-band: one plain TCP connect for RTT, then (for TLS
+    targets) one handshake that offers h2/http1.1 to time the TLS phase and
+    learn whether the server speaks HTTP/2.
+
+    Why sample instead of reusing aiohttp's timings?
+    ------------------------------------------------
+    aiohttp's on_connection_create_* hooks fuse TCP connect and TLS into one
+    opaque interval, so they can give neither a clean RTT nor a clean TLS time.
+    And aiohttp only ever offers http/1.1, so its negotiated ALPN can never
+    reveal server h2 support. This sampler answers both questions on
+    connections it controls, at the cost of one (HTTP) or two (HTTPS) extra
+    handshakes per target per run — a SYN/FIN pair, negligible.
+
+    Returns:
+        A ConnectionSample. Any field may be None; nothing here ever raises
+        into the caller, because a diagnostics sample must never fail a probe.
+        A host the resolver cannot encode, or a port outside 1-65535, returns
+        the empty sample without opening a socket.
+    """
+    if not 0 < port <= 65_535:
+        # Checked here and not left to the socket layer: Windows truncates an
+        # out-of-range port to 16 bits and connects to whatever that happens
+        # to be, while Linux raises OverflowError. Neither is a sample.
+        return ConnectionSample()
+
+    rtt_ms = await _timed_tcp_connect(host, port, timeout_s)
+
+    if not use_tls:
+        return ConnectionSample(rtt_ms=rtt_ms)
+
+    ctx = _permissive_tls_context()
+    tls_start = time.monotonic()
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                host, port, ssl=ctx, server_hostname=server_hostname or host
+            ),
+            timeout=timeout_s,
+        )
+    except (*_SAMPLE_ERRORS, ssl.SSLError):
+        return ConnectionSample(rtt_ms=rtt_ms)
+
+    tls_total_ms = (time.monotonic() - tls_start) * 1000.0
+    ssl_object = writer.get_extra_info("ssl_object")
+    alpn = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
+
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+
+    # TLS handshake time is the fresh-connect total minus the bare round trip,
+    # both measured back-to-back by this sampler. Clamp negatives (noise) to
+    # None. Unlike deriving from aiohttp's warm connect, both figures come from
+    # the same sampler moments apart, so disagreement is rare.
+    tls_ms: float | None = None
+    if rtt_ms is not None:
+        derived = tls_total_ms - rtt_ms
+        tls_ms = derived if derived > 0 else None
+
+    h2_supported = None if alpn is None else (alpn == "h2")
+    return ConnectionSample(
+        rtt_ms=rtt_ms, tls_ms=tls_ms, alpn_protocol=alpn, h2_supported=h2_supported
+    )
+
+
+# ---------------------------------------------------------------------------
+# TLS certificate expiry
+# ---------------------------------------------------------------------------
+
+def cert_days_left(peercert: dict | None) -> int | None:
+    """
+    Days until the peer certificate expires, from getpeercert()'s dict form.
+
+    Returns None when the cert or its notAfter field is unavailable.
+    Negative values mean the certificate is already expired.
+    """
+    if not peercert:
+        return None
+    not_after = peercert.get("notAfter")
+    if not not_after:
+        return None
+    try:
+        expiry_ts = ssl.cert_time_to_seconds(not_after)
+    except ValueError:
+        return None
+    remaining_s = expiry_ts - datetime.now(timezone.utc).timestamp()
+    return int(remaining_s // 86_400)
+
+
+# ---------------------------------------------------------------------------
+# aiohttp TraceConfig — DNS + connection-create timings per request
+# ---------------------------------------------------------------------------
+
+def build_trace_config() -> aiohttp.TraceConfig:
+    """
+    Build a TraceConfig whose hooks write phase timings into the dict passed
+    as ``trace_request_ctx`` on each request.
+
+    Keys written:
+        dns_ms              — resolver wall time (absent on cache hit)
+        connect_total_ms    — TCP connect + TLS handshake (fresh conn only)
+        connection_reused   — True when the pool served an existing conn
+    """
+    trace = aiohttp.TraceConfig()
+
+    async def on_dns_start(
+        session: aiohttp.ClientSession,
+        ctx: SimpleNamespace,
+        params: aiohttp.TraceDnsResolveHostStartParams,
+    ) -> None:
+        if isinstance(ctx.trace_request_ctx, dict):
+            ctx.trace_request_ctx["_dns_start"] = time.monotonic()
+
+    async def on_dns_end(
+        session: aiohttp.ClientSession,
+        ctx: SimpleNamespace,
+        params: aiohttp.TraceDnsResolveHostEndParams,
+    ) -> None:
+        store = ctx.trace_request_ctx
+        if isinstance(store, dict) and "_dns_start" in store:
+            store["dns_ms"] = (time.monotonic() - store.pop("_dns_start")) * 1000.0
+
+    async def on_conn_start(
+        session: aiohttp.ClientSession,
+        ctx: SimpleNamespace,
+        params: aiohttp.TraceConnectionCreateStartParams,
+    ) -> None:
+        if isinstance(ctx.trace_request_ctx, dict):
+            ctx.trace_request_ctx["_conn_start"] = time.monotonic()
+
+    async def on_conn_end(
+        session: aiohttp.ClientSession,
+        ctx: SimpleNamespace,
+        params: aiohttp.TraceConnectionCreateEndParams,
+    ) -> None:
+        store = ctx.trace_request_ctx
+        if isinstance(store, dict) and "_conn_start" in store:
+            store["connect_total_ms"] = (
+                time.monotonic() - store.pop("_conn_start")
+            ) * 1000.0
+
+    async def on_conn_reuse(
+        session: aiohttp.ClientSession,
+        ctx: SimpleNamespace,
+        params: aiohttp.TraceConnectionReuseconnParams,
+    ) -> None:
+        if isinstance(ctx.trace_request_ctx, dict):
+            ctx.trace_request_ctx["connection_reused"] = True
+
+    trace.on_dns_resolvehost_start.append(on_dns_start)
+    trace.on_dns_resolvehost_end.append(on_dns_end)
+    trace.on_connection_create_start.append(on_conn_start)
+    trace.on_connection_create_end.append(on_conn_end)
+    trace.on_connection_reuseconn.append(on_conn_reuse)
+    return trace
+
+
+# ---------------------------------------------------------------------------
+# Derived metrics
+# ---------------------------------------------------------------------------
+
+def bandwidth_confidence(phases: ProbePhases) -> str:
+    """HIGH only when the body was large enough to exercise the TCP window."""
+    if phases.body_bytes >= BANDWIDTH_MIN_SAMPLE_BYTES:
+        return CONFIDENCE_HIGH
+    return CONFIDENCE_INSUFFICIENT
+
+
+def effective_window_bytes(phases: ProbePhases) -> float | None:
+    """
+    Bytes the connection effectively kept in flight: goodput × RTT.
+
+    This is the observable floor of the path's BDP.  If it sits below the
+    classic 64 KB window on a large transfer, the transfer was window-limited
+    — the pipe was never full.
+    """
+    if phases.goodput_bps is None or phases.rtt_ms is None:
+        return None
+    goodput_bytes_per_s = phases.goodput_bps / 8.0
+    return goodput_bytes_per_s * (phases.rtt_ms / 1000.0)
+
+
+def default_window_ceiling_bps(phases: ProbePhases) -> float | None:
+    """
+    Throughput ceiling a plain 64 KB window imposes on this path:
+    window / RTT.  On a 150 ms path that is ~3.5 Mbit/s no matter how fat
+    the pipe is — which is exactly why window scaling exists.
+    """
+    if phases.rtt_ms is None or phases.rtt_ms <= 0:
+        return None
+    return DEFAULT_WINDOW_BYTES * 8.0 / (phases.rtt_ms / 1000.0)
+
+
+# ---------------------------------------------------------------------------
+# Rule engine
+# ---------------------------------------------------------------------------
+
+def analyze(phases: ProbePhases, *, rtt_high_ms: float = RTT_HIGH_MS,
+            backend_slack_ms: float = TTFB_BACKEND_SLACK_MS) -> list[Diagnosis]:
+    """
+    Run every diagnostic rule against *phases* and return the findings.
+
+    Rule discipline: each rule names its trigger (a threshold constant) and
+    tolerates missing inputs by not firing.  Bandwidth rules additionally
+    require CONFIDENCE_HIGH — no verdicts from insufficient samples.
+
+    Args:
+        phases:      The measured probe phases.
+        rtt_high_ms: Per-target override of RTT_HIGH_MS (rules 1 and 7 — both
+                     concern the same physical quantity, so both honour the
+                     same override). A single global threshold produces
+                     chronic false HIGH_RTT_NEEDS_EDGE findings for a target
+                     that is legitimately far away; a chronically-false
+                     finding gets ignored, which defeats the point of having it.
+        backend_slack_ms:
+                     Per-target override of TTFB_BACKEND_SLACK_MS (rule 4).
+                     Two weeks of hourly probing made the case: at the global
+                     500 ms, cloudflare.com fired on 63.8% of probes while
+                     google.com fired on 0%. Its median backend time is 587 ms,
+                     so the threshold sat BELOW the target's median -- which is
+                     not a threshold but a permanent alarm, measuring normal
+                     operation rather than an anomaly. The number is right for
+                     one target and wrong for the other, and that is what a
+                     per-target override is for.
+    """
+    findings: list[Diagnosis] = []
+
+    # --- Rule 1: high RTT — distance/routing, not tunable ------------------
+    if phases.rtt_ms is not None and phases.rtt_ms > rtt_high_ms:
+        findings.append(Diagnosis(
+            code=CODE_HIGH_RTT,
+            severity=SEVERITY_WARN,
+            evidence=f"rtt_ms={phases.rtt_ms:.0f} (threshold {rtt_high_ms:.0f})",
+            recommendation=(
+                "RTT this high is distance or routing — no sysctl shrinks the "
+                "speed of light. Serve this endpoint from a CDN or an edge/"
+                "anycast region closer to the probe. TCP tuning only helps "
+                "throughput on this path, never latency."
+            ),
+        ))
+
+    # --- Rule 2: slow DNS ---------------------------------------------------
+    if phases.dns_ms is not None and phases.dns_ms > DNS_SLOW_MS:
+        findings.append(Diagnosis(
+            code=CODE_SLOW_DNS,
+            severity=SEVERITY_WARN,
+            evidence=f"dns_ms={phases.dns_ms:.0f} (threshold {DNS_SLOW_MS:.0f})",
+            recommendation=(
+                "The resolver, not the target, spent this time. Run a local "
+                "caching resolver (systemd-resolved, dnsmasq, unbound) or "
+                "point at a faster upstream (1.1.1.1 / 8.8.8.8), and check "
+                "the record's TTL — a 30 s TTL forces constant re-resolution."
+            ),
+        ))
+
+    # --- Rule 3: TLS handshake overhead ------------------------------------
+    if (
+        phases.tls_ms is not None
+        and phases.rtt_ms is not None
+        and phases.tls_ms > 2 * phases.rtt_ms + TLS_OVERHEAD_SLACK_MS
+    ):
+        findings.append(Diagnosis(
+            code=CODE_TLS_OVERHEAD,
+            severity=SEVERITY_WARN,
+            evidence=(
+                f"tls_ms={phases.tls_ms:.0f} vs 2xRTT+{TLS_OVERHEAD_SLACK_MS:.0f}"
+                f"={2 * phases.rtt_ms + TLS_OVERHEAD_SLACK_MS:.0f}"
+            ),
+            recommendation=(
+                "The handshake costs more round trips than TLS 1.3 needs "
+                "(1-RTT, 0-RTT on resumption). Enable TLS 1.3 on the server, "
+                "turn on session resumption/tickets, and staple OCSP so the "
+                "client skips the revocation round trip."
+            ),
+        ))
+
+    # --- Rule 4: slow backend (network exonerated) --------------------------
+    # Structurally unreachable for a redirecting target, and that is correct.
+    # server_processing_ms is voided whenever the response arrived through a
+    # redirect chain (main.py gates the subtraction on `redirected`), so this
+    # rule cannot fire for one no matter how slow that backend actually is.
+    # github.com is the live case: 230 probes, zero values, zero findings.
+    # Reading that as missing coverage is the trap, and relaxing the guard here
+    # is the wrong fix -- it would produce a number built from two different
+    # connections, which is worse than no number because it looks like a
+    # measurement. A redirecting target that needs backend timing needs per-hop
+    # measurement upstream, not a threshold comparison against a bad subtrahend.
+    if (
+        phases.server_processing_ms is not None
+        and phases.server_processing_ms > backend_slack_ms
+    ):
+        findings.append(Diagnosis(
+            code=CODE_SLOW_BACKEND,
+            severity=SEVERITY_WARN,
+            evidence=(
+                f"server_processing_ms={phases.server_processing_ms:.0f} "
+                f"(TTFB minus RTT, threshold {backend_slack_ms:.0f})"
+            ),
+            recommendation=(
+                "The network already delivered the request — the server sat "
+                "on it. This is application time: profile the handler, the "
+                "database queries behind it, or cold starts. A CDN or TCP "
+                "tuning will not move this number."
+            ),
+        ))
+
+    # --- Rule 5: window-limited transfer (bandwidth confidence gated) -------
+    if bandwidth_confidence(phases) == CONFIDENCE_HIGH:
+        eff_window = effective_window_bytes(phases)
+        ceiling = default_window_ceiling_bps(phases)
+        if (
+            eff_window is not None
+            and eff_window < DEFAULT_WINDOW_BYTES * WINDOW_LIMITED_FACTOR
+        ):
+            ceiling_txt = (
+                f"; a 64KB window caps this path at {ceiling / 1e6:.1f} Mbit/s"
+                if ceiling is not None else ""
+            )
+            findings.append(Diagnosis(
+                code=CODE_WINDOW_LIMITED,
+                severity=SEVERITY_WARN,
+                evidence=(
+                    f"effective_window={eff_window:.0f}B over a "
+                    f"{phases.body_bytes}B transfer at rtt_ms="
+                    f"{phases.rtt_ms:.0f}{ceiling_txt}"
+                ),
+                recommendation=(
+                    "The transfer never filled even a classic 64KB window — "
+                    "throughput is window-limited, not pipe-limited. Verify "
+                    "net.ipv4.tcp_window_scaling=1 on both ends and raise "
+                    "net.core.rmem_max / net.ipv4.tcp_rmem on the receiver. "
+                    "If the server is remote and untunable, a CDN edge "
+                    "shortens the RTT, which shrinks the BDP the window must "
+                    "cover."
+                ),
+            ))
+
+    # --- Rule 6: certificate expiry -----------------------------------------
+    if phases.tls_cert_days_left is not None:
+        if phases.tls_cert_days_left < CERT_CRIT_DAYS:
+            findings.append(Diagnosis(
+                code=CODE_CERT_EXPIRING,
+                severity=SEVERITY_CRITICAL,
+                evidence=(
+                    f"tls_cert_days_left={phases.tls_cert_days_left} "
+                    f"(critical below {CERT_CRIT_DAYS})"
+                ),
+                recommendation=(
+                    "Renew the certificate NOW. When it expires every client "
+                    "hard-fails the handshake — this outage has a scheduled "
+                    "date and it is on the certificate."
+                ),
+            ))
+        elif phases.tls_cert_days_left < CERT_WARN_DAYS:
+            findings.append(Diagnosis(
+                code=CODE_CERT_EXPIRING,
+                severity=SEVERITY_WARN,
+                evidence=(
+                    f"tls_cert_days_left={phases.tls_cert_days_left} "
+                    f"(warn below {CERT_WARN_DAYS})"
+                ),
+                recommendation=(
+                    "Renew the certificate before the window closes, or wire "
+                    "up auto-renewal (certbot/ACME) so this warning never "
+                    "fires again."
+                ),
+            ))
+
+    # --- Rule 7: server does not offer HTTP/2 on a high-latency path --------
+    # Fires only when the server was actually tested (h2_supported is not None)
+    # and explicitly declined h2, AND the path is slow enough that HTTP/1.1
+    # head-of-line blocking bites. On a fast LAN this is noise, so it stays
+    # quiet there.
+    if (
+        phases.h2_supported is False
+        and phases.rtt_ms is not None
+        and phases.rtt_ms > rtt_high_ms
+    ):
+        findings.append(Diagnosis(
+            code=CODE_HTTP2_UNSUPPORTED,
+            severity=SEVERITY_INFO,
+            evidence=(
+                f"alpn={phases.alpn_protocol!r} h2=no at rtt_ms="
+                f"{phases.rtt_ms:.0f} (threshold {rtt_high_ms:.0f})"
+            ),
+            recommendation=(
+                "The server only offers HTTP/1.1. On this high-RTT path, "
+                "HTTP/1.1 head-of-line blocking serialises requests that "
+                "HTTP/2 would multiplex over one connection. Enable HTTP/2 "
+                "(h2) on the server or its load balancer/CDN edge — the win "
+                "grows with RTT and with the number of resources per page."
+            ),
+        ))
+
+    return findings
+
+
+def cert_alert_threshold(
+    days_left: int | None, already_alerted_at: int | None
+) -> int | None:
+    """
+    Decide whether an expiring certificate warrants an alert right now, and
+    at which threshold — or None for silence.
+
+    Pure by design: the whole suppression rule lives here, so the table of
+    cases below is testable with plain calls — no probe, no state file, no
+    webhook. That matters because the risk in this feature is not "does it
+    alert" but "does it stop alerting": a certificate sits below its warning
+    threshold for 30 days, which is 43,200 runs, and 43,198 of them must stay
+    quiet.
+
+    The stored value is the THRESHOLD last alerted at, not the days
+    remaining. Days remaining change every single day and are useless for
+    "have I already said this"; the threshold is stable for the whole band.
+
+        days  stored  ->  result
+          25       —      alert at 30 (first warn crossing)
+          24      30      silence
+           6      30      alert at 7 (escalation to critical)
+           5       7      silence
+          90       7      clear — renewed, so the next expiry alerts again
+          25       —      alert at 30 (a year later, as if new)
+
+    The reset on renewal is the case that cannot be dropped. Without it a
+    renewed certificate keeps ``stored = 7`` forever, and its next expiry
+    would skip the 30-day warning entirely — the monitor going quiet exactly
+    at the notice that gives the most room to act.
+
+    Args:
+        days_left:          phases.tls_cert_days_left; None for plain HTTP or
+                            when the transport did not expose a certificate.
+        already_alerted_at: The threshold this target was last alerted at, or
+                            None if never (or since renewed).
+
+    Returns:
+        CERT_CRIT_DAYS or CERT_WARN_DAYS when an alert should fire now, else
+        None. A None return with a healthy certificate is also the caller's
+        signal to clear any stored threshold — see is_cert_healthy().
+    """
+    if days_left is None:
+        return None
+
+    if days_left < CERT_CRIT_DAYS:
+        threshold = CERT_CRIT_DAYS
+    elif days_left < CERT_WARN_DAYS:
+        threshold = CERT_WARN_DAYS
+    else:
+        return None  # healthy — nothing to say
+
+    if already_alerted_at is None or threshold < already_alerted_at:
+        return threshold
+
+    # Known limitation: a partial renewal landing back inside the
+    # 7-30 day band does not re-alert, because 30 < 7 is false. Defensible —
+    # the operator already got the critical — and rare enough not to
+    # complicate the rule. Documented, not forgotten.
+    return None
+
+
+def is_cert_renewed(days_left: int | None, last_seen_days: int | None) -> bool:
+    """
+    True when this run's days_left is HIGHER than the previous run's.
+
+    Certificate lifetime only ever decreases with the calendar, so an
+    increase means one thing: the certificate was replaced. This is the only
+    renewal signal available for a certificate whose NEW validity period is
+    itself under CERT_WARN_DAYS — short-lived cert programs, or an internal
+    PKI issuing 14-day certs.
+
+    is_cert_healthy() cannot cover that case: it asks "is this certificate
+    comfortable" and a 25-day cert is not, so it never fires the reset.
+    Without this signal, a target that has
+    already alerted at the 7-day threshold and then renews to anything below
+    30 days is silenced permanently — through the next full decay, and
+    through the certificate actually expiring, with no alert at any point.
+    """
+    return (
+        days_left is not None
+        and last_seen_days is not None
+        and days_left > last_seen_days
+    )
+
+
+def is_cert_healthy(days_left: int | None) -> bool:
+    """
+    True when a certificate is far enough out that any stored alert threshold
+    should be cleared — the renewal case in cert_alert_threshold's table.
+
+    Separate from cert_alert_threshold because "should I alert" and "should I
+    forget that I alerted" are different questions, and collapsing them into
+    one return value is how the reset gets lost in a refactor.
+    """
+    return days_left is not None and days_left >= CERT_WARN_DAYS
+
+
+def degraded_reason(
+    phases: ProbePhases,
+    findings: list[Diagnosis],
+    *,
+    degraded_ttfb_ms: float = DEGRADED_TTFB_MS,
+) -> str | None:
+    """
+    Decide whether a *successful* probe should count as DEGRADED, and why.
+
+    A 200 is not the same as healthy. A service answering 200 in 2.8 seconds,
+    or tripping a performance finding, is up and hurting — the state machine
+    must be able to say so without waiting for it to go fully DOWN.
+
+    Args:
+        phases:           The measured probe phases.
+        findings:         The findings analyze() already produced for phases.
+        degraded_ttfb_ms: Per-target override of DEGRADED_TTFB_MS. A report
+                          that legitimately takes 3s is a chronic false
+                          DEGRADED under the global default — the whole point
+                          of a per-target SLA override.
+
+    Returns:
+        A short human-readable reason string when the service is degraded, or
+        None when it is cleanly healthy. The reason is what lands in the
+        yellow alert and in state.json's last_error field.
+    """
+    degrading = [f for f in findings if f.code in DEGRADING_FINDING_CODES]
+    if degrading:
+        return "; ".join(f"{f.code} ({f.evidence})" for f in degrading)
+
+    if phases.ttfb_ms > degraded_ttfb_ms:
+        return f"SLOW_RESPONSE (ttfb_ms={phases.ttfb_ms:.0f} > {degraded_ttfb_ms:.0f})"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Serialization for state.json
+# ---------------------------------------------------------------------------
+
+def phases_to_dict(phases: ProbePhases, findings: list[Diagnosis]) -> dict:
+    """
+    Serialize one measurement + its findings for persistence in state.json.
+
+    Numbers are rounded to keep the file human-readable; None survives as
+    null so a consumer can tell "not measured" from zero.
+    """
+    def _r(value: float | None, digits: int = 1) -> float | None:
+        return None if value is None else round(value, digits)
+
+    eff_window = effective_window_bytes(phases)
+    ceiling = default_window_ceiling_bps(phases)
+
+    return {
+        "measured": {
+            "http_status"         : phases.http_status,
+            "rtt_ms"              : _r(phases.rtt_ms),
+            "dns_ms"              : _r(phases.dns_ms),
+            "connect_total_ms"    : _r(phases.connect_total_ms),
+            "tls_ms"              : _r(phases.tls_ms),
+            "ttfb_ms"             : _r(phases.ttfb_ms),
+            "server_processing_ms": _r(phases.server_processing_ms),
+            "transfer_ms"         : _r(phases.transfer_ms),
+            "body_bytes"          : phases.body_bytes,
+            "goodput_bps"         : _r(phases.goodput_bps, 0),
+            "connection_reused"   : phases.connection_reused,
+            "tls_cert_days_left"  : phases.tls_cert_days_left,
+            "alpn_protocol"       : phases.alpn_protocol,
+            "h2_supported"        : phases.h2_supported,
+        },
+        "derived": {
+            "effective_window_bytes"    : _r(eff_window, 0),
+            "default_window_ceiling_bps": _r(ceiling, 0),
+            "bandwidth_confidence"      : bandwidth_confidence(phases),
+        },
+        "findings": [
+            {
+                "code"          : d.code,
+                "severity"      : d.severity,
+                "evidence"      : d.evidence,
+                "recommendation": d.recommendation,
+            }
+            for d in findings
+        ],
+        "measured_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ongoing-incident reminders
+# ---------------------------------------------------------------------------
+
+#: Hours after an outage begins at which a reminder is due. Growing gaps, not a
+#: fixed interval: the spacing itself communicates "this has been going a
+#: while", and a fixed hourly ping is nagging by hour six — the alert fatigue
+#: this project spent several rounds removing.
+REMINDER_SCHEDULE_H: tuple[float, ...] = (1, 2, 4, 6, 12)
+
+#: After the schedule above is exhausted, one reminder per day. An outage that
+#: has lasted twelve hours is known; a daily line is a record, not a page.
+REMINDER_REPEAT_H: float = 24
+
+
+def reminders_due(elapsed_hours: float) -> int:
+    """
+    How many reminders SHOULD have fired for an outage this old.
+
+    Returns a count, not a boolean, and that is the point. Comparing this
+    against how many were actually sent makes the schedule self-correcting:
+    a monitor that was itself down for six hours comes back, sees that three
+    reminders were owed, and sends one — not three, and not zero. A boolean
+    "is one due right now" would fire only if a run happened to land inside
+    the right window, so a missed cycle would silently skip that reminder
+    forever.
+
+    Pure: no clock, no state. The caller supplies the elapsed time.
+    """
+    # No guard against a negative elapsed time on purpose: the arithmetic
+    # already answers 0, because no `>=` comparison below can hold. A mutation
+    # test proved the guard was code a test could not tell from its absence,
+    # which is the definition of noise. The property is held by the test that
+    # asserts it, not by a line that restates it.
+    due = sum(1 for threshold in REMINDER_SCHEDULE_H if elapsed_hours >= threshold)
+    last = REMINDER_SCHEDULE_H[-1]
+    if elapsed_hours >= last:
+        due += int((elapsed_hours - last) // REMINDER_REPEAT_H)
+    return due
+
+
+# ---------------------------------------------------------------------------
+# Latency trend
+# ---------------------------------------------------------------------------
+
+#: A change must be at least this large in RELATIVE terms to count.
+TREND_MIN_CHANGE_PCT: float = 50.0
+
+#: ...and at least this large in ABSOLUTE terms. Both, not either.
+#:
+#: 2 ms to 6 ms is +200% and matters to nobody. Without an absolute floor this
+#: feature would fire on numbers too small to act on, and a signal that fires
+#: on nothing is one an operator learns to ignore — the exact failure the whole
+#: project is built against.
+TREND_MIN_CHANGE_MS: float = 50.0
+
+#: Minimum readings per window. A p95 over three samples is a number, not a
+#: measurement, and comparing two of them is arithmetic on noise.
+TREND_MIN_SAMPLES: int = 20
+
+#: Why a comparison produced no verdict. Returned rather than swallowed:
+#: "suppressed because the change was tiny" and "the feature did not run" look
+#: identical from outside, and only one of them is fine.
+#: Minimum share of a window's probes that must have ANSWERED for its p95 to
+#: describe the target instead of its survivors.
+#:
+#: A p95 is computed over the probes that came back, so a window that lost a
+#: third of them is a statement about the ones that happened to work. Measured
+#: over the 230 collected probes per target with sliding 3-day windows:
+#: google.com, github.com and cloudflare.com answered 100% of probes in EVERY
+#: window, with zero variance. httpbin.org/status/200 answered 64%. There is no
+#: overlap to split, so 90 sits above httpbin's whole range and below nothing
+#: the healthy targets ever did.
+#:
+#: This is what makes the check structural. Mitigating it with a per-target flag
+#: requires the operator to already know which targets are uninterpretable, and
+#: that knowledge is what the system should produce rather than ask for --
+#: httpbin was found by measuring, and the next noisy target arrives unannounced.
+TREND_MIN_SUCCESS_PCT: float = 90.0
+
+#: Maximum difference in answer rate between the two windows, in percentage
+#: points.
+#:
+#: The floor above catches a target that is unreliable in both windows. This
+#: catches survivorship bias: two windows can each clear the floor while one
+#: answered more probes than the other, and then the change in p95 partly
+#: reflects which subset survived rather than how slow the backend got.
+#:
+#: THE TWO CONSTANTS ARE COUPLED, and getting that wrong makes this one dead
+#: code. Both windows have to clear the floor before this is even consulted, so
+#: with the floor at 90 they are both inside [90, 100] and the widest gap
+#: reachable is 10 points. A gap threshold above 10 can never fire. The first
+#: version of this was 20, chosen from httpbin's measured peaks of 20.4 and
+#: 33.3 — correct numbers for the wrong question, because httpbin never clears
+#: the floor and so never reaches this check.
+#:
+#: 5 is the middle of the reachable band, and above the 0.0 that google.com,
+#: github.com and cloudflare.com show at every percentile: they answered 100%
+#: of probes in every window measured. Lower the floor and this regains room;
+#: raise the floor past 95 and it loses all of it.
+TREND_MAX_SUCCESS_GAP_PCT: float = 5.0
+
+TREND_OK              = "ok"                # measured, and nothing changed enough
+TREND_DEGRADING       = "degrading"
+TREND_IMPROVING       = "improving"
+TREND_TOO_FEW_SAMPLES = "too_few_samples"   # not enough history to compare
+TREND_NO_DATA         = "no_data"           # one window or both are empty
+TREND_INCOMPARABLE    = "incomparable"      # the two windows are not comparable
+
+
+def latency_trend(
+    recent_p95      : float | None,
+    previous_p95    : float | None,
+    recent_samples  : int = 0,
+    previous_samples: int = 0,
+    recent_total    : int = 0,
+    previous_total  : int = 0,
+) -> dict:
+    """
+    Compare two equal-length windows of the same target and say what changed.
+
+    Why two windows instead of a threshold
+    --------------------------------------
+    A fixed threshold answers "is this slow", which every target answers
+    differently and which the per-target overrides already handle. It cannot
+    answer "is this getting worse", and that is the failure a threshold never
+    sees: a service drifting from 50 ms to 380 ms over two weeks never crosses
+    400 ms, so it dies slowly and in silence. Comparing a target against its
+    own recent past makes the signal relative to the target — an endpoint that
+    was always 300 ms is not news; one that went from 50 to 300 is.
+
+    p95 and not the mean, because the mean hides exactly the tail worth
+    knowing about.
+
+    Always returns a dict with a ``verdict``. It never returns None and never
+    silently declines: a change suppressed by the floors reports
+    ``ok`` WITH the numbers that were suppressed, so a reader can tell
+    "measured, too small to act on" from "did not run". Those two look the same
+    from outside and only one of them is acceptable.
+    """
+    result: dict = {
+        "recent_p95_ms"   : recent_p95,
+        "previous_p95_ms" : previous_p95,
+        "recent_samples"  : recent_samples,
+        "previous_samples": previous_samples,
+        "change_pct"      : None,
+        "change_ms"       : None,
+        "verdict"         : TREND_NO_DATA,
+        "suppressed_by"   : None,
+        "recent_success_pct"  : None,
+        "previous_success_pct": None,
+    }
+
+    if recent_p95 is None or previous_p95 is None or previous_p95 <= 0:
+        return result
+
+    if min(recent_samples, previous_samples) < TREND_MIN_SAMPLES:
+        result["verdict"] = TREND_TOO_FEW_SAMPLES
+        return result
+
+    change_ms  = recent_p95 - previous_p95
+    change_pct = (change_ms / previous_p95) * 100.0
+    result["change_ms"]  = change_ms
+    result["change_pct"] = change_pct
+    result["verdict"]    = TREND_OK
+
+    # Comparability before magnitude. The floors below answer "is this change
+    # big enough to act on"; this answers "is this a change at all", and asking
+    # the second question of two windows that measured different populations
+    # produces a confident number about nothing.
+    #
+    # The totals are optional so every existing caller keeps working: with no
+    # denominator there is nothing to check and the verdict is unchanged.
+    if recent_total > 0 and previous_total > 0:
+        recent_rate   = 100.0 * recent_samples / recent_total
+        previous_rate = 100.0 * previous_samples / previous_total
+        result["recent_success_pct"]   = recent_rate
+        result["previous_success_pct"] = previous_rate
+
+        if min(recent_rate, previous_rate) < TREND_MIN_SUCCESS_PCT:
+            # Unreliable in at least one window: the p95 describes survivors.
+            result["verdict"]       = TREND_INCOMPARABLE
+            result["suppressed_by"] = "success_floor"
+            return result
+        if abs(recent_rate - previous_rate) > TREND_MAX_SUCCESS_GAP_PCT:
+            # Reliable enough in both, but not EQUALLY: the change in p95 may be
+            # a change in which probes survived.
+            result["verdict"]       = TREND_INCOMPARABLE
+            result["suppressed_by"] = "success_gap"
+            return result
+
+    if abs(change_pct) < TREND_MIN_CHANGE_PCT:
+        result["suppressed_by"] = "relative"
+        return result
+    if abs(change_ms) < TREND_MIN_CHANGE_MS:
+        # Named, not hidden. A +200% jump from 2 ms to 6 ms is real and
+        # irrelevant; saying WHICH floor stopped it is what keeps a quiet
+        # feature from reading as a broken one.
+        result["suppressed_by"] = "absolute"
+        return result
+
+    result["verdict"] = TREND_DEGRADING if change_ms > 0 else TREND_IMPROVING
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Maintenance windows
+# ---------------------------------------------------------------------------
+
+def in_maintenance(windows: list[dict] | None, now: datetime) -> dict | None:
+    """
+    Return the window currently in effect for a target, or None.
+
+    A window is ``{"days": [0..6], "start": "HH:MM", "end": "HH:MM"}`` in UTC,
+    where 0 is Monday. Recurring weekly, because planned work recurs weekly:
+    a one-off outage does not need configuration, it needs someone to ignore
+    one alert.
+
+    Windows silence the ALERT, never the probe. During one the target is still
+    measured and still recorded, so uptime stays honest and the history has no
+    hole. A window that stopped probing would leave a gap on the dashboard
+    indistinguishable from "the monitor died" — trading a known noise for an
+    unknown silence, which is the worse of the two every time.
+
+    A window whose end is before its start crosses midnight (``22:00`` to
+    ``02:00``), and is evaluated as such rather than treated as invalid: the
+    hours nobody is awake are exactly the hours maintenance happens.
+
+    Pure: the caller supplies the clock.
+    """
+    if not windows:
+        return None
+
+    weekday = now.weekday()
+    minutes = now.hour * 60 + now.minute
+
+    for window in windows:
+        days = window.get("days")
+        try:
+            start_h, start_m = (int(part) for part in window["start"].split(":"))
+            end_h,   end_m   = (int(part) for part in window["end"].split(":"))
+        except (KeyError, ValueError, AttributeError):
+            continue                      # validated on the way in; skip if not
+
+        start = start_h * 60 + start_m
+        end   = end_h * 60 + end_m
+        if end == 1439:
+            # 23:59 is the full-day recipe the store's own rejection message
+            # hands the operator ("to silence the whole day use 00:00 to
+            # 23:59"). With an exclusive end that recipe leaves the last
+            # minute of every day unsilenced, so the config and the message
+            # that produced it disagree once a day, forever. Every other end
+            # stays exclusive; only this one is special-cased, because only
+            # this one is documented as meaning "all of it".
+            end = 1440
+
+        if start <= end:
+            if days is not None and weekday not in days:
+                continue
+            if start <= minutes < end:
+                return window
+        else:
+            # Crosses midnight. The tail after 00:00 belongs to the PREVIOUS
+            # day's window, so a Monday 22:00-02:00 window covers Tuesday's
+            # small hours — matching how a human describes "Monday night".
+            if minutes >= start:
+                if days is None or weekday in days:
+                    return window
+            elif minutes < end:
+                if days is None or (weekday - 1) % 7 in days:
+                    return window
+    return None
