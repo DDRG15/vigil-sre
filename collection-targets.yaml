@@ -1,0 +1,35 @@
+# =============================================================================
+# collection-targets.yaml — the fixed list the 14-day data collection probes
+# =============================================================================
+#
+# Used only by .github/workflows/data-collection.yml, which copies it over
+# targets.yaml inside the runner's throwaway checkout. The monitor's own
+# targets.yaml is not touched.
+#
+# Fixed, not random. The p95 trend and the daily summaries compare a target
+# with itself over time, so every run must measure the same targets; a list
+# that changed per run would produce windows with nothing in common.
+#
+# Large, stable public sites, probed once an hour with a single GET of the
+# front page: traffic none of them will notice. No thresholds are overridden —
+# the point is to see where each target actually lives from a datacenter, not
+# to page anyone.
+#
+# Every entry answered 200 to the monitor's own request before it was added.
+# Sites that answer 403 to automated requests (bot protection, or a policy
+# requiring a custom User-Agent) were left out: they would read DOWN for the
+# whole window and measure nothing.
+
+targets:
+  - url: https://www.google.com
+  - url: https://www.cloudflare.com
+  - url: https://www.github.com
+  - url: https://www.debian.org
+  - url: https://www.mozilla.org
+  - url: https://www.python.org
+  - url: https://pypi.org
+  - url: https://www.apple.com
+  - url: https://www.microsoft.com
+  - url: https://aws.amazon.com
+  - url: https://www.fastly.com
+  - url: https://www.kernel.org

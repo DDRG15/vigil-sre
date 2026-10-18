@@ -15,6 +15,7 @@ history.db
 # A history database rebuilt by scripts/import-history.py from an NDJSON export.
 # It is regenerable data, not code.
 collected.db
+collected.ndjson
 # Runtime state: state.json, targets.json, the watchdog's database and the
 # history database all live under data/. None of it commits.
 #

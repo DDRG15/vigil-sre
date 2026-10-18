@@ -8,6 +8,10 @@
 > Hiring teams are welcome to clone and run it to evaluate my work.
 > For any other use, ask.
 
+> **Data collection in progress:** until 1 November 2026, a scheduled GitHub Actions
+> workflow probes 12 public sites once an hour and appends the results to the
+> `collected-data` branch. See "A second collection run" below.
+
 This is not a monitoring script. It is a monitoring microservice — the distinction
 matters. A script does a job. A microservice has a contract. This one's contract is
 simple: if something is wrong, you will know. Once. Not seventeen times.
@@ -375,6 +379,7 @@ instead: it includes the runtime requirements plus the test tools.
 │                        through the same API the dashboard editor uses
 ├── targets.yaml         URL configuration — the hand-edited seed
 ├── targets.yaml.example Documented template with every per-target field
+├── collection-targets.yaml The fixed list the 14-day data collection probes
 ├── scripts/             init-watchdog.sh — provisions the self-hosted watchdog
 │                        export/import-history.py — NDJSON round trip of the history
 │                        build-grafana-dashboards.py — generates the dashboards below
@@ -388,11 +393,12 @@ instead: it includes the runtime requirements plus the test tools.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1199-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1205-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
-├── .github/             CI: pytest, then docker build + run a real health-check cycle
+├── .github/             CI: pytest, then docker build + run a real health-check cycle;
+│                        data-collection: hourly probes for 14 days, rows to a data branch
 ├── .env                 Secret store — never committed
 ├── .env.example         Template — committed, contains no secrets
 ├── data/                Runtime artifacts, bind-mounted (the whole directory is gitignored)
@@ -408,7 +414,7 @@ instead: it includes the runtime requirements plus the test tools.
 
 We do not ship what we cannot prove works.
 
-1199 automated tests cover every component in isolation: target loading (including
+1205 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -1099,6 +1105,27 @@ The threshold lines the panels draw are asserted against the constants
 `diagnostics.py` actually applies. A dashboard drawing 900 ms while the code
 alerts at 500 ms does not look wrong — it looks like a measurement, and someone
 reads "this is below the line" and concludes it will not alert.
+
+### A second collection run (in progress)
+
+`.github/workflows/data-collection.yml` runs once an hour from 18 October to
+1 November 2026 (UTC). Each run probes the fixed list in `collection-targets.yaml`
+— twelve large public sites, the same every time, so a target can be compared with
+itself across the two weeks — and appends the new rows as NDJSON to the
+`collected-data` branch, committed only as `github-actions[bot]`. It never writes to
+`main`, has no alert channels, and switches its own schedule off when the window
+closes. The sites in the list answered 200 to the monitor's request when they were
+chosen; ones that refuse automated requests were left out, because they would read
+DOWN for the whole window and measure nothing.
+
+To look at the data, fetch the branch and import it:
+
+```bash
+git fetch origin collected-data
+git show origin/collected-data:collected/github-actions.ndjson > collected.ndjson
+python scripts/import-history.py collected.ndjson --db collected.db
+```n
+The numbers describe GitHub's datacenter path to each site, not yours.
 
 ### What the first collection run found
 
