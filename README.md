@@ -1,5 +1,7 @@
 # SRE Health Checker
 
+[![CI](https://github.com/DDRG15/vigil-sre/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DDRG15/vigil-sre/actions/workflows/ci.yml)
+
 **Engineering is the art of preventing the predictable.**
 
 > Source-available under [PolyForm Strict 1.0.0](LICENSE), not open source.
