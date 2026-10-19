@@ -116,6 +116,11 @@ jobs:
           fi
           echo "  rows exported in this run: $(wc -l < /tmp/new.ndjson)"
 
+          # Probe once replaced this tracked file. The export is safe in /tmp;
+          # restore the input before switching to a branch that deletes it.
+          # Otherwise every run after the first aborts on local changes.
+          git restore -- targets.yaml
+
           if [ "$HAVE_BRANCH" = 1 ]; then
             git checkout "$DATA_BRANCH"
           else

@@ -393,7 +393,7 @@ instead: it includes the runtime requirements plus the test tools.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1205-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1206-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -414,7 +414,7 @@ instead: it includes the runtime requirements plus the test tools.
 
 We do not ship what we cannot prove works.
 
-1205 automated tests cover every component in isolation: target loading (including
+1206 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
