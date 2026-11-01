@@ -398,6 +398,54 @@ instead: it includes the runtime requirements plus the test tools.
 
 ---
 
+## Running on Kubernetes
+
+`deploy/k8s/` runs what compose runs: the monitor and the dashboard as two
+containers of one pod, on one PersistentVolumeClaim. Tested on a local `kind`
+cluster:
+
+```bash
+kind create cluster --name vigil-sre
+docker build -t vigil-sre:local . && kind load docker-image vigil-sre:local --name vigil-sre
+kubectl apply -f deploy/k8s/
+kubectl -n vigil-sre create secret generic vigil-sre-env --from-env-file=.env
+kubectl -n vigil-sre port-forward svc/vigil-sre-dashboard 8787     # http://127.0.0.1:8787
+```
+
+The seed list probes `http://echo.vigil-demo.svc.cluster.local:5678/`, a demo
+service inside the cluster, by its DNS name. Scale it to zero and the monitor
+reports it DOWN on the second failed round, the same two confirmations as
+anywhere else; scale it back and it recovers. To try that without alerting
+your real channel, create the Secret pointing at the demo's sink instead (the
+command is at the top of `deploy/k8s/demo-echo.yaml`).
+
+What the manifests hold, and `tests/test_k8s_manifests.py` checks:
+- **One replica, `strategy: Recreate`.** A rolling update starts the new pod before
+  the old one stops, and for that overlap two monitors would send every alert
+  twice and write the same SQLite file.
+- **The image's uid (999) through `fsGroup`.** The volume needs no setfacl step.
+- **A read-only root filesystem**, all capabilities dropped. That is how the
+  monitor's log file was found: it opened `health_checker.log` in the working
+  directory and crashed every round. `LOG_FILE=""` now keeps the log on stdout,
+  which is what `kubectl logs` reads.
+- **The compose loop**, character for character, and compose's 150 s stop grace.
+- **No Secret in the repository.** The pod reads an optional one made from `.env`.
+
+Kubernetes restarts what dies and replaces what disappears, which is the job
+`restart: unless-stopped` does in compose; deleting the pod brings up a new one
+with the history intact. What it does not do is notice that a service answers
+wrong or slowly, and that is still this monitor's job. The heartbeat still
+matters too: if the node goes, nothing in the cluster is left to bring
+anything back.
+
+One interaction to know about: a round whose alert reaches no channel exits 1
+by design, the loop stops, and Kubernetes restarts the container. With no
+channel configured at all, an outage therefore puts the monitor in
+CrashLoopBackOff, probing less and less often until a channel exists. Create the
+Secret before relying on it.
+
+---
+
 ## File Structure
 
 ```
@@ -426,12 +474,14 @@ instead: it includes the runtime requirements plus the test tools.
 │                        JSON is built from the probed list, never hand-edited
 ├── Dockerfile           Multi-stage, non-root, health-checked production image
 ├── docker-compose.yml   Standard deployment manifest
+├── deploy/k8s/          Kubernetes: one pod (monitor + dashboard) on one volume, and a
+│                        demo namespace with an in-cluster target and a webhook sink
 ├── .dockerignore        An allowlist: the build sees requirements.txt and the Python
 │                        modules, nothing else
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1241-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1257-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -452,7 +502,7 @@ instead: it includes the runtime requirements plus the test tools.
 
 We do not ship what we cannot prove works.
 
-1241 automated tests cover every component in isolation: target loading (including
+1257 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —

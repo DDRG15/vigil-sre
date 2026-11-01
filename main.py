@@ -120,17 +120,24 @@ LOG_BACKUP_COUNT: int = 5                 # keep 5 rotated files (50 MiB total c
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 
+# LOG_FILE moves the file; LOG_FILE="" drops it and leaves stdout. A pod with a
+# read-only root filesystem cannot open health_checker.log in the working
+# directory -- the handler raised at import and every round died before
+# probing anything -- and a container's log is its stdout anyway.
+LOG_FILE: str = os.getenv("LOG_FILE", "health_checker.log")
+
+_log_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+if LOG_FILE:
+    _log_handlers.append(RotatingFileHandler(
+        LOG_FILE, mode="a", maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+    ))
+
 logging.basicConfig(
     level=logging.INFO,
     format=LOG_FORMAT,
     datefmt=DATE_FORMAT,
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        RotatingFileHandler(
-            "health_checker.log", mode="a", maxBytes=LOG_MAX_BYTES,
-            backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
-        ),
-    ],
+    handlers=_log_handlers,
 )
 logger = logging.getLogger("sre.health_checker")
 

@@ -2170,6 +2170,46 @@ def test_main_wires_rotating_file_handler_in_a_clean_interpreter(tmp_path: Path)
     assert wiring["bak"] > 0
 
 
+def _handlers_in_a_clean_interpreter(tmp_path: Path, log_file: str | None) -> dict:
+    project_root = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONPATH": str(project_root)}
+    env.pop("LOG_FILE", None)
+    if log_file is not None:
+        env["LOG_FILE"] = log_file
+    code = (
+        "import json, logging, main;"
+        "hs=logging.getLogger().handlers;"
+        "f=[x.baseFilename for x in hs if isinstance(x, main.RotatingFileHandler)];"
+        "s=[x for x in hs if type(x) is logging.StreamHandler];"
+        "print(json.dumps({'files': f, 'streams': len(s)}))"
+    )
+    result = subprocess.run([sys.executable, "-c", code], cwd=str(tmp_path), env=env,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_an_empty_log_file_setting_logs_to_stdout_only(tmp_path: Path) -> None:
+    """In a pod with a read-only root filesystem, opening health_checker.log
+    in the working directory raised at import, so every round died before
+    probing anything. A container's log is its stdout; LOG_FILE="" says so."""
+    wiring = _handlers_in_a_clean_interpreter(tmp_path, "")
+    assert wiring == {"files": [], "streams": 1}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_log_file_can_be_put_somewhere_else(tmp_path: Path) -> None:
+    target = tmp_path / "logs" / "monitor.log"
+    target.parent.mkdir()
+    wiring = _handlers_in_a_clean_interpreter(tmp_path, str(target))
+    assert wiring["files"] == [str(target)] and wiring["streams"] == 1
+
+
+def test_without_the_setting_the_log_file_is_where_it_always_was(tmp_path: Path) -> None:
+    wiring = _handlers_in_a_clean_interpreter(tmp_path, None)
+    assert wiring["files"] == [str(tmp_path / "health_checker.log")]
+
+
 def test_rotating_file_handler_actually_rotates(tmp_path: Path) -> None:
     """A plain FileHandler(mode='a') never rotates -- the bug this fixes.
     Proves RotatingFileHandler, the class main.py now wires up, genuinely

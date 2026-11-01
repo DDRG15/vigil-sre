@@ -1,0 +1,112 @@
+# =============================================================================
+# deploy/k8s/demo-echo.yaml — a service inside the cluster for the monitor to watch
+# =============================================================================
+#
+# The seed list in vigil-sre.yaml probes it by its cluster DNS name. Scale it to
+# zero and the monitor reports it DOWN; scale it back and it recovers:
+#
+#   kubectl -n vigil-demo scale deploy/echo --replicas=0
+#
+# webhook-sink is where the demo's alerts go: it answers 200 to any POST, as the
+# receiver in CI does, so an alert is delivered without reaching anyone's chat:
+#
+#   kubectl -n vigil-sre create secret generic vigil-sre-env \
+#     --from-literal=DISCORD_WEBHOOK_URL=http://webhook-sink.vigil-demo.svc.cluster.local:5678/
+#
+# Without any channel, an alert reaches nobody, the round exits 1 by design,
+# and Kubernetes restarts the monitor into CrashLoopBackOff until one is set.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vigil-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: vigil-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      securityContext:
+        runAsUser: 65534
+        runAsNonRoot: true
+      containers:
+        - name: echo
+          image: hashicorp/http-echo:1.0.0@sha256:fcb75f691c8b0414d670ae570240cbf95502cc18a9ba57e982ecac589760a186
+          args: ["-listen=:5678", "-text=ok"]
+          ports:
+            - containerPort: 5678
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 32Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  namespace: vigil-demo
+spec:
+  selector:
+    app: echo
+  ports:
+    - port: 5678
+      targetPort: 5678
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-sink
+  namespace: vigil-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webhook-sink
+  template:
+    metadata:
+      labels:
+        app: webhook-sink
+    spec:
+      securityContext:
+        runAsUser: 65534
+        runAsNonRoot: true
+      containers:
+        - name: sink
+          image: hashicorp/http-echo:1.0.0@sha256:fcb75f691c8b0414d670ae570240cbf95502cc18a9ba57e982ecac589760a186
+          args: ["-listen=:5678", "-text=received"]
+          ports:
+            - containerPort: 5678
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 32Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-sink
+  namespace: vigil-demo
+spec:
+  selector:
+    app: webhook-sink
+  ports:
+    - port: 5678
+      targetPort: 5678

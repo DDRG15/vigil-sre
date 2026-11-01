@@ -1,0 +1,214 @@
+# =============================================================================
+# deploy/k8s/vigil-sre.yaml — the monitor and the dashboard in one pod
+# =============================================================================
+#
+# What compose runs, in a cluster. One pod with two containers on one volume,
+# the way compose runs two services on one directory. tests/test_k8s_manifests.py
+# holds each property below, and holds the loop and the paths to compose's.
+#
+#   kubectl apply -f deploy/k8s/
+#   kubectl -n vigil-sre create secret generic vigil-sre-env --from-env-file=.env
+#
+# The Secret is optional and never in the repository: without it the monitor
+# runs with no channels and the dashboard editor is read-only.
+#
+# Kubernetes restarts what dies and replaces what disappears, which is the job
+# `restart: unless-stopped` does in compose. It does not tell anyone that a
+# service answers wrong, slowly or not at all — that is still this monitor's job,
+# and the heartbeat still matters: if the node goes, nothing here comes back.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vigil-sre
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vigil-sre-targets
+  namespace: vigil-sre
+data:
+  # The seed, as targets.yaml is in compose: read until the first save from the
+  # dashboard editor, after which the list lives in data/targets.json on the volume.
+  targets.yaml: |
+    targets:
+      - url: http://echo.vigil-demo.svc.cluster.local:5678/
+      - url: https://www.google.com
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vigil-sre-data
+  namespace: vigil-sre
+spec:
+  # ReadWriteOnce, one pod: SQLite on a volume two nodes write is a locking
+  # problem, and two monitors are two copies of every alert.
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vigil-sre
+  namespace: vigil-sre
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: a rolling update starts the new pod before the
+  # old one stops, and for that overlap two monitors alert and write history.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vigil-sre
+  template:
+    metadata:
+      labels:
+        app: vigil-sre
+    spec:
+      # The uid the Dockerfile pins. fsGroup gives it the volume, which on a
+      # plain Linux host takes the setfacl step in the README.
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      # As long as compose's stop_grace_period: a stop may finish delivering
+      # the alert it started.
+      terminationGracePeriodSeconds: 150
+      containers:
+        - name: monitor
+          image: vigil-sre:local
+          imagePullPolicy: IfNotPresent
+          # The compose loop, with compose's `$$` escape undone. A round, a
+          # 60 s pause, and a stop forwarded to whichever is running.
+          command:
+            - sh
+            - -c
+            - |
+              trap 'if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null; wait "$pid"; fi; exit 0' TERM
+              while true; do
+                python main.py &
+                pid=$!
+                wait "$pid"
+                rc=$?
+                pid=
+                sleep 60 &
+                pid=$!
+                wait "$pid"
+                pid=
+                [ "$rc" -eq 0 ] || exit 1
+              done
+          env:
+            - name: STATE_FILE_PATH
+              value: /app/data/state.json
+            - name: HISTORY_DB_PATH
+              value: /app/data/history/history.db
+            # stdout only: the root filesystem is read-only, and the kubelet
+            # collects stdout. The probe below imports main and inherits this.
+            - name: LOG_FILE
+              value: ""
+          envFrom:
+            - secretRef:
+                name: vigil-sre-env
+                optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: targets
+              mountPath: /app/targets.yaml
+              subPath: targets.yaml
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          # The image's HEALTHCHECK: the code imports and the target list loads.
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import logging, main; logging.getLogger('sre.health_checker').setLevel(logging.CRITICAL); main.load_targets()"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        - name: dashboard
+          image: vigil-sre:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "api.py"]
+          env:
+            - name: STATE_FILE_PATH
+              value: /app/data/state.json
+            - name: HISTORY_DB_PATH
+              value: /app/data/history/history.db
+            - name: API_HOST
+              value: 0.0.0.0
+          envFrom:
+            - secretRef:
+                name: vigil-sre-env
+                optional: true
+          ports:
+            - containerPort: 8787
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            # History read-only for the dashboard, as in compose.
+            - name: data
+              mountPath: /app/data/history
+              subPath: history
+              readOnly: true
+            - name: targets
+              mountPath: /app/targets.yaml
+              subPath: targets.yaml
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet: {path: /api/status, port: 8787}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /api/status, port: 8787}
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 20m, memory: 48Mi}
+            limits: {memory: 192Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: vigil-sre-data
+        - name: targets
+          configMap:
+            name: vigil-sre-targets
+        # The root filesystem is read-only; a CSV export over 1 MiB spools here.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vigil-sre-dashboard
+  namespace: vigil-sre
+spec:
+  # ClusterIP: reach it with `kubectl -n vigil-sre port-forward svc/vigil-sre-dashboard 8787`.
+  # The editor writes the target list; exposing it outside the cluster is a
+  # decision that needs an ingress with authentication in front, not a type change.
+  selector:
+    app: vigil-sre
+  ports:
+    - port: 8787
+      targetPort: 8787
