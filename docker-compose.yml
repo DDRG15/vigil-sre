@@ -209,7 +209,7 @@ services:
   # leaves every other subcommand working.
   watchdog-guard:
     profiles: ["demo-watchdog"]
-    image: busybox:1.37
+    image: busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
     environment:
       - WATCHDOG_SECRET_KEY=${WATCHDOG_SECRET_KEY:-}
     command:
@@ -225,7 +225,7 @@ services:
 
   watchdog:
     profiles: ["demo-watchdog"]
-    image: healthchecks/healthchecks:latest
+    image: healthchecks/healthchecks:v5.0.3@sha256:5eb96eb72dc63ac24743f1c0fc4469931155329e05c9781a0809320de0ae479c
     depends_on:
       # Nothing about the watchdog starts until the guard has exited 0.
       watchdog-guard:
@@ -276,11 +276,13 @@ services:
   # ---------------------------------------------------------------------------
   grafana:
     profiles: ["analysis"]
-    image: grafana/grafana:11.6.0
+    image: grafana/grafana:11.6.0@sha256:62d2b9d20a19714ebfe48d1bb405086081bc602aa053e28cf6d73c7537640dfb
     environment:
       # Grafana core has no SQLite datasource. This plugin adds one and is
-      # installed at startup; the first run needs network access.
-      - GF_INSTALL_PLUGINS=frser-sqlite-datasource
+      # installed at startup; the first run needs network access. The version
+      # is pinned like the images: without one, every fresh volume installs
+      # whatever is newest that day.
+      - GF_INSTALL_PLUGINS=frser-sqlite-datasource 4.0.6
       # No login for a local analysis tool bound to loopback. Publishing this
       # port with anonymous access on hands the instance to anyone who can
       # reach it — which is why the port below is pinned to 127.0.0.1 and must

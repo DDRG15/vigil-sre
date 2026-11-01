@@ -166,6 +166,26 @@ files and bind mounts. They do not appear in image layers. They do not appear in
 registry, scanned by a pipeline, cached by a CI runner, or rotated by a frustrated
 platform engineer six months from now.
 
+Every image is pinned to `tag@sha256:digest` — the Python base, Healthchecks,
+Grafana, busybox — and the Grafana plugin to a version. A tag is a pointer its
+publisher moves: `healthchecks/healthchecks:latest` went from v4 to v5 on
+20 October 2026 without a single change here, under a provisioning script that
+imports that image's internals. With a digest, the same commit builds the same
+stack, and an upgrade is a commit you can test and revert.
+
+To bump one:
+
+```bash
+docker pull python:3.11-slim
+docker image inspect --format '{{index .RepoDigests 0}}' python:3.11-slim
+# paste tag@sha256:... into both FROM lines (or the compose image: line),
+# then rebuild, run the tests, and start the profile that uses it
+```
+
+`tests/test_image_pinning.py` fails on any image left at a bare tag and on two
+Dockerfile stages that drift apart. Pinning is not freezing: the base image
+carries security fixes, so bump it on a schedule, not only when something breaks.
+
 ---
 
 ## Prerequisites
@@ -409,7 +429,7 @@ instead: it includes the runtime requirements plus the test tools.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1212-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1216-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -430,7 +450,7 @@ instead: it includes the runtime requirements plus the test tools.
 
 We do not ship what we cannot prove works.
 
-1212 automated tests cover every component in isolation: target loading (including
+1216 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —

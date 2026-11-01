@@ -35,7 +35,14 @@
 # ── Stage 1: dependency builder ───────────────────────────────────────────────
 # Use the full slim image to compile any C-extension wheels (e.g. aiohttp's
 # optional speedups).  This layer is never shipped in the final image.
-FROM python:3.11-slim AS builder
+#
+# Pinned by digest, and the runtime stage below names the same one: the tag says
+# what it is, the digest is what gets pulled. A tag alone is moved by whoever
+# publishes it, so the same commit would build on a different base next week.
+# Bumping it is a commit: docker pull python:3.11-slim, then
+# docker image inspect --format '{{index .RepoDigests 0}}' python:3.11-slim,
+# and paste the digest into BOTH FROM lines (tests/test_image_pinning.py checks).
+FROM python:3.11-slim@sha256:673719e071ecf27434fd2635bbd8d00f49f4fdd81f243143438a42ced8bedf60 AS builder
 
 # Prevent .pyc files and enable unbuffered stdout/stderr for clean log streaming.
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -53,7 +60,7 @@ RUN pip install --upgrade pip --no-cache-dir \
 
 
 # ── Stage 2: lean runtime image ───────────────────────────────────────────────
-FROM python:3.11-slim AS runtime
+FROM python:3.11-slim@sha256:673719e071ecf27434fd2635bbd8d00f49f4fdd81f243143438a42ced8bedf60 AS runtime
 
 # ── Security: run as a non-root user ──────────────────────────────────────────
 # Creating a dedicated user with no login shell and no home directory is a
