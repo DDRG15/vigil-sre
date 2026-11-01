@@ -136,6 +136,81 @@ def test_no_secret_lives_in_the_repository() -> None:
         assert refs and all(r["name"] == "vigil-sre-env" and r["optional"] is True for r in refs), c["name"]
 
 
+# -----------------------------------------------------------------------------
+# The Secret template. Not applied by `kubectl apply -f deploy/k8s/` -- the
+# primary path is `--from-env-file=.env`, one source -- but present for anyone
+# without a .env (GitOps, sealed-secrets) to see which keys the pod reads. A
+# second list of keys is a list that drifts and a file that invites a real
+# value: each test below closes one of those, so neither can happen quietly.
+# -----------------------------------------------------------------------------
+
+TEMPLATE = K8S / "secret.yaml.example"
+SECRET_KEY = re.compile(r"(URL|TOKEN|KEY)$")
+
+
+def _env_example() -> dict[str, str]:
+    """Every key .env.example documents, set or commented out, with its value."""
+    keys: dict[str, str] = {}
+    for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^#?\s*([A-Z][A-Z0-9_]+)=(.*)$", line)
+        if m:
+            keys.setdefault(m.group(1), m.group(2).strip())
+    return keys
+
+
+def _template() -> dict:
+    docs = [d for d in yaml.safe_load_all(TEMPLATE.read_text(encoding="utf-8")) if d]
+    assert len(docs) == 1
+    return docs[0]
+
+
+def test_the_env_example_parser_finds_the_known_keys() -> None:
+    """Guards the guard: a parser that found nothing would match an empty template."""
+    assert {"DISCORD_WEBHOOK_URL", "SLACK_WEBHOOK_URL", "HEARTBEAT_URL",
+            "API_WRITE_TOKEN", "HISTORY_RETENTION_DAYS"} <= set(_env_example())
+
+
+def test_the_template_is_the_secret_the_pod_reads() -> None:
+    secret = _template()
+    assert secret["kind"] == "Secret"
+    assert secret["metadata"] == {"name": "vigil-sre-env", "namespace": "vigil-sre"}
+    refs = {e["secretRef"]["name"] for c in _pod()["containers"] for e in c.get("envFrom", [])}
+    assert refs == {secret["metadata"]["name"]}
+
+
+def test_the_template_has_every_key_env_example_has_and_no_other() -> None:
+    """The drift guard: a variable added to .env.example and not here, or the
+    other way round, fails in the commit that adds it."""
+    assert set(_template()["stringData"]) == set(_env_example())
+
+
+def test_the_template_holds_no_secret_value() -> None:
+    """Secrets empty; plain settings keep .env.example's value, so a copied
+    template does not put a warning in every round (an empty retention is
+    rejected with a warning and replaced by the default)."""
+    example = _env_example()
+    for key, value in _template()["stringData"].items():
+        if SECRET_KEY.search(key):
+            assert value == "", f"{key} carries a value in a committed file"
+        else:
+            assert str(value) == example[key], key
+
+
+def test_kubectl_apply_on_the_directory_skips_the_template() -> None:
+    """kubectl apply -f <dir> reads .json, .yaml and .yml only. A template it
+    applied would create the Secret first and make `create secret
+    --from-env-file` fail with AlreadyExists."""
+    assert TEMPLATE.suffix not in {".json", ".yaml", ".yml"}
+    assert TEMPLATE.exists()
+
+
+def test_a_filled_in_copy_cannot_be_committed() -> None:
+    import subprocess
+    result = subprocess.run(["git", "check-ignore", "-q", "deploy/k8s/secret.yaml"],
+                            cwd=ROOT)
+    assert result.returncode == 0, "deploy/k8s/secret.yaml is not ignored"
+
+
 def test_third_party_images_are_pinned_and_ours_is_not_latest() -> None:
     for d in _all_docs():
         if d["kind"] != "Deployment":

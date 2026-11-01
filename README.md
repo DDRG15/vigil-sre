@@ -438,11 +438,17 @@ wrong or slowly, and that is still this monitor's job. The heartbeat still
 matters too: if the node goes, nothing in the cluster is left to bring
 anything back.
 
-One interaction to know about: a round whose alert reaches no channel exits 1
-by design, the loop stops, and Kubernetes restarts the container. With no
-channel configured at all, an outage therefore puts the monitor in
-CrashLoopBackOff, probing less and less often until a channel exists. Create the
-Secret before relying on it.
+Without a `.env` — GitOps, sealed-secrets — `deploy/k8s/secret.yaml.example` lists
+the keys the pod reads. `kubectl apply -f deploy/k8s/` skips it (kubectl reads
+`.yaml`, `.yml` and `.json` from a directory); copy it to `deploy/k8s/secret.yaml`,
+which git ignores, and fill it in. Tests fail if its keys and `.env.example`'s
+ever differ, or if a value in it is not empty.
+
+Running with no channel is never silent. Every round logs `No alert channels
+configured`, healthy or not. And a round whose alert reaches nobody exits 1 by
+design, the loop stops, and Kubernetes restarts the container: an outage with no
+channel puts the monitor in CrashLoopBackOff, probing less and less often until
+a channel exists. Create the Secret before relying on it.
 
 ---
 
@@ -481,7 +487,7 @@ Secret before relying on it.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1257-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1270-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -502,7 +508,7 @@ Secret before relying on it.
 
 We do not ship what we cannot prove works.
 
-1257 automated tests cover every component in isolation: target loading (including
+1270 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -1418,6 +1424,21 @@ that the script generates on its first run:
 docker compose --profile demo-watchdog up -d watchdog       # starts the watchdog
 ./scripts/init-watchdog.sh                                  # 2nd run: creates the check, prints the ping URL
 ```
+
+On a Linux host, run the `setfacl` step from "Deploy" first: the watchdog runs as
+uid 999 and keeps its database in `data/watchdog/`, which ships with the clone
+for that reason. Skip it and `up` stops at the guard instead of starting a
+watchdog that cannot open its database:
+
+```
+data/watchdog is not writable by uid 999, the watchdog's user.
+On a Linux host, run this once from the repository, then try again:
+  setfacl -R -m u:999:rwX,d:u:999:rwX,u:$(id -u):rwX,d:u:$(id -u):rwX data
+```
+
+Before the guard checked this, `up -d` exited 0 and the watchdog restarted
+forever on `unable to open database file`; the script gave up two minutes later
+with "Could not create the check".
 
 That runs a self-hosted healthchecks instance and prints the ping URL to paste into
 `.env` (then `docker compose --profile demo-watchdog up -d` to recreate the monitor
