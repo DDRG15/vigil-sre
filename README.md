@@ -170,12 +170,24 @@ platform engineer six months from now.
 
 ## Prerequisites
 
-- Docker and Docker Compose — or, to run it without Docker or to run the tests,
-  Python 3.11 or newer (see "Run without Docker")
+- Linux. Every command in this README is bash, and the monitor runs in Linux
+  containers either way.
+- Docker Engine with the Compose plugin — or, to run it without Docker or to run
+  the tests, Python 3.11 or newer (see "Run without Docker")
 - A Discord Webhook URL (Server Settings > Integrations > Webhooks)
 - Optionally a Slack Incoming Webhook — alerts go to both at once, see
   "Multi-channel alerting"
 - Two minutes of focused attention
+
+**On Windows or macOS, use Docker.** Install Docker Desktop, then:
+- On Windows, clone and run everything from a WSL 2 terminal (Ubuntu from the
+  Microsoft Store), where the bash commands below work unchanged.
+- On macOS, use Terminal, where the same commands work too.
+
+Docker Desktop does not enforce host file permissions, so the Linux permission
+step in "Deploy" is not needed there. Running without Docker is supported on
+Linux only. Phones and tablets cannot host the monitor, but they can open the
+dashboard in a browser.
 
 ---
 
@@ -196,9 +208,7 @@ configured channel. Do not commit this file. It is in `.gitignore` for a reason.
 ```bash
 # Edit targets.yaml — add or remove URLs under the targets: key.
 # No code changes required. The service reads this file at startup.
-nano targets.yaml   # macOS / Linux
-notepad targets.yaml   # Windows
-code targets.yaml      # VS Code (any platform)
+nano targets.yaml
 ```
 
 The file is plain text. Any editor works.
@@ -267,16 +277,22 @@ cannot contain. The history database lives at `data/history/history.db`; the
 `data/history/` directory ships with the clone on purpose, so Docker never has to
 create it.
 
-**On a Linux host**, the container runs as a non-root user that is not your host
-user, so it cannot write to a `data/` you own. Give it access once, before the
-first `up`:
+**Give the container access to `data/`, once, before the first `up`.** The
+container runs as the non-root user `sre`, uid 999, which is not your host user.
+Without access, every round logs `State write failed ... Permission denied`, exits
+1 and withholds the heartbeat:
 
 ```bash
-chmod -R a+rwX data
+setfacl -R -m u:999:rwX,d:u:999:rwX,u:$(id -u):rwX,d:u:$(id -u):rwX data
 ```
 
-Docker Desktop on Windows and macOS does not enforce host permissions and needs
-nothing.
+The `d:` (default) entries pass the same access on to files created later. The
+container's `state.json` is owned by uid 999, and they keep it writable by you
+too, which matters if you also run `python main.py` from a venv. `setfacl` comes
+from the `acl` package (`sudo apt install acl` on Debian and Ubuntu). On a host
+uid 999 can have a name of its own, such as `dnsmasq` or `systemd-coredump`; only
+the number matters. `chmod -R a+rwX data` also works, but lets every user on the
+machine write the history, and you lose write access to files the container creates.
 
 **Upgrading an install that mounted `./history.db`.** Stop the stack, move the
 file into the new directory, start it. If Docker already created a *directory*
@@ -336,7 +352,7 @@ three consecutive slow checks. A first healthy sighting stays quiet.
 
 ### 5. Run without Docker (optional)
 
-Python 3.11 or newer. The runtime needs three packages, pinned in
+Linux, Python 3.11 or newer. The runtime needs three packages, pinned in
 `requirements.txt`; install them in a virtual environment so they do not touch
 anything else on the machine:
 
@@ -345,10 +361,10 @@ On Debian, Ubuntu and Mint the venv module is its own package
 environment is active — hence `python3` on the first line.
 
 ```bash
-python3 -m venv .venv              # Windows: py -m venv .venv
-source .venv/bin/activate          # Windows PowerShell: .venv\Scripts\Activate.ps1
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env               # Windows: copy .env.example .env — then add your webhook
+cp .env.example .env               # then add your webhook
 
 python main.py                     # one round: probe every target, alert, exit
 python main.py --report            # the history table, without probing
@@ -356,8 +372,8 @@ python api.py                      # dashboard and API at http://127.0.0.1:8787
 ```
 
 `main.py` runs one round and exits by design (see "No built-in scheduling"). For
-continuous monitoring without Docker, run it every 60 seconds from cron or the
-Windows Task Scheduler. To run the test suite, install `requirements-dev.txt`
+continuous monitoring without Docker, run it every minute from cron or a systemd
+timer. To run the test suite, install `requirements-dev.txt`
 instead: it includes the runtime requirements plus the test tools.
 
 ---
@@ -393,7 +409,7 @@ instead: it includes the runtime requirements plus the test tools.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1211-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1212-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -414,7 +430,7 @@ instead: it includes the runtime requirements plus the test tools.
 
 We do not ship what we cannot prove works.
 
-1211 automated tests cover every component in isolation: target loading (including
+1212 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —

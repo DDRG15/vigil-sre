@@ -500,6 +500,21 @@ def test_the_runtime_user_has_no_login_shell() -> None:
     )
 
 
+def test_the_runtime_user_has_the_uid_the_readme_grants_access_to() -> None:
+    """On a Linux host the README grants the container's user write access to
+    data/ by number. `useradd --system` picks the first free system uid, 999 on
+    today's base image; a base image that ships one more system account moves
+    it, and the documented command then grants access to nobody -- every round
+    fails to save state and nothing in the build says why."""
+    stage = _runtime_stage()
+    groupadd = next((l for l in stage if "groupadd" in l), "")
+    useradd  = next((l for l in stage if "useradd" in l), "")
+    assert re.search(r"--gid[ =]999\b", groupadd), f"gid not pinned: {groupadd!r}"
+    assert re.search(r"--uid[ =]999\b", useradd), f"uid not pinned: {useradd!r}"
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "u:999:rwX" in readme, "the README grants access to a different uid"
+
+
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
 

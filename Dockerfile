@@ -59,9 +59,11 @@ FROM python:3.11-slim AS runtime
 # Creating a dedicated user with no login shell and no home directory is a
 # Docker hardening best practice; it limits blast radius if the container is
 # ever compromised. The shell is stated, not left to useradd's default: a
-# --system account without -s gets /bin/sh.
-RUN groupadd --system sre \
- && useradd --system --gid sre --no-create-home --shell /usr/sbin/nologin sre
+# --system account without -s gets /bin/sh. The uid is pinned because the
+# README grants this user access to the host's data/ by number; left to
+# useradd it is whatever system uid the base image happens to leave free.
+RUN groupadd --system --gid 999 sre \
+ && useradd --system --uid 999 --gid sre --no-create-home --shell /usr/sbin/nologin sre
 
 # The base image ships pip, setuptools and wheel, and nothing here uses them:
 # the dependencies arrive pre-built from the builder stage. Left in, they are a
