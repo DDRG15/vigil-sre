@@ -155,6 +155,14 @@ RETRY_BACKOFF_MAX : float = 10.0     # cap on sleep between retries
 #: nobody tuned is one nobody can misconfigure into disabling the guard.
 MAX_BODY_BYTES    : int  = 4 * 1024 * 1024
 BODY_CHUNK_BYTES  : int  = 64 * 1024       # read size; also bounds what is held at once
+
+#: Longest single response header the probe session accepts. aiohttp's default
+#: is 8190 bytes, and on 23-24 October 2026 www.github.com sent a
+#: Content-Security-Policy longer than that: the client refused to parse a 200
+#: and the target read DOWN six runs in a row. A browser accepts that header, so
+#: a monitor that does not is paging on its own limit. 64 KiB clears it eight
+#: times over and still bounds what one header can make the parser buffer.
+PROBE_MAX_HEADER_FIELD_BYTES: int = 64 * 1024
 # One definition, owned by targetstore: api.py reads the same file to show the
 # editor what this process is running on, and must not name it separately.
 TARGETS_FILE      : Path = targetstore.SEED_FILE
@@ -2789,7 +2797,8 @@ async def run_health_checks(
     down_count      = 0
     internal_errors = 0
     async with aiohttp.ClientSession(
-        connector=connector, trace_configs=[trace_config]
+        connector=connector, trace_configs=[trace_config],
+        max_field_size=PROBE_MAX_HEADER_FIELD_BYTES,
     ) as session:
         # Build one coroutine per target, then gather concurrently.
         tasks = [
