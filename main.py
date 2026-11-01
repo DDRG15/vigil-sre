@@ -95,7 +95,9 @@ from history import (
     uptime_pct,
 )
 from notifiers import (
+    ALL_NOTIFIERS,
     AlertKind,
+    active_notifiers,
     dispatch_alert,
     reset_circuits,
 )
@@ -2792,6 +2794,18 @@ async def run_health_checks(
         len(resolved), RETRY_ATTEMPTS, RETRY_BACKOFF_BASE, RETRY_BACKOFF_MAX,
     )
     logger.info("=" * 64)
+
+    # Said on every round, healthy or not. Without it a monitor with nowhere to
+    # send an alert looked fine until the first outage, and the first sign was
+    # "alert ... is LOST", written after the fact. Same reasoning as the
+    # HEARTBEAT_URL warning: an unset variable and a forgotten one look alike.
+    if not active_notifiers():
+        logger.warning(
+            "No alert channels configured (set %s) — this round probes and "
+            "records, but any alert it raises will reach nobody. "
+            "event_type=metric metric=alert_channels_unconfigured_total value=1",
+            " or ".join(cls.env_var for cls in ALL_NOTIFIERS),
+        )
 
     # One shared session for the whole run — efficient TCP reuse.
     # The diagnostics TraceConfig records DNS and connection-create timings
