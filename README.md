@@ -8,10 +8,6 @@
 > Hiring teams are welcome to clone and run it to evaluate my work.
 > For any other use, ask.
 
-> **Data collection in progress:** until 1 November 2026, a scheduled GitHub Actions
-> workflow probes 12 public sites once an hour and appends the results to the
-> `collected-data` branch. See "A second collection run" below.
-
 This is not a monitoring script. It is a monitoring microservice — the distinction
 matters. A script does a job. A microservice has a contract. This one's contract is
 simple: if something is wrong, you will know. Once. Not seventeen times.
@@ -344,8 +340,12 @@ Python 3.11 or newer. The runtime needs three packages, pinned in
 `requirements.txt`; install them in a virtual environment so they do not touch
 anything else on the machine:
 
+On Debian, Ubuntu and Mint the venv module is its own package
+(`sudo apt install python3-venv`), and there is no `python` command until the
+environment is active — hence `python3` on the first line.
+
 ```bash
-python -m venv .venv
+python3 -m venv .venv              # Windows: py -m venv .venv
 source .venv/bin/activate          # Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 cp .env.example .env               # Windows: copy .env.example .env — then add your webhook
@@ -393,7 +393,7 @@ instead: it includes the runtime requirements plus the test tools.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1206-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1211-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -414,7 +414,7 @@ instead: it includes the runtime requirements plus the test tools.
 
 We do not ship what we cannot prove works.
 
-1206 automated tests cover every component in isolation: target loading (including
+1211 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -1106,17 +1106,17 @@ The threshold lines the panels draw are asserted against the constants
 alerts at 500 ms does not look wrong — it looks like a measurement, and someone
 reads "this is below the line" and concludes it will not alert.
 
-### A second collection run (in progress)
+### The second collection run (18 October – 1 November 2026)
 
-`.github/workflows/data-collection.yml` runs once an hour from 18 October to
-1 November 2026 (UTC). Each run probes the fixed list in `collection-targets.yaml`
+`.github/workflows/data-collection.yml` was scheduled once an hour from 18 October to
+1 November 2026 (UTC). Each run probed the fixed list in `collection-targets.yaml`
 — twelve large public sites, the same every time, so a target can be compared with
-itself across the two weeks — and appends the new rows as NDJSON to the
-`collected-data` branch, committed only as `github-actions[bot]`. It never writes to
-`main`, has no alert channels, and switches its own schedule off when the window
-closes. The sites in the list answered 200 to the monitor's request when they were
-chosen; ones that refuse automated requests were left out, because they would read
-DOWN for the whole window and measure nothing.
+itself across the two weeks — and appended the new rows as NDJSON to the
+`collected-data` branch, committed only as `github-actions[bot]`. It never wrote to
+`main`, had no alert channels, and switches its own schedule off on its first run
+after the window. The sites in the list answered 200 to the monitor's request when
+they were chosen; ones that refuse automated requests were left out, because they
+would read DOWN for the whole window and measure nothing.
 
 To look at the data, fetch the branch and import it:
 
@@ -1124,8 +1124,51 @@ To look at the data, fetch the branch and import it:
 git fetch origin collected-data
 git show origin/collected-data:collected/github-actions.ndjson > collected.ndjson
 python scripts/import-history.py collected.ndjson --db collected.db
-```n
+```
+
 The numbers describe GitHub's datacenter path to each site, not yours.
+
+### What the second collection run found
+
+792 measurements, 12 per run, none lost or duplicated. Three results:
+
+**The scheduler started one run in five.** The cron asked for 336 hourly runs;
+GitHub started 66, a median of 4.9 hours apart and once 25.7 hours. Every run that
+started finished and stored its rows — what went missing were the starts.
+GitHub's documentation says scheduled workflows can be delayed under load and some
+dropped, and two weeks put a number on it. An hourly schedule on Actions is a
+request, not a sampling rate: this data holds about five samples per target per
+day, and a monitor built on that schedule would have been blind for a day at a time.
+
+**Six DOWN readings were the monitor's, not GitHub's.** From 23 to 24 October,
+www.github.com read DOWN six runs in a row with `Got more than 8190 bytes when
+reading`. The site was answering 200. Its Content-Security-Policy header had grown
+past aiohttp's default 8190-byte limit for one header, and the client refused to
+parse the response. A browser accepts that header; a monitor that does not pages
+on its own limit. The probe session now accepts headers up to 64 KiB
+(`PROBE_MAX_HEADER_FIELD_BYTES`), and `tests/test_probe_header_limit.py` serves a
+16 KiB header from a local server and requires UP. **A client's parsing limits are
+part of the measurement** — nothing in the code looked wrong until a real server
+crossed one.
+
+**A 100 ms RTT threshold is a permanent alarm for a site across an ocean.**
+`HIGH_RTT_NEEDS_EDGE` fires above `RTT_HIGH_MS = 100`:
+
+| target | RTT p50 | RTT p95 | probes over 100 ms | probes DEGRADED |
+|---|---|---|---|---|
+| debian.org | 269 ms | 992 ms | **100 %** | 97 % |
+| fastly.com | 92 ms | 252 ms | 45.5 % | 62 % |
+| aws.amazon.com | 93 ms | 193 ms | 42.4 % | 42 % |
+| google.com | 23 ms | 52 ms | 1.5 % | 4.5 % |
+
+Every probe to debian.org crossed the line. That is the cloudflare finding below
+with a different phase: a threshold under the target's median measures distance
+from GitHub's runners, not an anomaly. The fix already exists — `degraded_rtt_ms` is
+a per-target override — and the collection list overrides nothing on purpose,
+so the table shows where each target actually lives. fastly.com and
+aws.amazon.com have a median within 10 ms of the line, so they flip between UP and
+DEGRADED from one run to the next — the case the three-consecutive-checks rule for
+Slow alerts exists for.
 
 ### What the first collection run found
 

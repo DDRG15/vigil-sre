@@ -34,5 +34,8 @@ def test_every_runtime_requirement_is_pinned():
 def test_the_readme_says_how_to_install_and_run_without_docker():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "pip install -r requirements.txt" in readme, "no runtime install line"
-    assert "python -m venv" in readme, "no virtual environment step"
+    # python3, not python: Debian, Ubuntu and Mint ship no `python` command, so
+    # the first line of the section answered "command not found" there.
+    assert "python3 -m venv" in readme, "no virtual environment step that runs on Linux"
+    assert "python3-venv" in readme, "Debian-family systems need the venv package named"
     assert "Python 3.11" in readme, "the Python version is never stated"
