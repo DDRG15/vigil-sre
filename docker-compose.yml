@@ -210,6 +210,13 @@ services:
   watchdog-guard:
     profiles: ["demo-watchdog"]
     image: busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+    # The watchdog image's user (hc, uid 999), on the watchdog's directory. A
+    # directory the watchdog cannot write used to let `up -d` exit 0 while the
+    # watchdog restarted forever on "unable to open database file"; the guard
+    # makes that a refusal with the fix in it, before the watchdog starts.
+    user: "999:999"
+    volumes:
+      - ./data/watchdog:/data
     environment:
       - WATCHDOG_SECRET_KEY=${WATCHDOG_SECRET_KEY:-}
     command:
@@ -222,6 +229,14 @@ services:
           exit 1
         fi
         echo "WATCHDOG_SECRET_KEY is set."
+        if ! touch /data/.write-check 2>/dev/null; then
+          echo "data/watchdog is not writable by uid 999, the watchdog's user." >&2
+          echo "On a Linux host, run this once from the repository, then try again:" >&2
+          echo '  setfacl -R -m u:999:rwX,d:u:999:rwX,u:$$(id -u):rwX,d:u:$$(id -u):rwX data' >&2
+          exit 1
+        fi
+        rm -f /data/.write-check
+        echo "data/watchdog is writable."
 
   watchdog:
     profiles: ["demo-watchdog"]

@@ -19,8 +19,9 @@ collected.ndjson
 # Runtime state: state.json, targets.json, the watchdog's database and the
 # history database all live under data/. None of it commits.
 #
-# One file is the exception, and it is not data: data/history/.gitkeep. The
-# compose file bind-mounts ./data/history, and a bind mount of a host directory
+# Two files are the exception, and they are not data: data/history/.gitkeep and
+# data/watchdog/.gitkeep. The compose file bind-mounts both directories, and a
+# bind mount of a host directory
 # that does not exist is created by the Docker daemon -- as root on Linux, where
 # the non-root container user then cannot write to it. Shipping the directory
 # with the clone means it already exists, owned by whoever cloned. The pattern
@@ -30,6 +31,9 @@ data/*
 !data/history/
 data/history/*
 !data/history/.gitkeep
+!data/watchdog/
+data/watchdog/*
+!data/watchdog/.gitkeep
 
 # Secrets
 .env
@@ -46,3 +50,6 @@ Thumbs.db
 
 # Archives
 *.zip
+
+# A Secret filled in from deploy/k8s/secret.yaml.example holds real values.
+deploy/k8s/secret.yaml
