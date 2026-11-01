@@ -413,11 +413,15 @@ import api as _api
 def test_deeply_nested_json_answers_400_not_a_dead_socket(live) -> None:
     """RecursionError is NOT a JSONDecodeError, so it escaped do_PUT entirely:
     the handler thread died and the client got a connection reset instead of a
-    refusal. A few KB of "[[[[" is enough -- far under MAX_BODY_BYTES -- and it
+    refusal. About 100 KB of "[[[[" is enough -- under MAX_BODY_BYTES -- and it
     is reachable WITHOUT a token, because the body is read before the auth
-    check by design (so that a 401 does not reset the socket)."""
+    check by design (so that a 401 does not reset the socket).
+
+    The depth is 50000, not a few thousand: Python 3.12's json decoder parses
+    3000 levels that 3.11 refuses, and a payload that parses reaches the auth
+    check and answers 401 -- the test would pass or fail by interpreter."""
     host, port = live.removeprefix("http://").split(":")
-    payload = ("[" * 3000 + "]" * 3000).encode()
+    payload = ("[" * 50000 + "]" * 50000).encode()
     conn = http.client.HTTPConnection(host, int(port), timeout=10)
     conn.request("PUT", "/api/targets", body=payload,
                  headers={"Content-Length": str(len(payload))})
