@@ -413,6 +413,8 @@ instead: it includes the runtime requirements plus the test tools.
 ├── dashboard.py         The overview page and target editor — no framework, no JS dependency
 ├── targetctl.py         The target list from a terminal: list / add / remove / validate,
 │                        through the same API the dashboard editor uses
+├── mcp_server.py        Read-only MCP server over stdio: status, history and trend for
+│                        an MCP client, from the same functions as the API (v0)
 ├── targets.yaml         URL configuration — the hand-edited seed
 ├── targets.yaml.example Documented template with every per-target field
 ├── collection-targets.yaml The fixed list the 14-day data collection probes
@@ -429,7 +431,7 @@ instead: it includes the runtime requirements plus the test tools.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1216-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1241-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -450,7 +452,7 @@ instead: it includes the runtime requirements plus the test tools.
 
 We do not ship what we cannot prove works.
 
-1216 automated tests cover every component in isolation: target loading (including
+1241 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -1080,6 +1082,61 @@ The figures come from the same functions `--report` uses, and the test suite
 asserts the two agree with *each other* rather than each with a fixture. A CLI and
 an API deriving the same number from the same rows and printing different answers
 is the kind of bug where both sides pass their own tests.
+
+---
+
+## Asking the monitor from an MCP client (v0)
+
+`mcp_server.py` speaks the Model Context Protocol over stdio, so an assistant or
+an IDE that supports MCP can ask the monitor what it knows instead of someone
+pasting the dashboard into a chat. Three tools, all read-only:
+
+| tool | answers | same numbers as |
+|---|---|---|
+| `get_status` | status, last check, last error and diagnostics per target, plus `stale_seconds` | `/api/status` |
+| `get_history` | uptime % and p50/p95 TTFB per target over `1d`, `7d` or `30d` | `/api/history` |
+| `get_trend` | p95 of the last 7 days against the 7 before: ok, degrading, improving, or why not comparable | `--report` |
+
+Register it in the client's MCP configuration as a command. With the stack running
+in Docker, the server runs inside the dashboard container, next to the data:
+
+```json
+{
+  "mcpServers": {
+    "vigil-sre": {
+      "command": "docker",
+      "args": ["compose", "--project-directory", "/path/to/vigil-sre",
+               "exec", "-T", "dashboard", "python", "mcp_server.py"]
+    }
+  }
+}
+```
+
+Without Docker, the command is `python mcp_server.py` from the repository, with
+`STATE_FILE_PATH` and `HISTORY_DB_PATH` pointing at the data. To check it by hand:
+
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_status","arguments":{}}}' \
+  | docker compose exec -T dashboard python mcp_server.py
+```
+
+What it does not do, by design:
+- **It writes nothing.** The history database is opened with SQLite's `mode=ro`,
+  which makes a write impossible rather than merely absent, and a missing
+  database is an error, not an empty file created on the spot. A test hashes
+  `state.json` and the database, with their modification times, around every
+  tool call.
+- **It has no second query path.** Every tool calls the function the API or
+  `--report` already uses, and the tests compare the answers against those
+  surfaces, not against the server itself.
+- **It needs no package.** MCP over stdio is newline-delimited JSON-RPC, and four
+  methods of it are enough. Logs go to stderr: on stdout, one stray line
+  corrupts the stream for the client, and a test runs the server as a real
+  process and parses every line it prints.
+- **It does not load `.env`.** Nothing it answers needs a secret.
+
+It is v0 (`0.1.0` in `serverInfo`): the contract above holds, and the tool set
+may still grow before it is called 1.0.
 
 ---
 
