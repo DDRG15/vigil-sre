@@ -487,7 +487,7 @@ a channel exists. Create the Secret before relying on it.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1270-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1275-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -508,7 +508,7 @@ a channel exists. Create the Secret before relying on it.
 
 We do not ship what we cannot prove works.
 
-1270 automated tests cover every component in isolation: target loading (including
+1275 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -1141,7 +1141,7 @@ is the kind of bug where both sides pass their own tests.
 
 ---
 
-## Asking the monitor from an MCP client (v0)
+## Asking the monitor from an MCP client (v0.2)
 
 `mcp_server.py` speaks the Model Context Protocol over stdio, so an assistant or
 an IDE that supports MCP can ask the monitor what it knows instead of someone
@@ -1149,7 +1149,7 @@ pasting the dashboard into a chat. Three tools, all read-only:
 
 | tool | answers | same numbers as |
 |---|---|---|
-| `get_status` | status, last check, last error and diagnostics per target, plus `stale_seconds` | `/api/status` |
+| `get_status` | status, last check, last error and diagnostics per target, `stale_seconds`, and `alerting` / `warnings`: which channels are configured and whether a heartbeat watches the monitor | `/api/status`, and the monitor's own per-round warnings |
 | `get_history` | uptime % and p50/p95 TTFB per target over `1d`, `7d` or `30d` | `/api/history` |
 | `get_trend` | p95 of the last 7 days against the 7 before: ok, degrading, improving, or why not comparable | `--report` |
 
@@ -1189,10 +1189,19 @@ What it does not do, by design:
   methods of it are enough. Logs go to stderr: on stdout, one stray line
   corrupts the stream for the client, and a test runs the server as a real
   process and parses every line it prints.
-- **It does not load `.env`.** Nothing it answers needs a secret.
+- **It counts secrets and never returns them.** Whether a channel or the
+  heartbeat is configured is decided as the monitor decides it — the process
+  environment first, then `.env`, an empty value meaning unset — and only the
+  channel's name and a boolean leave the process. A test sets unique webhook
+  and ping URLs and searches the whole protocol line for them.
+- **All UP is not the whole answer.** With every target UP and no channel
+  configured, nobody would hear about the next outage; `warnings` says so in
+  the words the monitor's log uses for the same condition, and a test runs a
+  real round to check that the two agree.
 
-It is v0 (`0.1.0` in `serverInfo`): the contract above holds, and the tool set
-may still grow before it is called 1.0.
+It is `0.2.0` in `serverInfo`: the contract above holds, and the tool set grows
+with the monitor — a change that adds state an MCP client cannot see is not
+finished until the server reports it. 1.0 comes when the set is complete.
 
 ---
 

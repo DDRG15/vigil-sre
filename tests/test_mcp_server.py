@@ -89,7 +89,9 @@ def paths(tmp_path: Path) -> tuple[Path, Path]:
 
 @pytest.fixture
 def server(paths) -> mcp_server.Server:
-    return mcp_server.Server(*paths)
+    # A .env that does not exist: the default is the repository's, and a test
+    # must not depend on what the owner's real .env holds.
+    return mcp_server.Server(*paths, env_file=paths[0].parent / ".env")
 
 
 def _req(method: str, params: dict | None = None, id_: int = 1) -> str:
@@ -109,9 +111,10 @@ def _call(server, name: str, arguments: dict | None = None) -> dict:
 # =============================================================================
 
 
-def test_the_version_is_0_1_0() -> None:
-    """v0 until the owner calls it finished; 1.0.0 then."""
-    assert mcp_server.SERVER_VERSION == "0.1.0"
+def test_the_version_is_0_2_0() -> None:
+    """0.x until the owner calls it finished; 1.0.0 then. 0.2.0 adds the
+    alerting state to get_status."""
+    assert mcp_server.SERVER_VERSION == "0.2.0"
 
 
 def test_initialize_echoes_a_supported_protocol_version(server) -> None:
@@ -121,7 +124,7 @@ def test_initialize_echoes_a_supported_protocol_version(server) -> None:
     result = out["result"]
     assert out["id"] == 1 and out["jsonrpc"] == "2.0"
     assert result["protocolVersion"] == "2025-06-18"
-    assert result["serverInfo"] == {"name": "vigil-sre", "version": "0.1.0"}
+    assert result["serverInfo"] == {"name": "vigil-sre", "version": mcp_server.SERVER_VERSION}
     assert "tools" in result["capabilities"]
 
 
@@ -158,11 +161,11 @@ def test_get_status_is_what_api_status_serves(server, paths) -> None:
     state, _ = paths
     result = _call(server, "get_status")["result"]
     targets = api.read_state(state)
-    expected = {"targets": targets, "stale_seconds": result["structuredContent"]["stale_seconds"]}
+    content = result["structuredContent"]
     assert result["isError"] is False
-    assert result["structuredContent"]["targets"] == targets
-    assert json.loads(result["content"][0]["text"]) == expected
-    assert result["structuredContent"]["stale_seconds"] is not None
+    assert content["targets"] == targets
+    assert content["stale_seconds"] == pytest.approx(api.stale_seconds(targets), abs=5)
+    assert json.loads(result["content"][0]["text"]) == content
 
 
 @pytest.mark.parametrize("window", ["1d", "7d", "30d"])
@@ -195,6 +198,96 @@ def test_the_trend_window_is_the_reports(server) -> None:
     assert mcp_server.TREND_WINDOW_DAYS == main.TREND_WINDOW_DAYS
     result = _call(server, "get_trend")["result"]
     assert result["structuredContent"]["window_days"] == main.TREND_WINDOW_DAYS
+
+
+# =============================================================================
+# B2. get_status says whether anyone would hear about an outage (0.2.0)
+#
+# The monitor warns every round when no alert channel is configured and when
+# HEARTBEAT_URL is unset. An MCP that reported every target UP and said nothing
+# of that answered "is it healthy?" with half the truth.
+# =============================================================================
+
+SECRET_HOOK = "https://hooks.example.test/T000/very-secret-webhook-path"
+SECRET_PING = "https://hc-ping.example.test/very-secret-ping-uuid"
+
+
+def _status(server) -> dict:
+    return _call(server, "get_status")["result"]
+
+
+def _clear_channels(monkeypatch) -> None:
+    for var in ("DISCORD_WEBHOOK_URL", "SLACK_WEBHOOK_URL", "HEARTBEAT_URL"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_no_channel_and_no_heartbeat_are_reported(server, monkeypatch) -> None:
+    _clear_channels(monkeypatch)
+    content = _status(server)["structuredContent"]
+    assert content["alerting"] == {"channels": [], "heartbeat": False}
+    codes = [w["code"] for w in content["warnings"]]
+    assert codes == ["no_alert_channels", "heartbeat_unconfigured"]
+
+
+def test_configured_channels_are_named_and_silence_their_warning(server, monkeypatch) -> None:
+    _clear_channels(monkeypatch)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", SECRET_HOOK)
+    monkeypatch.setenv("HEARTBEAT_URL", SECRET_PING)
+    content = _status(server)["structuredContent"]
+    assert content["alerting"] == {"channels": ["Discord"], "heartbeat": True}
+    assert content["warnings"] == []
+
+
+def test_a_secret_never_appears_in_the_answer(server, monkeypatch) -> None:
+    """Names and booleans only. The full protocol line is searched, not just
+    the structured part: a URL in the text content would leak just the same."""
+    _clear_channels(monkeypatch)
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", SECRET_HOOK)
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", SECRET_HOOK + "-slack")
+    monkeypatch.setenv("HEARTBEAT_URL", SECRET_PING)
+    line = server.handle_line(_req("tools/call", {"name": "get_status", "arguments": {}}))
+    for fragment in ("very-secret", "hooks.example", "hc-ping"):
+        assert fragment not in line
+
+
+def test_the_env_file_counts_like_the_monitor_counts_it(paths, monkeypatch) -> None:
+    """Run from the repository, the monitor loads .env; an MCP that ignored it
+    would report "no channels" for a monitor that has one -- a false alarm,
+    and the opposite failure is no better. A variable already in the process
+    environment wins, as load_dotenv(override=False) does."""
+    _clear_channels(monkeypatch)
+    env_file = paths[0].parent / ".env"
+    env_file.write_text(f"SLACK_WEBHOOK_URL={SECRET_HOOK}\nHEARTBEAT_URL=\n", encoding="utf-8")
+    server = mcp_server.Server(*paths, env_file=env_file)
+    content = _status(server)["structuredContent"]
+    assert content["alerting"] == {"channels": ["Slack"], "heartbeat": False}
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", "")
+    assert _status(server)["structuredContent"]["alerting"]["channels"] == []
+
+
+async def test_the_warnings_are_the_monitors_own(paths, monkeypatch, caplog) -> None:
+    """Each warning the MCP reports opens with the same words the monitor logs
+    for the same condition in a real round: one condition, one wording."""
+    import logging
+    from unittest.mock import AsyncMock
+    _clear_channels(monkeypatch)
+    monkeypatch.setattr(main, "RETRY_ATTEMPTS", 1)
+
+    async def _up(*a, **k):
+        return main.CheckOutcome(url=a[0], status=main.STATUS_UP,
+                                 checked_at=_stamp(NOW), phases=None)
+    monkeypatch.setattr(main, "check_url", _up)
+    with caplog.at_level(logging.WARNING, logger="sre.health_checker"):
+        await main.run_health_checks(targets=[main.Target(url=URL)],
+                                     state_path=paths[0].parent / "s2.json",
+                                     history_path=paths[0].parent / "h2.db")
+    logged = [r.getMessage() for r in caplog.records]
+    server = mcp_server.Server(*paths, env_file=paths[0].parent / ".env")
+    warnings = _status(server)["structuredContent"]["warnings"]
+    assert warnings
+    for w in warnings:
+        head = w["message"].split(" — ")[0]
+        assert any(m.startswith(head) for m in logged), (head, logged)
 
 
 # =============================================================================

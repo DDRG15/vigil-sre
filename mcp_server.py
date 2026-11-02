@@ -2,7 +2,8 @@
 mcp_server.py — a read-only MCP server over stdio (v0).
 
 Lets an MCP client — an assistant, an IDE — ask the monitor what it knows:
-the current status of every target, uptime and TTFB percentiles over 1, 7 or
+the current status of every target, whether anyone would be told about an
+outage (alert channels, heartbeat), uptime and TTFB percentiles over 1, 7 or
 30 days, and the p95 trend. It answers questions; it changes nothing.
 
 Why it is shaped this way
@@ -20,8 +21,12 @@ Why it is shaped this way
 * **Read-only by construction.** The history functions open SQLite with
   `mode=ro`, which makes a write impossible rather than merely absent, and a
   missing database is an error, not an empty file created on the spot. No
-  tool touches state.json except to read it. `.env` is not loaded: nothing
-  here needs a secret.
+  tool touches state.json except to read it.
+* **Secrets are counted, never returned.** Whether a channel is configured is
+  decided as the monitor decides it — the process environment first, then
+  `.env` beside this file, an empty value meaning unset — and only the
+  channel's name and a boolean leave the process. `.env` is read for that and
+  never loaded into the environment.
 * **stdout is the protocol.** One JSON message per line, nothing else. Logs go
   to stderr; a single stray print on stdout corrupts the stream for the client.
   `main` is not imported for the same reason — importing it loads `.env` and
@@ -44,14 +49,17 @@ import sys
 from pathlib import Path
 from typing import IO, Any, Callable
 
+from dotenv import dotenv_values
+
 import api
 from diagnostics import latency_trend
 from history import history_path_from_env, latency_trend_windows
+from notifiers import ALL_NOTIFIERS
 
 logger = logging.getLogger("sre.mcp")
 
 SERVER_NAME   : str = "vigil-sre"
-SERVER_VERSION: str = "0.1.0"     # v0 until the owner calls it finished
+SERVER_VERSION: str = "0.2.0"     # 0.x until the owner calls it finished; 1.0.0 then
 
 #: Newest first. An unknown version from the client is answered with the first.
 PROTOCOL_VERSIONS: tuple[str, ...] = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -73,7 +81,11 @@ TOOLS: list[dict] = [
             "Current status of every monitored target (UP, DEGRADED or DOWN), "
             "with the last check time, the last error and the phase diagnostics, "
             "plus stale_seconds: the age of the oldest check. A large "
-            "stale_seconds means the monitor stopped, and the statuses are old."
+            "stale_seconds means the monitor stopped, and the statuses are old. "
+            "alerting names the configured alert channels and says whether a "
+            "heartbeat watches the monitor; warnings repeats what the monitor "
+            "logs every round when either is missing — all targets UP with no "
+            "channel means nobody would hear about the next outage."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
@@ -112,9 +124,13 @@ class _ToolError(Exception):
 class Server:
     """One instance per session. Holds only the two paths it reads."""
 
-    def __init__(self, state_path: Path, history_path: Path) -> None:
+    def __init__(self, state_path: Path, history_path: Path,
+                 env_file: Path | None = None) -> None:
         self.state_path   = Path(state_path)
         self.history_path = Path(history_path)
+        # Where main.py's load_dotenv() finds it when run from the repository.
+        # In a container the variables arrive through env_file instead.
+        self.env_file     = Path(env_file) if env_file else Path(__file__).resolve().parent / ".env"
         self._methods: dict[str, Callable[[dict], dict]] = {
             "initialize": self._initialize,
             "ping"      : lambda params: {},
@@ -203,9 +219,37 @@ class Server:
         if not self.history_path.exists():
             raise _ToolError(f"no history database at {self.history_path}")
 
+    def _is_set(self, var: str) -> bool:
+        """The monitor's rule: the process environment wins, even when empty
+        (load_dotenv does not override), then .env; an empty value is unset."""
+        if var in os.environ:
+            return bool(os.environ[var])
+        if self.env_file.is_file():
+            return bool(dotenv_values(self.env_file).get(var))
+        return False
+
+    def _alerting(self) -> tuple[dict, list[dict]]:
+        channels  = [cls.name for cls in ALL_NOTIFIERS if self._is_set(cls.env_var)]
+        heartbeat = self._is_set("HEARTBEAT_URL")
+        warnings: list[dict] = []
+        # The words before " — " are the monitor's own log wording for the
+        # same condition; a test holds the two together.
+        if not channels:
+            warnings.append({"code": "no_alert_channels", "message": (
+                "No alert channels configured (set "
+                + " or ".join(cls.env_var for cls in ALL_NOTIFIERS)
+                + ") — any alert the monitor raises reaches nobody.")})
+        if not heartbeat:
+            warnings.append({"code": "heartbeat_unconfigured", "message": (
+                "HEARTBEAT_URL is not set — nothing is watching this monitor; "
+                "if it dies, no alert says so.")})
+        return {"channels": channels, "heartbeat": heartbeat}, warnings
+
     def _get_status(self, arguments: dict) -> dict:
         targets = self._targets()
-        return {"targets": targets, "stale_seconds": api.stale_seconds(targets)}
+        alerting, warnings = self._alerting()
+        return {"targets": targets, "stale_seconds": api.stale_seconds(targets),
+                "alerting": alerting, "warnings": warnings}
 
     def _get_history(self, arguments: dict) -> dict:
         window = arguments.get("window", api.DEFAULT_WINDOW)
