@@ -19,7 +19,8 @@ are the contract, and each one is a way this has gone wrong elsewhere:
 Coverage:
   A. Handshake: initialize, version negotiation, initialized, ping, tools/list
   B. Tools agree with the API and --report
-  C. Errors: JSON-RPC codes, tool errors that do not crash the loop
+  B2-B4. Alerting state, unreadable state file, uninitialised history (warnings)
+  C. Errors (including the strict JSON-RPC envelope): JSON-RPC codes, tool errors that do not crash the loop
   D. Read-only
   E. A real subprocess: stdout carries only protocol
 """
@@ -111,10 +112,11 @@ def _call(server, name: str, arguments: dict | None = None) -> dict:
 # =============================================================================
 
 
-def test_the_version_is_0_2_0() -> None:
-    """0.x until the owner calls it finished; 1.0.0 then. 0.2.0 adds the
-    alerting state to get_status."""
-    assert mcp_server.SERVER_VERSION == "0.2.0"
+def test_the_version_is_0_3_0() -> None:
+    """0.x until the owner calls it finished; 1.0.0 then. 0.3.0 adds the
+    warnings that say an empty answer is a broken file, and strict envelope
+    checks."""
+    assert mcp_server.SERVER_VERSION == "0.3.0"
 
 
 def test_initialize_echoes_a_supported_protocol_version(server) -> None:
@@ -163,6 +165,7 @@ def test_get_status_is_what_api_status_serves(server, paths) -> None:
     targets = api.read_state(state)
     content = result["structuredContent"]
     assert result["isError"] is False
+    assert targets, "the fixture's state is valid: an empty map would make the next line vacuous"
     assert content["targets"] == targets
     assert content["stale_seconds"] == pytest.approx(api.stale_seconds(targets), abs=5)
     assert json.loads(result["content"][0]["text"]) == content
@@ -170,12 +173,29 @@ def test_get_status_is_what_api_status_serves(server, paths) -> None:
 
 @pytest.mark.parametrize("window", ["1d", "7d", "30d"])
 def test_get_history_is_what_api_history_serves(server, paths, window) -> None:
+    """The tool is the API payload plus an empty warnings list for a valid
+    database. Compared minus `warnings`, so a second query path still fails."""
     state, db = paths
     result = _call(server, "get_history", {"window": window})["result"]
     expected = api.history_payload(db, window, list(api.read_state(state)))
+    content = dict(result["structuredContent"])
+    warnings = content.pop("warnings")
     assert result["isError"] is False
-    assert result["structuredContent"] == expected
-    assert json.loads(result["content"][0]["text"]) == expected
+    assert warnings == []
+    assert content == expected
+    assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+
+
+def test_get_history_reports_the_seeded_numbers(server) -> None:
+    """Literal values from the fixture's rows (25 at 100 ms 8 days ago, 25 at
+    400 ms a day ago), so a tool and an API that both returned nothing would
+    not agree their way past the comparison above. The 1d window is left out:
+    its newest-but-one sample sits at the window's edge."""
+    seven = _call(server, "get_history", {"window": "7d"})["result"]["structuredContent"]
+    thirty = _call(server, "get_history", {"window": "30d"})["result"]["structuredContent"]
+    assert seven["targets"][URL] == {"uptime_pct": 100.0, "p50_ttfb_ms": 400.0, "p95_ttfb_ms": 400.0}
+    # The 8-day-old samples exist only in the 30d window: p50 moves to 100.
+    assert thirty["targets"][URL] == {"uptime_pct": 100.0, "p50_ttfb_ms": 100.0, "p95_ttfb_ms": 400.0}
 
 
 def test_get_history_defaults_to_the_api_default_window(server) -> None:
@@ -246,6 +266,13 @@ def test_a_secret_never_appears_in_the_answer(server, monkeypatch) -> None:
     monkeypatch.setenv("SLACK_WEBHOOK_URL", SECRET_HOOK + "-slack")
     monkeypatch.setenv("HEARTBEAT_URL", SECRET_PING)
     line = server.handle_line(_req("tools/call", {"name": "get_status", "arguments": {}}))
+    # Positive control: the channels ARE configured and reported by name, so
+    # the absence below is not an answer that never looked at them.
+    result = json.loads(line)["result"]
+    assert result["isError"] is False
+    assert result["structuredContent"]["alerting"] == {
+        "channels": ["Discord", "Slack"], "heartbeat": True}
+    assert "Discord" in line and "Slack" in line
     for fragment in ("very-secret", "hooks.example", "hc-ping"):
         assert fragment not in line
 
@@ -263,6 +290,67 @@ def test_the_env_file_counts_like_the_monitor_counts_it(paths, monkeypatch) -> N
     assert content["alerting"] == {"channels": ["Slack"], "heartbeat": False}
     monkeypatch.setenv("SLACK_WEBHOOK_URL", "")
     assert _status(server)["structuredContent"]["alerting"]["channels"] == []
+
+
+AUDIT_BASE_URL = "https://example.invalid/ping"
+
+
+def _monitor_heartbeat_is_set(env_file: Path, env: dict) -> bool:
+    """What the monitor decides: load_dotenv(path, override=False), then
+    bool(os.getenv('HEARTBEAT_URL')). Run in a subprocess so this process's
+    environment is never the thing under test. The child drops HEARTBEAT_URL
+    itself: conftest hands every child that variable blank, and a blank one
+    would win over .env, which is not the state being modelled."""
+    clean = {k: v for k, v in env.items() if k != "PYTHON_DOTENV_DISABLED"}
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import os, sys; from dotenv import load_dotenv; "
+         "os.environ.pop('HEARTBEAT_URL', None); "
+         "load_dotenv(sys.argv[1], override=False); "
+         "print(bool(os.getenv('HEARTBEAT_URL')))",
+         str(env_file)],
+        capture_output=True, text=True, env=clean, cwd=str(env_file.parent), timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip() == "True"
+
+
+def test_a_dotenv_reference_to_an_empty_process_variable_is_not_a_heartbeat(
+        paths, monkeypatch) -> None:
+    """HEARTBEAT_URL=${AUDIT_BASE} in .env with AUDIT_BASE set but empty in the
+    process: the monitor interpolates with the process value first, gets "",
+    and pings nobody. An MCP that interpolated with the file's own value said
+    "heartbeat configured" about a monitor nothing watches."""
+    _clear_channels(monkeypatch)
+    monkeypatch.setenv("AUDIT_BASE", "")
+    env_file = paths[0].parent / ".env"
+    env_file.write_text(f"AUDIT_BASE={AUDIT_BASE_URL}\nHEARTBEAT_URL=${{AUDIT_BASE}}\n",
+                        encoding="utf-8")
+    server = mcp_server.Server(*paths, env_file=env_file)
+    assert _status(server)["structuredContent"]["alerting"]["heartbeat"] is False
+
+
+@pytest.mark.parametrize("process_value", [None, "", "https://example.invalid/other"],
+                         ids=["absent", "empty", "set"])
+def test_the_mcp_heartbeat_answer_is_what_load_dotenv_produces(
+        paths, monkeypatch, process_value) -> None:
+    """Same .env, same process variable, two readers: the monitor's
+    load_dotenv(override=False) in a subprocess and the MCP. They must agree
+    for every state of the referenced variable, and the MCP must not leave
+    HEARTBEAT_URL behind in this process's environment."""
+    _clear_channels(monkeypatch)
+    if process_value is None:
+        monkeypatch.delenv("AUDIT_BASE", raising=False)
+    else:
+        monkeypatch.setenv("AUDIT_BASE", process_value)
+    env_file = paths[0].parent / ".env"
+    env_file.write_text(f"AUDIT_BASE={AUDIT_BASE_URL}\nHEARTBEAT_URL=${{AUDIT_BASE}}\n",
+                        encoding="utf-8")
+    server = mcp_server.Server(*paths, env_file=env_file)
+    before = dict(os.environ)
+    heartbeat = _status(server)["structuredContent"]["alerting"]["heartbeat"]
+    assert heartbeat is _monitor_heartbeat_is_set(env_file, dict(before))
+    assert "HEARTBEAT_URL" not in os.environ
+    assert dict(os.environ) == before
 
 
 async def test_the_warnings_are_the_monitors_own(paths, monkeypatch, caplog) -> None:
@@ -288,6 +376,91 @@ async def test_the_warnings_are_the_monitors_own(paths, monkeypatch, caplog) -> 
     for w in warnings:
         head = w["message"].split(" — ")[0]
         assert any(m.startswith(head) for m in logged), (head, logged)
+
+
+# =============================================================================
+# B3. An unreadable state file is said, not shown as "nothing monitored" (0.3.0)
+#
+# An empty targets map reads as "no targets, all quiet". When state.json exists
+# and cannot be used, that is the opposite of the truth.
+# =============================================================================
+
+UNREADABLE_STATES = [
+    pytest.param("{broken", id="invalid-json"),
+    pytest.param("[]", id="json-array"),
+    pytest.param('{"schema_version": 2, "targets": []}', id="targets-not-an-object"),
+    pytest.param('{"schema_version": 2, "targets": "x"}', id="targets-a-string"),
+]
+
+
+@pytest.mark.parametrize("content", UNREADABLE_STATES)
+def test_an_unreadable_state_file_is_the_first_warning_and_not_an_error(paths, content) -> None:
+    """Empty targets with isError False and no warning is "nothing is
+    monitored" said about a monitor that is probing; the warning comes first so
+    a client reading one line reads the cause."""
+    state, db = paths
+    state.write_text(content, encoding="utf-8")
+    server = mcp_server.Server(state, db, env_file=state.parent / ".env")
+    result = _status(server)
+    assert result["isError"] is False
+    assert result["structuredContent"]["targets"] == {}
+    warnings = result["structuredContent"]["warnings"]
+    assert warnings[0]["code"] == "state_unreadable"
+    assert warnings[0]["message"]
+
+
+def test_a_missing_state_file_is_not_reported_as_unreadable(paths) -> None:
+    """A fresh deployment has no state file yet; that is new, not broken, and a
+    warning on every first-minute call would train clients to ignore it."""
+    state, db = paths
+    state.unlink()
+    server = mcp_server.Server(state, db, env_file=state.parent / ".env")
+    content = _status(server)["structuredContent"]
+    assert content["targets"] == {}
+    assert "state_unreadable" not in [w["code"] for w in content["warnings"]]
+
+
+def test_a_valid_state_file_carries_no_state_warning(server) -> None:
+    """Control for the two tests above: the fixture's valid state must not
+    produce the warning, or they prove nothing."""
+    content = _status(server)["structuredContent"]
+    assert content["targets"]
+    assert "state_unreadable" not in [w["code"] for w in content["warnings"]]
+
+
+# =============================================================================
+# B4. A database with no tables is not a quiet window (0.3.0)
+# =============================================================================
+
+
+@pytest.mark.parametrize("tool", ["get_history", "get_trend"])
+def test_a_zero_byte_history_file_warns_history_uninitialised(paths, tool) -> None:
+    """sqlite opens a zero-byte file as an empty database, so the query
+    succeeds with "no samples": indistinguishable from a quiet window unless
+    the answer says the file has no tables."""
+    state, db = paths
+    db.write_bytes(b"")
+    server = mcp_server.Server(state, db, env_file=state.parent / ".env")
+    result = _call(server, tool)["result"]
+    assert result["isError"] is False
+    assert "history_uninitialised" in [w["code"] for w in result["structuredContent"]["warnings"]]
+
+
+@pytest.mark.parametrize("tool", ["get_history", "get_trend"])
+def test_an_initialised_history_database_has_no_warnings(server, tool) -> None:
+    result = _call(server, tool)["result"]
+    assert result["structuredContent"]["warnings"] == []
+
+
+def test_the_uninitialised_check_does_not_write_to_the_file(paths) -> None:
+    """The check opens the zero-byte file to look at it; mode=ro keeps that
+    from turning the file into a database with tables."""
+    state, db = paths
+    db.write_bytes(b"")
+    server = mcp_server.Server(state, db, env_file=state.parent / ".env")
+    _call(server, "get_history")
+    _call(server, "get_trend")
+    assert db.read_bytes() == b""
 
 
 # =============================================================================
@@ -344,6 +517,75 @@ def test_the_loop_survives_every_error(paths) -> None:
     answers = [json.loads(l) for l in out.getvalue().splitlines()]
     assert [a["id"] for a in answers] == [None, 2, 3, 4]
     assert answers[-1]["result"] == {}
+
+
+# --- JSON-RPC envelope (0.3.0) -------------------------------------------------
+#
+# Each case below used to be answered as a valid call: a missing "jsonrpc" was
+# taken for 2.0, `params or {}` turned [] and false into {}, and ids the spec
+# forbids (null, true, 1.5, an object) were echoed back.
+
+
+def _line(**fields) -> str:
+    return json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping", **fields})
+
+
+@pytest.mark.parametrize("line,expected_id", [
+    pytest.param('{"id": 1, "method": "ping"}', 1, id="jsonrpc-missing"),
+    pytest.param('{"jsonrpc": "1.0", "id": 1, "method": "ping"}', 1, id="jsonrpc-1.0"),
+    pytest.param('{"jsonrpc": 2.0, "id": 1, "method": "ping"}', 1, id="jsonrpc-a-number"),
+    pytest.param('{"jsonrpc": "2.0", "id": null, "method": "ping"}', None, id="id-null"),
+    pytest.param('{"jsonrpc": "2.0", "id": true, "method": "ping"}', None, id="id-true"),
+    pytest.param('{"jsonrpc": "2.0", "id": false, "method": "ping"}', None, id="id-false"),
+    pytest.param('{"jsonrpc": "2.0", "id": 1.5, "method": "ping"}', None, id="id-float"),
+    pytest.param('{"jsonrpc": "2.0", "id": {"a": 1}, "method": "ping"}', None, id="id-object"),
+    pytest.param('{"jsonrpc": "2.0", "id": [1], "method": "ping"}', None, id="id-array"),
+])
+def test_a_request_with_a_bad_envelope_is_invalid_request(server, line, expected_id) -> None:
+    out = json.loads(server.handle_line(line))
+    assert out["error"]["code"] == -32600
+    assert out["id"] == expected_id
+    assert "result" not in out
+
+
+@pytest.mark.parametrize("params", [[], False, "text", 3], ids=["array", "false", "string", "number"])
+def test_params_that_are_not_an_object_are_invalid_params(server, params) -> None:
+    out = json.loads(server.handle_line(_line(params=params)))
+    assert out["error"]["code"] == -32602
+    assert out["id"] == 1
+
+
+@pytest.mark.parametrize("arguments", [[], False, "text", 3], ids=["array", "false", "string", "number"])
+def test_tool_arguments_that_are_not_an_object_are_invalid_params(server, arguments) -> None:
+    line = _line(method="tools/call", params={"name": "get_status", "arguments": arguments})
+    out = json.loads(server.handle_line(line))
+    assert out["error"]["code"] == -32602
+    assert out["id"] == 1
+
+
+@pytest.mark.parametrize("id_", ["abc", 0, 7], ids=["string", "zero", "integer"])
+def test_a_correct_request_succeeds_with_any_string_or_integer_id(server, id_) -> None:
+    """Positive control for the cases above: id 0 is falsy and "abc" is not an
+    int, and a stricter check must still answer both."""
+    out = json.loads(server.handle_line(_line(id=id_)))
+    assert out == {"jsonrpc": "2.0", "id": id_, "result": {}}
+
+
+def test_missing_params_and_missing_arguments_are_still_fine(server) -> None:
+    ping = json.loads(server.handle_line(_line()))
+    assert ping["result"] == {}
+    line = _line(method="tools/call", params={"name": "get_status"})
+    call = json.loads(server.handle_line(line))
+    assert call["result"]["isError"] is False
+
+
+def test_a_notification_with_a_bad_envelope_still_gets_no_answer_only_when_valid(server) -> None:
+    """A notification is a valid request without an id. One without "jsonrpc"
+    is not a notification and is refused rather than silently dropped."""
+    assert server.handle_line(json.dumps(
+        {"jsonrpc": "2.0", "method": "notifications/initialized"})) is None
+    out = json.loads(server.handle_line(json.dumps({"method": "notifications/initialized"})))
+    assert out["error"]["code"] == -32600
 
 
 # =============================================================================

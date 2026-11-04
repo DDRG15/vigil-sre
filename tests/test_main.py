@@ -999,6 +999,10 @@ async def test_dispatch_delivers_to_every_configured_channel() -> None:
                 )
     d_send.assert_awaited_once()
     s_send.assert_awaited_once()
+    # Same alert on both: a channel that got a different URL or kind would
+    # deliver, pass the awaited-once check, and tell the operator the wrong thing.
+    for send in (d_send, s_send):
+        assert send.await_args.args[1:] == (TARGET_URL, "HTTP 503", AlertKind.FAILURE)
 
 
 async def test_dispatch_one_channel_down_does_not_stop_the_other(caplog) -> None:
@@ -1013,6 +1017,34 @@ async def test_dispatch_one_channel_down_does_not_stop_the_other(caplog) -> None
                         notifiers=[DiscordNotifier(), SlackNotifier()],
                     )
     d_send.assert_awaited_once()
+    assert not any("alerts_lost_all_channels_total" in r.message for r in caplog.records)
+
+
+async def test_dispatch_a_failing_first_channel_does_not_stop_the_second(caplog) -> None:
+    """Same property with the failing channel FIRST in the list: a loop that
+    returns or breaks on the first False passes the order above and drops the
+    alert here. Both channels are awaited, and the healthy one gets the alert
+    that was raised, not a default."""
+    import notifiers
+    # This test adds a Slack failure to the module-level circuit counters; left
+    # there, the third one in a session opens the circuit and a later test that
+    # expects Slack to be called is skipped for it.
+    notifiers.reset_circuits()
+    try:
+        with patch.object(SlackNotifier, "send", new_callable=AsyncMock, return_value=False) as s_send:
+            with patch.object(DiscordNotifier, "send", new_callable=AsyncMock, return_value=True) as d_send:
+                async with aiohttp.ClientSession() as session:
+                    with caplog.at_level("CRITICAL"):
+                        delivered = await dispatch_alert(
+                            session, TARGET_URL, "HTTP 503", AlertKind.FAILURE,
+                            notifiers=[SlackNotifier(), DiscordNotifier()],
+                        )
+    finally:
+        notifiers.reset_circuits()
+    s_send.assert_awaited_once()
+    d_send.assert_awaited_once()
+    assert d_send.await_args.args[1:] == (TARGET_URL, "HTTP 503", AlertKind.FAILURE)
+    assert delivered is True
     assert not any("alerts_lost_all_channels_total" in r.message for r in caplog.records)
 
 
@@ -2230,3 +2262,163 @@ def test_rotating_file_handler_actually_rotates(tmp_path: Path) -> None:
 
     assert log_file.exists()
     assert (tmp_path / "rotating.log.1").exists()
+
+
+# =============================================================================
+# L. liveness_problem() / check_liveness() -- the Kubernetes liveness probe
+#
+# The probe used to import main and load the target list: it passed with no
+# monitor process at all, so a round hung on a socket kept the pod "healthy"
+# while state.json aged. These tests pin what it looks at now.
+# =============================================================================
+
+_LIVE_NOW = datetime(2026, 11, 3, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _live_stamp(age_s: float) -> str:
+    return (_LIVE_NOW - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _live_state(tmp_path: Path, *ages_s: float, wrapped: bool = True) -> Path:
+    """A state.json whose targets were last checked ages_s seconds before _LIVE_NOW."""
+    targets = {f"https://t{i}.example.invalid/": {"status": "UP", "last_checked": _live_stamp(a)}
+               for i, a in enumerate(ages_s)}
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"schema_version": 2, "targets": targets} if wrapped else targets),
+                    encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def liveness_env(monkeypatch):
+    """The two knobs unset, so the host's environment cannot decide a result."""
+    monkeypatch.delenv("LIVENESS_MAX_AGE_S", raising=False)
+    monkeypatch.delenv("LIVENESS_ROUND_MARKER", raising=False)
+
+
+def test_liveness_judges_by_the_newest_check_not_the_oldest(tmp_path: Path, liveness_env) -> None:
+    """A target removed from the list keeps its old record in state.json for
+    good. Judging by the oldest would restart a healthy pod in a loop."""
+    state = _live_state(tmp_path, 40 * 86400, 30)
+    assert main.liveness_problem(state, now=_LIVE_NOW) is None
+
+
+def test_liveness_flags_a_state_where_every_check_is_stale(tmp_path: Path, liveness_env) -> None:
+    """Every target stale means no round has finished in the limit: the loop is
+    hung or dead, which the old import-only probe could not see."""
+    state = _live_state(tmp_path, 2000, 5000)
+    problem = main.liveness_problem(state, now=_LIVE_NOW)
+    assert problem is not None
+    assert "2000" in problem and "900" in problem
+
+
+def test_liveness_works_on_the_legacy_flat_state_schema(tmp_path: Path, liveness_env) -> None:
+    stale = _live_state(tmp_path, 5000, wrapped=False)
+    assert main.liveness_problem(stale, now=_LIVE_NOW) is not None
+    fresh = _live_state(tmp_path, 5, wrapped=False)
+    assert main.liveness_problem(fresh, now=_LIVE_NOW) is None
+
+
+def test_liveness_limit_is_inclusive(tmp_path: Path, liveness_env) -> None:
+    """Exactly at the limit is alive; one second past it is not. A probe that
+    flips at the boundary restarts a pod whose round simply takes a while."""
+    assert main.liveness_problem(_live_state(tmp_path, 900), now=_LIVE_NOW) is None
+    assert main.liveness_problem(_live_state(tmp_path, 901), now=_LIVE_NOW) is not None
+
+
+def test_liveness_is_not_a_problem_before_the_first_round(tmp_path: Path, liveness_env) -> None:
+    """No file yet: the first round has not finished, and killing the pod
+    would make that permanent."""
+    assert main.liveness_problem(tmp_path / "absent.json", now=_LIVE_NOW) is None
+
+
+@pytest.mark.parametrize("content", ["{broken", "[]", '{"schema_version": 2, "targets": []}',
+                                     '{"schema_version": 2, "targets": {}}',
+                                     '{"https://a.example.invalid/": {"status": "UP"}}',
+                                     '{"https://a.example.invalid/": {"last_checked": "yesterday"}}',
+                                     '{"https://a.example.invalid/": "not a record"}'],
+                         ids=["invalid-json", "array", "targets-array", "no-targets",
+                              "no-timestamp", "bad-timestamp", "record-not-an-object"])
+def test_liveness_does_not_kill_a_pod_over_a_file_it_cannot_judge(
+        tmp_path: Path, liveness_env, content) -> None:
+    """The dashboard and the MCP server already report an unreadable state;
+    the liveness probe restarting the pod over it would only hide the file."""
+    path = tmp_path / "state.json"
+    path.write_text(content, encoding="utf-8")
+    assert main.liveness_problem(path, now=_LIVE_NOW) is None
+
+
+def test_liveness_max_age_can_be_set_in_the_environment(
+        tmp_path: Path, liveness_env, monkeypatch) -> None:
+    state = _live_state(tmp_path, 120)
+    assert main.liveness_problem(state, now=_LIVE_NOW) is None
+    monkeypatch.setenv("LIVENESS_MAX_AGE_S", "60")
+    assert main.liveness_problem(state, now=_LIVE_NOW) is not None
+    monkeypatch.setenv("LIVENESS_MAX_AGE_S", "300")
+    assert main.liveness_problem(state, now=_LIVE_NOW) is None
+
+
+def test_liveness_explicit_max_age_beats_the_environment(
+        tmp_path: Path, liveness_env, monkeypatch) -> None:
+    monkeypatch.setenv("LIVENESS_MAX_AGE_S", "10000")
+    assert main.liveness_problem(_live_state(tmp_path, 120), now=_LIVE_NOW, max_age_s=60) is not None
+
+
+def _marker(tmp_path: Path, age_s: float) -> Path:
+    marker = tmp_path / "round-started"
+    marker.write_text("", encoding="utf-8")
+    stamp = (_LIVE_NOW - timedelta(seconds=age_s)).timestamp()
+    os.utime(marker, (stamp, stamp))
+    return marker
+
+
+def test_a_fresh_round_marker_keeps_a_pod_with_stale_state_alive(
+        tmp_path: Path, liveness_env, monkeypatch) -> None:
+    """A new pod inherits the old state.json from the volume and must finish
+    its first round before that ages back under the limit. A round that
+    started recently is alive; killing it mid-round is a restart loop."""
+    state = _live_state(tmp_path, 5000)
+    monkeypatch.setenv("LIVENESS_ROUND_MARKER", str(_marker(tmp_path, 30)))
+    assert main.liveness_problem(state, now=_LIVE_NOW) is None
+
+
+def test_a_stale_round_marker_does_not_excuse_stale_state(
+        tmp_path: Path, liveness_env, monkeypatch) -> None:
+    """The marker proves a round started, not that the loop still moves: a
+    marker nobody has touched in the limit is the hung loop again."""
+    state = _live_state(tmp_path, 5000)
+    monkeypatch.setenv("LIVENESS_ROUND_MARKER", str(_marker(tmp_path, 5000)))
+    assert main.liveness_problem(state, now=_LIVE_NOW) is not None
+
+
+def test_a_missing_round_marker_falls_back_to_the_state(
+        tmp_path: Path, liveness_env, monkeypatch) -> None:
+    monkeypatch.setenv("LIVENESS_ROUND_MARKER", str(tmp_path / "never-touched"))
+    assert main.liveness_problem(_live_state(tmp_path, 5000), now=_LIVE_NOW) is not None
+    assert main.liveness_problem(_live_state(tmp_path, 5), now=_LIVE_NOW) is None
+
+
+def test_check_liveness_exits_1_with_the_reason_on_stderr(
+        tmp_path: Path, liveness_env, monkeypatch, capsys) -> None:
+    """The kubelet restarts on a non-zero exit and shows stderr in the event:
+    the reason has to be there, not only in a log nobody opens."""
+    state = tmp_path / "state.json"
+    old = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state.write_text(json.dumps({"schema_version": 2, "targets": {
+        "https://a.example.invalid/": {"last_checked": old}}}), encoding="utf-8")
+    monkeypatch.setenv("STATE_FILE_PATH", str(state))
+    with pytest.raises(SystemExit) as exit_info:
+        main.check_liveness()
+    assert exit_info.value.code == 1
+    assert "liveness:" in capsys.readouterr().err
+
+
+def test_check_liveness_returns_quietly_for_a_live_monitor(
+        tmp_path: Path, liveness_env, monkeypatch, capsys) -> None:
+    state = tmp_path / "state.json"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state.write_text(json.dumps({"schema_version": 2, "targets": {
+        "https://a.example.invalid/": {"last_checked": now}}}), encoding="utf-8")
+    monkeypatch.setenv("STATE_FILE_PATH", str(state))
+    assert main.check_liveness() is None
+    assert capsys.readouterr().err == ""

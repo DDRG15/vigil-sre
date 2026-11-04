@@ -39,6 +39,7 @@ Depends : stdlib only (http.server, sqlite3, json).
 from __future__ import annotations
 
 import hmac
+import html
 import json
 import logging
 import os
@@ -122,22 +123,35 @@ DEFAULT_WINDOW: str = "7d"
 
 def read_state(state_path: Path) -> dict:
     """
-    Return state.json's target map, or an empty one if it does not exist yet.
+    Return state.json's target map, or an empty one if it does not exist yet
+    or cannot be read. Callers that answer someone use read_state_checked():
+    an empty map alone does not say which of those it was.
+    """
+    return read_state_checked(state_path)[0]
+
+
+def read_state_checked(state_path: Path) -> tuple[dict, str | None]:
+    """
+    state.json's target map, and why it is empty when it should not be.
 
     A missing state file is a real, ordinary sequence — a freshly deployed
     instance before its first run — and answering 200 with nothing is the
-    honest response. A 500 would say "something is broken" about a system
-    that is merely new.
+    honest response, so it has no problem attached. A file that exists and
+    is not JSON, or is JSON of the wrong shape, is different: served as the
+    same empty map it read as "nothing is monitored" on the dashboard and
+    through MCP, with the only trace on the server's stderr. The second value
+    names that problem so every surface can say it.
     """
     if not state_path.exists():
-        return {}
+        return {}, None
     try:
         raw = json.loads(state_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Could not read '%s': %s", state_path, exc)
-        return {}
+        return {}, f"state file cannot be read ({type(exc).__name__}: {_first_line(exc)})"
     if not isinstance(raw, dict):
-        return {}
+        logger.warning("'%s' is %s, not an object", state_path, type(raw).__name__)
+        return {}, f"state file holds a JSON {type(raw).__name__}, not an object"
     # Mirrors StateManager._load_sync exactly, including its fallback: v2+
     # nests targets under a key, and a MISSING key means no targets — not
     # "treat the wrapper as a target". Falling back to `raw` here (as an
@@ -145,8 +159,15 @@ def read_state(state_path: Path) -> dict:
     # monitored URL, which a dashboard iterating the map would then try to
     # read a status off. Legacy v1 WAS the flat mapping.
     if "schema_version" in raw:
-        return raw.get("targets", {})
-    return raw
+        targets = raw.get("targets", {})
+        if not isinstance(targets, dict):
+            return {}, f"state file 'targets' is a JSON {type(targets).__name__}, not an object"
+        return targets, None
+    return raw, None
+
+
+def _first_line(exc: BaseException) -> str:
+    return str(exc).splitlines()[0] if str(exc) else type(exc).__name__
 
 
 def stale_seconds(targets: dict, now: datetime | None = None) -> float | None:
@@ -263,7 +284,7 @@ class _Handler(BaseHTTPRequestHandler):
         two different claims about the same target, and the reader has no way
         to tell which one they are looking at.
         """
-        targets = read_state(self.state_path)
+        targets, self.state_error = read_state_checked(self.state_path)
         urls    = list(targets)
         history = history_payload(
             self.history_path, DEFAULT_WINDOW, urls
@@ -284,6 +305,10 @@ class _Handler(BaseHTTPRequestHandler):
     #: Why the silenced badges cannot be trusted on this request, or None. Set
     #: per request by _dashboard_data; the HTML routes turn it into a notice.
     maintenance_unknown: str | None = None
+
+    #: Why the target list on this request is empty although state.json
+    #: exists, or None. Set per request by _dashboard_data, shown like the above.
+    state_error: str | None = None
 
     def _muted_now(self, now: datetime) -> tuple[dict, str | None]:
         """
@@ -323,13 +348,21 @@ class _Handler(BaseHTTPRequestHandler):
         string goes into the full page and the fragment, which is why this
         works on markup rather than asking the renderer to know about it.
         """
-        if self.maintenance_unknown is None:
+        notice = ""
+        if self.state_error is not None:
+            notice += (
+                '<div class="freshness stale" role="status">The monitor\'s state '
+                'cannot be read, so no target is shown although the monitor may be '
+                'probing some: ' + html.escape(self.state_error) + '.</div>'
+            )
+        if self.maintenance_unknown is not None:
+            notice += (
+                '<div class="freshness stale" role="status">Maintenance windows are '
+                'unknown: the target list could not be read, so a target shown here '
+                'may be silenced without a badge. The reason is in the API log.</div>'
+            )
+        if not notice:
             return markup
-        notice = (
-            '<div class="freshness stale" role="status">Maintenance windows are '
-            'unknown: the target list could not be read, so a target shown here '
-            'may be silenced without a badge. The reason is in the API log.</div>'
-        )
         if markup.startswith("<!doctype"):
             return markup.replace('<div id="list">', '<div id="list">' + notice, 1)
         return notice + markup
@@ -556,7 +589,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return
 
             if route == "/api/status":
-                targets = read_state(self.state_path)
+                targets, state_error = read_state_checked(self.state_path)
                 stale   = stale_seconds(targets)
                 self._log_metric("status")
                 if stale is not None:
@@ -573,6 +606,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._respond(200, {
                     "targets"      : targets,
                     "stale_seconds": stale,
+                    # null when the map is what the monitor wrote (or there is
+                    # no file yet); a sentence when it is empty because the
+                    # file could not be used.
+                    "state_error"  : state_error,
                 })
                 return
 

@@ -429,6 +429,12 @@ What the manifests hold, and `tests/test_k8s_manifests.py` checks:
   directory and crashed every round. `LOG_FILE=""` now keeps the log on stdout,
   which is what `kubectl logs` reads.
 - **The compose loop**, character for character, and compose's 150 s stop grace.
+- **A liveness probe that needs a recent round.** Importing the code and loading
+  the list passed with no monitor running at all, so a round hung on a socket left
+  the pod "live" while `state.json` aged. The probe now also fails when the newest
+  check is older than `LIVENESS_MAX_AGE_S` (900 s) and no round started in that
+  time either: the loop touches `/tmp/round-started` before each round, so a fresh
+  pod that inherits an old `state.json` is not killed during its first round.
 - **No Secret in the repository.** The pod reads an optional one made from `.env`.
 
 Kubernetes restarts what dies and replaces what disappears, which is the job
@@ -487,7 +493,7 @@ a channel exists. Create the Secret before relying on it.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1275-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1410-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -508,7 +514,7 @@ a channel exists. Create the Secret before relying on it.
 
 We do not ship what we cannot prove works.
 
-1275 automated tests cover every component in isolation: target loading (including
+1410 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -974,7 +980,12 @@ reading the list for display does not need it.
 **A URL is checked when it is saved, not when it is probed.** A port out of
 range or not a number, port 0, a missing host or a host that cannot be encoded is
 refused by the editor, the API, `targetctl validate` and the YAML loader alike.
-Valid IPv6 literals and explicit ports pass. A URL listed twice in `targets.yaml`
+Valid IPv6 literals and explicit ports pass. A URL with a user or password before
+the host, or with a query parameter named like a credential (`token`, `key`,
+`api_key`, `sig`, `password`, anything ending in `_token`, `_key` or `_secret`),
+is refused too: the URL is the target's identity, so it is written to the state
+and the history, exported in the CSV, logged, returned by the API and the MCP
+server, and sent in the text of every Discord and Slack alert. A URL listed twice in `targets.yaml`
 fails the load and names the URL: both copies would share one state record, and
 two failures in one round would confirm an outage the hysteresis exists to
 double-check.
@@ -1103,7 +1114,9 @@ to parse a table.
 ```bash
 python api.py                          # 127.0.0.1:8787
 
-curl localhost:8787/api/status         # current state per target + staleness
+curl localhost:8787/api/status         # current state per target + staleness;
+                                       # state_error says why targets is empty
+                                       # when state.json exists but cannot be used
 curl localhost:8787/api/history?window=7d   # uptime % and TTFB p50/p95
 ```
 
@@ -1141,7 +1154,7 @@ is the kind of bug where both sides pass their own tests.
 
 ---
 
-## Asking the monitor from an MCP client (v0.2)
+## Asking the monitor from an MCP client (v0.3)
 
 `mcp_server.py` speaks the Model Context Protocol over stdio, so an assistant or
 an IDE that supports MCP can ask the monitor what it knows instead of someone
@@ -1149,9 +1162,9 @@ pasting the dashboard into a chat. Three tools, all read-only:
 
 | tool | answers | same numbers as |
 |---|---|---|
-| `get_status` | status, last check, last error and diagnostics per target, `stale_seconds`, and `alerting` / `warnings`: which channels are configured and whether a heartbeat watches the monitor | `/api/status`, and the monitor's own per-round warnings |
-| `get_history` | uptime % and p50/p95 TTFB per target over `1d`, `7d` or `30d` | `/api/history` |
-| `get_trend` | p95 of the last 7 days against the 7 before: ok, degrading, improving, or why not comparable | `--report` |
+| `get_status` | status, last check, last error and diagnostics per target, `stale_seconds`, and `alerting` / `warnings`: which channels are configured, whether a heartbeat watches the monitor, and `state_unreadable` when the targets are empty because `state.json` could not be used | `/api/status`, and the monitor's own per-round warnings |
+| `get_history` | uptime % and p50/p95 TTFB per target over `1d`, `7d` or `30d`, with `history_uninitialised` in `warnings` when the database has no tables yet | `/api/history` |
+| `get_trend` | p95 of the last 7 days against the 7 before: ok, degrading, improving, or why not comparable; `warnings` as in `get_history` | `--report` |
 
 Register it in the client's MCP configuration as a command. With the stack running
 in Docker, the server runs inside the dashboard container, next to the data:
@@ -1191,15 +1204,25 @@ What it does not do, by design:
   process and parses every line it prints.
 - **It counts secrets and never returns them.** Whether a channel or the
   heartbeat is configured is decided as the monitor decides it — the process
-  environment first, then `.env`, an empty value meaning unset — and only the
-  channel's name and a boolean leave the process. A test sets unique webhook
-  and ping URLs and searches the whole protocol line for them.
+  environment first, then `.env` resolved by the same python-dotenv object the
+  monitor's `load_dotenv(override=False)` builds, so a `${REF}` inside `.env`
+  takes the process's value of `REF` first, as in the monitor; an empty value
+  means unset. Only the channel's name and a boolean leave the process. A test
+  sets unique webhook and ping URLs and searches the whole protocol line for
+  them. Target URLs are not secrets by construction: a URL carrying a
+  credential is refused when the list is saved or loaded.
+- **An empty answer says why it is empty.** A `state.json` that exists and cannot
+  be used, and a history database with no tables, answer with a warning code,
+  not with the same empty map a new install gives.
+- **It answers JSON-RPC 2.0 only.** A request without `"jsonrpc": "2.0"`, with a
+  null or non-scalar `id`, or with `params` or `arguments` that are not objects
+  is refused with the protocol's error code before any default is applied.
 - **All UP is not the whole answer.** With every target UP and no channel
   configured, nobody would hear about the next outage; `warnings` says so in
   the words the monitor's log uses for the same condition, and a test runs a
   real round to check that the two agree.
 
-It is `0.2.0` in `serverInfo`: the contract above holds, and the tool set grows
+It is `0.3.0` in `serverInfo`: the contract above holds, and the tool set grows
 with the monitor — a change that adds state an MCP client cannot see is not
 finished until the server reports it. 1.0 comes when the set is complete.
 

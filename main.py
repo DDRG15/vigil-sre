@@ -3309,6 +3309,82 @@ def _report_main(history_path: Path = HISTORY_DB_FILE) -> int:
     return 0
 
 
+#: How old the NEWEST check may be before the liveness probe calls the monitor
+#: stuck. A round plus the 60 s pause is about two minutes on a slow list; 15
+#: minutes is several missed rounds, never one slow one.
+LIVENESS_MAX_AGE_S: float = 900.0
+
+
+def liveness_problem(state_path: Path | None = None,
+                     now: datetime | None = None,
+                     max_age_s: float | None = None) -> str | None:
+    """
+    Why this monitor counts as stuck, or None.
+
+    The Kubernetes liveness probe used to import this module and load the
+    target list: it passed with no monitor process at all, so a round hung
+    on a socket kept the pod "healthy" forever while state.json aged. This
+    looks at what a live monitor leaves behind -- a check written in the
+    last few rounds.
+
+    The NEWEST check, not the oldest: a target removed from the list keeps
+    its old record in state.json, and judging by the oldest would restart a
+    healthy pod in a loop. No file, an unreadable file or no timestamp yet is
+    not "stuck": the first round has not finished, and the dashboard and the
+    MCP server already report a file they cannot read.
+
+    LIVENESS_ROUND_MARKER names a file the container loop touches before each
+    round. A fresh pod inherits the old state.json from the volume, and its
+    first round has to finish before that ages back under the limit; a round
+    that STARTED recently is alive, so the probe does not kill it mid-round.
+    """
+    path = state_path or Path(os.getenv("STATE_FILE_PATH", str(STATE_FILE)))
+    if max_age_s is None:
+        raw = os.getenv("LIVENESS_MAX_AGE_S", "").strip()
+        max_age_s = float(raw) if raw else LIVENESS_MAX_AGE_S
+    now = now or datetime.now(timezone.utc)
+    marker = os.getenv("LIVENESS_ROUND_MARKER", "").strip()
+    if marker:
+        try:
+            started = datetime.fromtimestamp(Path(marker).stat().st_mtime, timezone.utc)
+        except OSError:
+            started = None
+        if started is not None and (now - started).total_seconds() <= max_age_s:
+            return None
+    try:
+        raw_state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw_state, dict):
+        return None
+    targets = raw_state.get("targets", {}) if "schema_version" in raw_state else raw_state
+    if not isinstance(targets, dict):
+        return None
+    newest: datetime | None = None
+    for record in targets.values():
+        stamp = record.get("last_checked") if isinstance(record, dict) else None
+        try:
+            seen = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        newest = seen if newest is None or seen > newest else newest
+    if newest is None:
+        return None
+    age = (now - newest).total_seconds()
+    if age <= max_age_s:
+        return None
+    return (f"no check written for {age:.0f}s (limit {max_age_s:.0f}s): "
+            f"the monitor is not completing rounds")
+
+
+def check_liveness() -> None:
+    """Exit 1 with the reason on stderr when liveness_problem() has one."""
+    problem = liveness_problem()
+    if problem:
+        print(f"liveness: {problem}", file=sys.stderr)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     if "--report" in sys.argv:
         # Mutually exclusive with a normal run: report and exit, probe

@@ -66,6 +66,7 @@ services:
       - |
         trap 'if [ -n "$$pid" ]; then kill -TERM "$$pid" 2>/dev/null; wait "$$pid"; fi; exit 0' TERM
         while true; do
+          touch /tmp/round-started
           python main.py &
           pid=$$!
           wait "$$pid"

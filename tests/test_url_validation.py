@@ -8,6 +8,9 @@ were accepted by the API and by targets.yaml, and then raised inside the probe
 on every round. The same rule now runs on every door: the store, the YAML seed
 (strings and objects), the API and `targetctl validate`.
 
+A target URL is also refused when it carries a credential (userinfo, or a
+query parameter named like one): it is stored, logged and sent in alerts.
+
 Deliberately NOT tested as invalid: private, loopback and link-local addresses.
 Whether a monitor may probe the inside of its own network is a policy decision,
 not a syntax rule.
@@ -94,6 +97,68 @@ def test_the_whole_list_is_refused_when_one_entry_is_bad() -> None:
         validate_all([{"url": "https://ok.example"}, {"url": "http://host:99999/"}])
 
 
+# --- Credentials in the URL ----------------------------------------------------
+#
+# A target URL is the target's identity: stored, logged on every check, returned
+# by the API and MCP, exported, and written into Discord and Slack alerts. A
+# credential in it reaches all of those, so it is refused where it is entered.
+
+CREDENTIAL_URLS = [
+    pytest.param("https://u:p@example.invalid/", id="user-and-password"),
+    pytest.param("https://u@example.invalid/", id="user-only"),
+    pytest.param("https://:p@example.invalid/", id="password-only"),
+    pytest.param("https://example.invalid/?token=x", id="token"),
+    pytest.param("https://example.invalid/?Access_Token=x", id="access-token-mixed-case"),
+    pytest.param("https://example.invalid/?api_key=x", id="api-key"),
+    pytest.param("https://example.invalid/?x_api_key=x", id="suffix-_key"),
+    pytest.param("https://example.invalid/?x-api-key=x", id="suffix--key"),
+    pytest.param("https://example.invalid/?sig=x", id="sig"),
+    pytest.param("https://example.invalid/?page=2&token=x", id="credential-after-a-plain-param"),
+    pytest.param("https://example.invalid/?token=", id="credential-with-empty-value"),
+]
+
+NOT_CREDENTIAL_URLS = [
+    pytest.param("https://example.invalid/?page=2", id="page"),
+    pytest.param("https://example.invalid/?monkey=1", id="ends-in-key-but-not-_key"),
+    pytest.param("https://example.invalid/?tokens_total=1", id="token-inside-a-name"),
+    pytest.param("https://example.invalid/?sort=asc&limit=10", id="several-plain-params"),
+    pytest.param("https://example.invalid/a@b", id="at-sign-in-the-path"),
+]
+
+
+@pytest.mark.parametrize("url", CREDENTIAL_URLS)
+def test_a_url_carrying_a_credential_is_refused(url) -> None:
+    """A user, a password or a credential-named query parameter in a target URL
+    would be stored, logged and sent to Discord/Slack in every alert."""
+    with pytest.raises(ValidationError) as exc:
+        validate_entry({"url": url})
+    assert "credential" in str(exc.value).lower()
+    assert "\n" not in str(exc.value)
+
+
+@pytest.mark.parametrize("url", NOT_CREDENTIAL_URLS)
+def test_a_url_with_ordinary_parameters_is_still_accepted(url) -> None:
+    """Over-blocking is a failure too: 'monkey' ends in 'key' and 'tokens_total'
+    contains 'token', and neither is a credential name."""
+    assert validate_entry({"url": url})["url"] == url
+
+
+def test_the_refusal_does_not_repeat_the_credential_value() -> None:
+    """The message goes to logs and the API's 400 body; echoing the value
+    would put the secret exactly where the rule keeps it out of."""
+    with pytest.raises(ValidationError) as exc:
+        validate_entry({"url": "https://u:AUDIT_FAKE_TOKEN@example.invalid/"})
+    assert "AUDIT_FAKE_TOKEN" not in str(exc.value)
+    with pytest.raises(ValidationError) as exc:
+        validate_entry({"url": "https://example.invalid/?token=AUDIT_FAKE_TOKEN"})
+    assert "AUDIT_FAKE_TOKEN" not in str(exc.value)
+
+
+def test_the_whole_list_is_refused_when_one_url_carries_a_credential() -> None:
+    with pytest.raises(ValidationError):
+        validate_all([{"url": "https://ok.example"}, {"url": "https://u:p@example.invalid/"}])
+
+
 # =============================================================================
 # B. The YAML seed, through load_targets
 # =============================================================================
@@ -119,6 +184,29 @@ def test_load_targets_refuses_a_bad_url_in_either_yaml_form(
 
     assert exit_info.value.code == 1
     assert any(url in r.getMessage() for r in caplog.records), "the URL is named"
+
+
+@pytest.mark.parametrize("url", CREDENTIAL_URLS)
+@pytest.mark.parametrize("form", ["string", "object"])
+def test_load_targets_refuses_a_credential_url_in_either_yaml_form(
+        tmp_path: Path, url, form) -> None:
+    """The YAML seed is a door like the API: a credential refused there and
+    accepted here would still reach state.json, the logs and the alerts."""
+    quoted = json.dumps(url)
+    entry = f"  - {quoted}\n" if form == "string" else f"  - url: {quoted}\n"
+    path = _seed(tmp_path, "targets:\n  - https://ok.example\n" + entry)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main.load_targets(path, store_path=tmp_path / "no-store.json")
+
+    assert exit_info.value.code == 1
+
+
+@pytest.mark.parametrize("url", NOT_CREDENTIAL_URLS)
+def test_load_targets_keeps_loading_urls_with_ordinary_parameters(tmp_path: Path, url) -> None:
+    path = _seed(tmp_path, f"targets:\n  - {json.dumps(url)}\n")
+    got = main.load_targets(path, store_path=tmp_path / "no-store.json")
+    assert [t.url for t in got] == [url]
 
 
 @pytest.mark.parametrize("url", GOOD_URLS)
@@ -169,6 +257,15 @@ def test_the_api_answers_400_and_stores_nothing(server, url, word) -> None:
 
     assert status == 400
     assert word in body["error"].lower()
+    assert not targetstore.STORE_FILE.exists()
+
+
+@pytest.mark.parametrize("url", CREDENTIAL_URLS)
+def test_the_api_answers_400_for_a_credential_url_and_stores_nothing(server, url) -> None:
+    status, body = _put(server, [{"url": url}])
+
+    assert status == 400
+    assert "credential" in body["error"].lower()
     assert not targetstore.STORE_FILE.exists()
 
 

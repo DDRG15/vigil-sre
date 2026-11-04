@@ -91,6 +91,7 @@ spec:
             - |
               trap 'if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null; wait "$pid"; fi; exit 0' TERM
               while true; do
+                touch /tmp/round-started
                 python main.py &
                 pid=$!
                 wait "$pid"
@@ -111,6 +112,9 @@ spec:
             # collects stdout. The probe below imports main and inherits this.
             - name: LOG_FILE
               value: ""
+            # Touched by the loop above before each round; see main.liveness_problem.
+            - name: LIVENESS_ROUND_MARKER
+              value: /tmp/round-started
           envFrom:
             - secretRef:
                 name: vigil-sre-env
@@ -124,10 +128,13 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
-          # The image's HEALTHCHECK: the code imports and the target list loads.
+          # The image's HEALTHCHECK (the code imports, the target list loads)
+          # plus a round written in the last LIVENESS_MAX_AGE_S (900 s): the
+          # import alone passed with no monitor running at all, so a round hung
+          # on a socket kept the pod live while state.json aged.
           livenessProbe:
             exec:
-              command: ["python", "-c", "import logging, main; logging.getLogger('sre.health_checker').setLevel(logging.CRITICAL); main.load_targets()"]
+              command: ["python", "-c", "import logging, main; logging.getLogger('sre.health_checker').setLevel(logging.CRITICAL); main.load_targets(); main.check_liveness()"]
             periodSeconds: 30
             timeoutSeconds: 10
             failureThreshold: 3

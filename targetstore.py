@@ -59,7 +59,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 import yaml
 
@@ -163,6 +163,16 @@ ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
 MAX_TARGETS: int = 200
 MAX_URL_LENGTH: int = 2048
+
+#: Query parameter names that carry a credential, compared lowercased. A
+#: name ending in one of CREDENTIAL_SUFFIXES counts too ("x_api_key").
+CREDENTIAL_PARAMS: frozenset[str] = frozenset({
+    "token", "access_token", "auth", "auth_token", "authorization", "key",
+    "api_key", "apikey", "secret", "client_secret", "password", "passwd", "pwd",
+    "sig", "signature", "x-amz-signature", "x-goog-signature", "x-amz-credential",
+})
+CREDENTIAL_SUFFIXES: tuple[str, ...] = ("_token", "-token", "_key", "-key",
+                                        "_secret", "-secret", "password")
 
 
 MAX_WINDOWS: int = 20
@@ -294,6 +304,27 @@ def validate_entry(raw: object, *, check_env: bool = True) -> dict:
         raise ValidationError(
             f"The host '{hostname}' is not a valid domain name."
         ) from None
+
+    # The URL is the target's identity: it is written to state.json and the
+    # history database, exported in the CSV, logged on every check, returned
+    # by the API and the MCP server, and put in the text of every Discord and
+    # Slack alert -- a third party. A credential in it goes to all of those,
+    # so it is refused here, where the operator is, not redacted in seven
+    # places that would each have to agree.
+    if parsed.username is not None or parsed.password is not None:
+        raise ValidationError(
+            "The URL carries a user name or password before the host. A target "
+            "URL is stored, logged and sent in alerts, so it cannot hold a "
+            "credential; probe an endpoint that does not need one."
+        )
+    for name, _ in parse_qsl(parsed.query, keep_blank_values=True):
+        low = name.lower()
+        if low in CREDENTIAL_PARAMS or low.endswith(CREDENTIAL_SUFFIXES):
+            raise ValidationError(
+                f"The URL's query parameter '{name}' looks like a credential. A "
+                f"target URL is stored, logged and sent in alerts, so it cannot "
+                f"hold one; probe an endpoint that does not need it."
+            )
 
     entry: dict = {"url": url}
 

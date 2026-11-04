@@ -46,10 +46,11 @@ import logging
 import os
 import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 from typing import IO, Any, Callable
 
-from dotenv import dotenv_values
+import dotenv.main
 
 import api
 from diagnostics import latency_trend
@@ -59,7 +60,7 @@ from notifiers import ALL_NOTIFIERS
 logger = logging.getLogger("sre.mcp")
 
 SERVER_NAME   : str = "vigil-sre"
-SERVER_VERSION: str = "0.2.0"     # 0.x until the owner calls it finished; 1.0.0 then
+SERVER_VERSION: str = "0.3.0"     # 0.x until the owner calls it finished; 1.0.0 then
 
 #: Newest first. An unknown version from the client is answered with the first.
 PROTOCOL_VERSIONS: tuple[str, ...] = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -85,7 +86,10 @@ TOOLS: list[dict] = [
             "alerting names the configured alert channels and says whether a "
             "heartbeat watches the monitor; warnings repeats what the monitor "
             "logs every round when either is missing — all targets UP with no "
-            "channel means nobody would hear about the next outage."
+            "channel means nobody would hear about the next outage. A "
+            "state_unreadable warning means targets is empty because the "
+            "monitor's state file could not be used, not because nothing is "
+            "monitored."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
@@ -94,7 +98,9 @@ TOOLS: list[dict] = [
         "description": (
             "Uptime percentage and p50/p95 time to first byte per target over a "
             "window of 1d, 7d or 30d (default 7d), from the stored probe history. "
-            "The same numbers the dashboard API and --report give."
+            "The same numbers the dashboard API and --report give. warnings "
+            "holds history_uninitialised when the database has no tables yet, "
+            "so empty numbers are not read as a quiet window."
         ),
         "inputSchema": {
             "type": "object",
@@ -109,7 +115,8 @@ TOOLS: list[dict] = [
             f"p95 TTFB of the last {TREND_WINDOW_DAYS} days against the "
             f"{TREND_WINDOW_DAYS} before, per target: ok, degrading, improving, or "
             "why it could not be compared (too few samples, or windows whose "
-            "response rates differ). The same verdict --report prints."
+            "response rates differ). The same verdict --report prints. "
+            "warnings as in get_history."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
@@ -154,14 +161,24 @@ class Server:
         if not isinstance(message, dict) or not isinstance(message.get("method"), str):
             return _error(message.get("id") if isinstance(message, dict) else None,
                           INVALID_REQUEST, "not a JSON-RPC request")
+        # Checked before anything is defaulted: `params or {}` used to turn
+        # params=[] and params=false into a valid call, and a message with no
+        # "jsonrpc" or with "1.0" was answered as if it were 2.0.
+        if message.get("jsonrpc") != "2.0":
+            id_ = message.get("id")
+            return _error(id_ if _valid_id(id_) else None, INVALID_REQUEST,
+                          'not a JSON-RPC 2.0 request ("jsonrpc" must be "2.0")')
         is_notification = "id" not in message
         if is_notification:
             return None
-        id_    = message["id"]
+        id_ = message["id"]
+        if not _valid_id(id_):
+            # MCP: "the ID MUST NOT be null"; JSON-RPC: a string or a number.
+            return _error(None, INVALID_REQUEST, "id must be a string or an integer")
         method = self._methods.get(message["method"])
         if method is None:
             return _error(id_, METHOD_NOT_FOUND, f"method not found: {message['method']}")
-        params = message.get("params") or {}
+        params = message.get("params", {})
         if not isinstance(params, dict):
             return _error(id_, INVALID_PARAMS, "params must be an object")
         try:
@@ -186,7 +203,7 @@ class Server:
 
     def _tools_call(self, params: dict) -> dict:
         name      = params.get("name")
-        arguments = params.get("arguments") or {}
+        arguments = params.get("arguments", {})
         tool = {"get_status": self._get_status, "get_history": self._get_history,
                 "get_trend": self._get_trend}.get(name)
         if tool is None:
@@ -212,6 +229,26 @@ class Server:
     def _targets(self) -> dict:
         return api.read_state(self.state_path)
 
+    def _history_warnings(self) -> list[dict]:
+        """A database file with no tables answers every query with "no
+        samples", which is also the honest answer for a valid database and a
+        quiet window. Said apart, because only one of them is fine."""
+        try:
+            with closing(sqlite3.connect(
+                f"file:{self.history_path.as_posix()}?mode=ro", uri=True, timeout=5,
+            )) as conn:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+        except sqlite3.Error:
+            return []   # the query that follows reports it, as before
+        if "probe_results" in tables:
+            return []
+        return [{"code": "history_uninitialised", "message": (
+            "The history database has no tables — the monitor has not "
+            "recorded a round into it yet, or the file is not the monitor's. "
+            "Every number below is empty for that reason, not because the "
+            "window was quiet.")}]
+
     def _require_history(self) -> None:
         # Checked here, not left to sqlite: with mode=ro a missing file is an
         # "unable to open" error, which is right, but the message should say
@@ -224,9 +261,23 @@ class Server:
         (load_dotenv does not override), then .env; an empty value is unset."""
         if var in os.environ:
             return bool(os.environ[var])
-        if self.env_file.is_file():
-            return bool(dotenv_values(self.env_file).get(var))
-        return False
+        return bool(self._dotenv_as_the_monitor_reads_it().get(var))
+
+    def _dotenv_as_the_monitor_reads_it(self) -> dict:
+        """.env resolved by the object load_dotenv(override=False) builds.
+
+        dotenv_values() interpolates ${REF} with the FILE's value first; the
+        monitor's load_dotenv(override=False) interpolates with the PROCESS
+        value first. With REF empty in the process and set in .env, the first
+        said "heartbeat configured" about a monitor that pings nobody. Same
+        class, same flags, so the same answer -- and nothing is written into
+        this process's environment."""
+        if not self.env_file.is_file():
+            return {}
+        disabled = getattr(dotenv.main, "_load_dotenv_disabled", lambda: False)
+        if disabled():
+            return {}
+        return dotenv.main.DotEnv(self.env_file, interpolate=True, override=False).dict()
 
     def _alerting(self) -> tuple[dict, list[dict]]:
         channels  = [cls.name for cls in ALL_NOTIFIERS if self._is_set(cls.env_var)]
@@ -246,8 +297,13 @@ class Server:
         return {"channels": channels, "heartbeat": heartbeat}, warnings
 
     def _get_status(self, arguments: dict) -> dict:
-        targets = self._targets()
+        targets, state_error = api.read_state_checked(self.state_path)
         alerting, warnings = self._alerting()
+        if state_error:
+            # First: it explains the empty targets above every other warning.
+            warnings.insert(0, {"code": "state_unreadable", "message": (
+                f"{state_error} — targets is empty because the monitor's state "
+                "could not be used, not because nothing is monitored.")})
         return {"targets": targets, "stale_seconds": api.stale_seconds(targets),
                 "alerting": alerting, "warnings": warnings}
 
@@ -256,7 +312,8 @@ class Server:
         if window not in api.WINDOWS:
             raise _ToolError(f"unknown window {window!r}; accepted: {', '.join(sorted(api.WINDOWS))}")
         self._require_history()
-        return api.history_payload(self.history_path, window, list(self._targets()))
+        payload = api.history_payload(self.history_path, window, list(self._targets()))
+        return {**payload, "warnings": self._history_warnings()}
 
     def _get_trend(self, arguments: dict) -> dict:
         self._require_history()
@@ -272,11 +329,17 @@ class Server:
                 recent["total"]         if recent   else 0,
                 previous["total"]       if previous else 0,
             )
-        return {"window_days": TREND_WINDOW_DAYS, "targets": verdicts}
+        return {"window_days": TREND_WINDOW_DAYS, "targets": verdicts,
+                "warnings": self._history_warnings()}
 
 
 class _InvalidParams(Exception):
     pass
+
+
+def _valid_id(id_: Any) -> bool:
+    # bool is an int subclass in Python and never a request id.
+    return isinstance(id_, str) or (isinstance(id_, int) and not isinstance(id_, bool))
 
 
 def _error(id_: Any, code: int, message: str) -> dict:

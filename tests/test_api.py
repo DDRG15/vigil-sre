@@ -133,6 +133,40 @@ def test_read_state_agrees_with_statemanager_on_a_malformed_file(tmp_path: Path)
     assert read_state(f) == main.StateManager(f)._state
 
 
+UNREADABLE_STATES = [
+    pytest.param("{broken", id="invalid-json"),
+    pytest.param("[]", id="json-array"),
+    pytest.param('{"schema_version": 2, "targets": []}', id="targets-not-an-object"),
+]
+
+
+@pytest.mark.parametrize("content", UNREADABLE_STATES)
+def test_read_state_checked_names_the_problem_with_an_unusable_file(
+        tmp_path: Path, content) -> None:
+    """An empty map alone reads as "nothing is monitored". A file that exists
+    and cannot be used must come back with the reason, or the dashboard, the
+    API and the MCP server all show a healthy-looking nothing."""
+    f = tmp_path / "state.json"
+    f.write_text(content, encoding="utf-8")
+    targets, problem = api.read_state_checked(f)
+    assert targets == {}
+    assert isinstance(problem, str) and problem
+    assert api.read_state(f) == {}
+
+
+def test_read_state_checked_has_no_problem_for_a_missing_file(tmp_path: Path) -> None:
+    """A fresh deployment has no state file; that is not a fault to report."""
+    assert api.read_state_checked(tmp_path / "state.json") == ({}, None)
+
+
+def test_read_state_checked_has_no_problem_for_a_valid_file(tmp_path: Path) -> None:
+    """Control: the problem string appears only for the broken shapes above."""
+    f = tmp_path / "state.json"
+    f.write_text(json.dumps({"schema_version": 4, "targets": {URL: {"status": "UP"}}}),
+                 encoding="utf-8")
+    assert api.read_state_checked(f) == ({URL: {"status": "UP"}}, None)
+
+
 # =============================================================================
 # B. stale_seconds()
 # =============================================================================
@@ -298,6 +332,86 @@ def test_unknown_route_is_a_json_404_not_a_stack_trace(live_server) -> None:
     status, body = _get(live_server, "/admin")
     assert status == 404
     assert body["error"] == "not found"
+
+
+def _fetch(base: str, path: str) -> tuple[int, str]:
+    with urllib.request.urlopen(base + path, timeout=10) as resp:
+        return resp.status, resp.read().decode("utf-8")
+
+
+@pytest.fixture
+def server_with_state(tmp_path: Path, monkeypatch):
+    """Factory: a live server whose state.json holds exactly the text given
+    (None for no file at all). The target store is pointed at nothing so the
+    host's data/ cannot change what the page shows."""
+    started = []
+
+    def start(state_text: str | None):
+        import targetstore
+        monkeypatch.setattr(targetstore, "STORE_FILE", tmp_path / "no-store" / "targets.json")
+        monkeypatch.setattr(targetstore, "SEED_FILE", tmp_path / "no-seed.yaml")
+        state = tmp_path / "state.json"
+        if state_text is not None:
+            state.write_text(state_text, encoding="utf-8")
+        db = tmp_path / "history.db"
+        _seed_history(db, [100.0], ["UP"])
+        srv = serve(DEFAULT_HOST, 0, state_path=state, history_path=db)
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        started.append((srv, thread))
+        return f"http://{DEFAULT_HOST}:{srv.server_address[1]}"
+
+    yield start
+    for srv, thread in started:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
+
+
+def test_status_endpoint_has_a_null_state_error_for_a_valid_file(live_server) -> None:
+    status, body = _get(live_server, "/api/status")
+    assert status == 200
+    assert body["state_error"] is None
+
+
+@pytest.mark.parametrize("content", UNREADABLE_STATES)
+def test_status_endpoint_says_why_the_targets_are_empty(server_with_state, content) -> None:
+    """200 with targets {} and nothing else is what a monitor with no targets
+    answers. state_error is what tells an alerting pipeline the file is the
+    problem."""
+    base = server_with_state(content)
+    status, body = _get(base, "/api/status")
+    assert status == 200
+    assert body["targets"] == {}
+    assert isinstance(body["state_error"], str) and body["state_error"]
+
+
+def test_status_endpoint_has_a_null_state_error_when_there_is_no_file(server_with_state) -> None:
+    status, body = _get(server_with_state(None), "/api/status")
+    assert status == 200
+    assert body == {"targets": {}, "stale_seconds": None, "state_error": None}
+
+
+@pytest.mark.parametrize("path", ["/", "/partial/targets"])
+def test_the_dashboard_says_the_state_cannot_be_read(server_with_state, path) -> None:
+    """The page and the fragment it polls both carry the notice: one only on
+    the first paint would be erased by the first poll."""
+    base = server_with_state("{broken")
+    status, markup = _fetch(base, path)
+    assert status == 200
+    assert "cannot be read" in markup
+
+
+@pytest.mark.parametrize("path", ["/", "/partial/targets"])
+def test_the_dashboard_has_no_unreadable_notice_for_a_missing_file(
+        server_with_state, path) -> None:
+    """Control: a fresh deployment has no state file and is not a fault."""
+    assert "cannot be read" not in _fetch(server_with_state(None), path)[1]
+
+
+def test_the_dashboard_has_no_unreadable_notice_for_a_valid_file(live_server) -> None:
+    for path in ("/", "/partial/targets"):
+        assert "cannot be read" not in _fetch(live_server, path)[1]
 
 
 # =============================================================================

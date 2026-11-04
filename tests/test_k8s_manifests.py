@@ -236,3 +236,82 @@ def test_the_seed_targets_include_an_in_cluster_service() -> None:
     assert any(".svc.cluster.local" in u for u in urls), urls
     echo = _one("Service", "echo")
     assert echo["metadata"]["namespace"] == "vigil-demo"
+
+
+# -----------------------------------------------------------------------------
+# The liveness probe. It used to be `import main; main.load_targets()`: true
+# with no monitor process at all, so a round hung on a socket kept the pod
+# "healthy" while state.json aged. It now asks main.check_liveness(), and the
+# loop leaves the marker that keeps a pod alive through its first round.
+# -----------------------------------------------------------------------------
+
+
+def _probe_command() -> list[str]:
+    return _container("monitor")["livenessProbe"]["exec"]["command"]
+
+
+def test_the_liveness_probe_asks_check_liveness() -> None:
+    """A probe that only imports and loads the target list passes with the
+    monitor dead; check_liveness() is the call that looks at what a live
+    monitor writes."""
+    assert "main.check_liveness()" in " ".join(_probe_command())
+
+
+def test_the_round_marker_is_the_file_the_loop_touches() -> None:
+    """The monitor's LIVENESS_ROUND_MARKER and the path the loop touches are
+    two spellings of one path; if they drift, the marker is never fresh and a
+    new pod is killed in its first round."""
+    env = {e["name"]: e["value"] for e in _container("monitor")["env"]}
+    loop = _container("monitor")["command"][2]
+    touched = re.findall(r"^\s*touch (\S+)\s*$", loop, flags=re.MULTILINE)
+    assert touched == [env["LIVENESS_ROUND_MARKER"]]
+
+
+def test_the_marker_lives_on_a_writable_mount() -> None:
+    """The root filesystem is read-only; the marker is written under /tmp, which
+    must be a mounted volume or `touch` fails and the loop with it."""
+    env = {e["name"]: e["value"] for e in _container("monitor")["env"]}
+    mounts = [m["mountPath"] for m in _container("monitor")["volumeMounts"]]
+    assert any(env["LIVENESS_ROUND_MARKER"].startswith(m.rstrip("/") + "/") for m in mounts)
+
+
+def test_compose_touches_the_same_marker() -> None:
+    """Both deployments run one loop (test_the_monitor_loop_is_the_compose_loop);
+    this names the marker so a rename in one fails here and not only there."""
+    compose_loop = _compose()["services"]["health-checker"]["command"][2].replace("$$", "$")
+    assert "touch /tmp/round-started" in compose_loop
+
+
+def _run_probe(tmp_path: Path, state_age_s: float):
+    """The manifest's own probe command, as the kubelet would run it, against a
+    state.json whose only target was last checked state_age_s ago."""
+    import json
+    import os
+    import subprocess
+    import sys
+    from datetime import datetime, timedelta, timezone
+
+    stamp = (datetime.now(timezone.utc) - timedelta(seconds=state_age_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"schema_version": 2, "targets": {
+        "https://example.invalid/": {"status": "UP", "last_checked": stamp}}}), encoding="utf-8")
+    env = {**os.environ, "STATE_FILE_PATH": str(state), "LOG_FILE": "",
+           "LIVENESS_ROUND_MARKER": "", "LIVENESS_MAX_AGE_S": "",
+           "PYTHONDONTWRITEBYTECODE": "1"}
+    command = _probe_command()
+    assert command[0] == "python"
+    return subprocess.run([sys.executable, *command[1:]], cwd=str(ROOT), env=env,
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_the_probe_command_fails_for_a_stale_state(tmp_path: Path) -> None:
+    """Run for real: exit 1 with the liveness reason, not an import error or
+    a bad target list that happens to exit non-zero too."""
+    proc = _run_probe(tmp_path, state_age_s=3 * 3600)
+    assert proc.returncode == 1, (proc.stdout, proc.stderr)
+    assert "liveness:" in proc.stderr
+
+
+def test_the_probe_command_passes_for_a_fresh_state(tmp_path: Path) -> None:
+    proc = _run_probe(tmp_path, state_age_s=5)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
