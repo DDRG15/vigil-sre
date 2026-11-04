@@ -55,7 +55,8 @@ from dotenv import load_dotenv
 
 import dashboard
 import history_browser
-import tempfile
+import itertools
+from contextlib import closing
 import targetstore
 from diagnostics import in_maintenance
 from dashboard import render_page, render_rows
@@ -145,8 +146,9 @@ def read_state_checked(state_path: Path) -> tuple[dict, str | None]:
     if not state_path.exists():
         return {}, None
     try:
+        # ValueError covers both JSONDecodeError and UnicodeDecodeError.
         raw = json.loads(state_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+    except (ValueError, OSError) as exc:
         logger.warning("Could not read '%s': %s", state_path, exc)
         return {}, f"state file cannot be read ({type(exc).__name__}: {_first_line(exc)})"
     if not isinstance(raw, dict):
@@ -164,6 +166,28 @@ def read_state_checked(state_path: Path) -> tuple[dict, str | None]:
             return {}, f"state file 'targets' is a JSON {type(targets).__name__}, not an object"
         return targets, None
     return raw, None
+
+
+def history_warnings(path: Path) -> list[dict]:
+    """Report schema/read failures even when there are no targets to query."""
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as conn:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+    except sqlite3.Error as exc:
+        return [{"code": "history_unreadable", "message": _first_line(exc)}]
+    if "probe_results" in tables:
+        return []
+    return [{"code": "history_uninitialised", "message": (
+        "The history database has no probe_results table. No monitoring "
+        "samples can be read; empty numbers do not mean a quiet window.")}]
+
+
+def data_warnings(path: Path, state_error: str | None) -> list[dict]:
+    warnings = history_warnings(path)
+    if state_error:
+        warnings.insert(0, {"code": "state_unreadable", "message": state_error})
+    return warnings
 
 
 def _first_line(exc: BaseException) -> str:
@@ -531,21 +555,41 @@ class _Handler(BaseHTTPRequestHandler):
                     daily = route == "/history-daily.csv"
                     chunks = history_browser.daily_csv_chunks if daily else history_browser.csv_chunks
                     filename = "vigil-sre-daily-history.csv" if daily else "vigil-sre-history.csv"
-                    # Complete the read before sending success; spool large exports to disk.
-                    with tempfile.SpooledTemporaryFile(max_size=1024*1024) as export:
-                        for chunk in chunks(self.history_path, selection):
-                            export.write(chunk)
-                        length = export.tell()
-                        export.seek(0)
+                    # Prime the query before sending 200, so initial read errors
+                    # still return JSON 500. Only a BOM, header and first row are held.
+                    iterator = chunks(self.history_path, selection)
+                    try:
+                        prefix = list(itertools.islice(iterator, 3))
+                        self.protocol_version = "HTTP/1.1"
+                        self.close_connection = True
                         self.send_response(200)
                         self.send_header("Content-Type", "text/csv; charset=utf-8")
                         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-                        self.send_header("Content-Length", str(length))
+                        _, state_error = read_state_checked(self.state_path)
+                        warnings = data_warnings(self.history_path, state_error)
+                        if warnings:
+                            self.send_header("X-Vigil-Warning", ", ".join(w["code"] for w in warnings))
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.send_header("Connection", "close")
                         self.send_header("Cache-Control", "no-store")
                         self.send_header("X-Content-Type-Options", "nosniff")
                         self.end_headers()
-                        while chunk := export.read(65536):
-                            self.wfile.write(chunk)
+                        try:
+                            buffer = bytearray()
+                            for chunk in itertools.chain(prefix, iterator):
+                                buffer.extend(chunk)
+                                if len(buffer) >= 65536:
+                                    self._write_csv_chunk(buffer)
+                                    buffer.clear()
+                            if buffer:
+                                self._write_csv_chunk(buffer)
+                            self.wfile.write(b"0\r\n\r\n")
+                        except (sqlite3.Error, OSError) as exc:
+                            # No second response after headers. An absent terminal
+                            # chunk tells the client that this download is incomplete.
+                            logger.warning("CSV stream interrupted: %s", exc)
+                    finally:
+                        iterator.close()
                 return
 
             if route == "/partial/targets":
@@ -610,6 +654,7 @@ class _Handler(BaseHTTPRequestHandler):
                     # no file yet); a sentence when it is empty because the
                     # file could not be used.
                     "state_error"  : state_error,
+                    "warnings"     : data_warnings(self.history_path, state_error),
                 })
                 return
 
@@ -622,9 +667,11 @@ class _Handler(BaseHTTPRequestHandler):
                         "accepted": sorted(WINDOWS),
                     })
                     return
-                targets = list(read_state(self.state_path))
+                targets, state_error = read_state_checked(self.state_path)
                 self._log_metric("history")
-                self._respond(200, history_payload(self.history_path, window, targets))
+                self._respond(200, {**history_payload(self.history_path, window, list(targets)),
+                                    "state_error": state_error,
+                                    "warnings": data_warnings(self.history_path, state_error)})
                 return
 
             self._log_metric(route, error="not_found")
@@ -637,6 +684,11 @@ class _Handler(BaseHTTPRequestHandler):
             logger.error("Query failed for %s: %s", route, exc)
             self._log_metric(route, error=type(exc).__name__)
             self._respond(500, {"error": "could not read monitoring data"})
+
+    def _write_csv_chunk(self, chunk: bytes) -> None:
+        self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+        self.wfile.write(chunk)
+        self.wfile.write(b"\r\n")
 
     def _log_metric(self, endpoint: str, error: str | None = None) -> None:
         if error is None:

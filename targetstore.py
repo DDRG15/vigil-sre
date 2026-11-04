@@ -59,7 +59,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urlparse, urlencode
 
 import yaml
 
@@ -169,10 +169,32 @@ MAX_URL_LENGTH: int = 2048
 CREDENTIAL_PARAMS: frozenset[str] = frozenset({
     "token", "access_token", "auth", "auth_token", "authorization", "key",
     "api_key", "apikey", "secret", "client_secret", "password", "passwd", "pwd",
+    "jwt", "session", "bearer",
     "sig", "signature", "x-amz-signature", "x-goog-signature", "x-amz-credential",
 })
 CREDENTIAL_SUFFIXES: tuple[str, ...] = ("_token", "-token", "_key", "-key",
                                         "_secret", "-secret", "password")
+
+
+def redact_url(url: object) -> str:
+    """Safe rejected-URL context: retain host and parameter names, never values.
+
+    Redact all parameter values, including unknown credential names. Invalid
+    URLs get a fixed placeholder because their components cannot be trusted.
+    """
+    try:
+        parsed = urlparse(str(url))
+        def scrub(component):
+            return urlencode([(name, "[redacted]") for name, _ in
+                              parse_qsl(component.replace(";", "&"), keep_blank_values=True)])
+        path = "/".join(part.split(";", 1)[0] +
+                        (";" + scrub(part.split(";", 1)[1]) if ";" in part else "")
+                        for part in parsed.path.split("/"))
+        return parsed._replace(netloc=parsed.netloc.rsplit("@", 1)[-1], path=path,
+                               params=scrub(parsed.params), query=scrub(parsed.query),
+                               fragment=scrub(parsed.fragment)).geturl()
+    except ValueError:
+        return "[invalid URL]"
 
 
 MAX_WINDOWS: int = 20
@@ -317,14 +339,21 @@ def validate_entry(raw: object, *, check_env: bool = True) -> dict:
             "URL is stored, logged and sent in alerts, so it cannot hold a "
             "credential; probe an endpoint that does not need one."
         )
-    for name, _ in parse_qsl(parsed.query, keep_blank_values=True):
-        low = name.lower()
-        if low in CREDENTIAL_PARAMS or low.endswith(CREDENTIAL_SUFFIXES):
-            raise ValidationError(
-                f"The URL's query parameter '{name}' looks like a credential. A "
-                f"target URL is stored, logged and sent in alerts, so it cannot "
-                f"hold one; probe an endpoint that does not need it."
-            )
+    components = [("query", parsed.query), ("path", parsed.params),
+                  ("fragment", parsed.fragment)]
+    components.extend(("path", part.split(";", 1)[1])
+                      for part in parsed.path.split("/") if ";" in part)
+    for component, text in components:
+        for name, _ in parse_qsl(text.replace(";", "&"), keep_blank_values=True):
+            low = name.lower()
+            pieces = set(low.replace("-", "_").split("_"))
+            if (low in CREDENTIAL_PARAMS or low.endswith(CREDENTIAL_SUFFIXES)
+                    or pieces.intersection({"jwt", "session", "bearer"})):
+                raise ValidationError(
+                    f"The URL's {component} parameter '{name}' looks like a credential. A "
+                    f"target URL is stored, logged and sent in alerts, so it cannot "
+                    f"hold one; probe an endpoint that does not need it."
+                )
 
     entry: dict = {"url": url}
 

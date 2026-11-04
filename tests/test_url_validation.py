@@ -183,7 +183,13 @@ def test_load_targets_refuses_a_bad_url_in_either_yaml_form(
             main.load_targets(path, store_path=tmp_path / "no-store.json")
 
     assert exit_info.value.code == 1
-    assert any(url in r.getMessage() for r in caplog.records), "the URL is named"
+    assert str(path) in caplog.text
+    if "user@" in url:
+        assert "user@" not in caplog.text and "no host" in caplog.text
+    elif "[" in url:
+        assert "[invalid URL]" in caplog.text
+    else:
+        assert url in caplog.text, "the rejected host and path remain identifiable"
 
 
 @pytest.mark.parametrize("url", CREDENTIAL_URLS)

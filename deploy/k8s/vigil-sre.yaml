@@ -200,7 +200,7 @@ spec:
         - name: targets
           configMap:
             name: vigil-sre-targets
-        # The root filesystem is read-only; a CSV export over 1 MiB spools here.
+        # The root filesystem is read-only; round markers and daily SQL sorts use this.
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi

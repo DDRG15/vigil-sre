@@ -235,7 +235,8 @@ def test_daily_csv_route_filters_and_download_headers(http):
     assert code == 200 and body.startswith(b"\xef\xbb\xbf")
     assert headers["Content-Disposition"] == 'attachment; filename="vigil-sre-daily-history.csv"'
     assert headers["Cache-Control"] == "no-store"
-    assert int(headers["Content-Length"]) == len(body)
+    assert headers["Transfer-Encoding"] == "chunked"
+    assert headers.get("Content-Length") is None
     row, = csv.DictReader(io.StringIO(body.decode("utf-8-sig")))
     assert row["url"] == URL and row["observations"] == "1"
 

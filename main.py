@@ -582,10 +582,15 @@ def load_targets(
             try:
                 targetstore.validate_entry({"url": entry})
             except targetstore.ValidationError as exc:
-                logger.critical("'%s' target %r: %s", path, entry, exc)
+                logger.critical("'%s' target %r: %s", path, targetstore.redact_url(entry), exc)
                 sys.exit(1)
             targets.append(Target(url=entry))
         elif isinstance(entry, dict) and entry.get("url"):
+            try:
+                targetstore.validate_entry({"url": str(entry["url"])})
+            except targetstore.ValidationError as exc:
+                logger.critical("'%s' target %r: %s", path, targetstore.redact_url(entry["url"]), exc)
+                sys.exit(1)
             expect = entry.get("expect_substring")
             if expect is not None and not isinstance(expect, str):
                 # YAML parses `expect_substring: 200` (no quotes) as an int.
@@ -663,7 +668,7 @@ def load_targets(
                        if k in entry},
                 })
             except targetstore.ValidationError as exc:
-                logger.critical("'%s' target %r: %s", path, entry["url"], exc)
+                logger.critical("'%s' target %r: %s", path, targetstore.redact_url(entry["url"]), exc)
                 sys.exit(1)
 
             targets.append(Target(
@@ -894,8 +899,9 @@ class StateManager:
             logger.info("No state file found at '%s' — starting fresh.", self._path)
             return {}
         try:
+            # ValueError is the narrowest common base of JSON and UTF-8 decode errors.
             raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+        except (ValueError, OSError) as exc:
             logger.warning(
                 "Could not read '%s' (%s) — starting with empty state.", self._path, exc
             )
@@ -3171,7 +3177,7 @@ def undelivered_alerts(state_path: Path) -> int:
     """
     try:
         raw = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return 0
     targets = raw.get("targets", raw) if isinstance(raw, dict) else {}
     if not isinstance(targets, dict):
@@ -3330,8 +3336,8 @@ def liveness_problem(state_path: Path | None = None,
     The NEWEST check, not the oldest: a target removed from the list keeps
     its old record in state.json, and judging by the oldest would restart a
     healthy pod in a loop. No file, an unreadable file or no timestamp yet is
-    not "stuck": the first round has not finished, and the dashboard and the
-    MCP server already report a file they cannot read.
+    allowed during startup unless an existing round marker is stale. A stale
+    marker with no readable check timestamp means the first round is stuck.
 
     LIVENESS_ROUND_MARKER names a file the container loop touches before each
     round. A fresh pod inherits the old state.json from the volume, and its
@@ -3344,6 +3350,7 @@ def liveness_problem(state_path: Path | None = None,
         max_age_s = float(raw) if raw else LIVENESS_MAX_AGE_S
     now = now or datetime.now(timezone.utc)
     marker = os.getenv("LIVENESS_ROUND_MARKER", "").strip()
+    stale_round = None
     if marker:
         try:
             started = datetime.fromtimestamp(Path(marker).stat().st_mtime, timezone.utc)
@@ -3351,15 +3358,17 @@ def liveness_problem(state_path: Path | None = None,
             started = None
         if started is not None and (now - started).total_seconds() <= max_age_s:
             return None
+        if started is not None:
+            stale_round = "round marker is stale and no readable check timestamp exists"
     try:
         raw_state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
+        return stale_round
     if not isinstance(raw_state, dict):
-        return None
+        return stale_round
     targets = raw_state.get("targets", {}) if "schema_version" in raw_state else raw_state
     if not isinstance(targets, dict):
-        return None
+        return stale_round
     newest: datetime | None = None
     for record in targets.values():
         stamp = record.get("last_checked") if isinstance(record, dict) else None
@@ -3369,7 +3378,7 @@ def liveness_problem(state_path: Path | None = None,
             continue
         newest = seen if newest is None or seen > newest else newest
     if newest is None:
-        return None
+        return stale_round
     age = (now - newest).total_seconds()
     if age <= max_age_s:
         return None

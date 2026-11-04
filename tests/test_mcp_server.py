@@ -112,11 +112,9 @@ def _call(server, name: str, arguments: dict | None = None) -> dict:
 # =============================================================================
 
 
-def test_the_version_is_0_3_0() -> None:
-    """0.x until the owner calls it finished; 1.0.0 then. 0.3.0 adds the
-    warnings that say an empty answer is a broken file, and strict envelope
-    checks."""
-    assert mcp_server.SERVER_VERSION == "0.3.0"
+def test_the_version_is_0_4_0() -> None:
+    """0.4.0 exposes unreadable history even with no monitored targets."""
+    assert mcp_server.SERVER_VERSION == "0.4.0"
 
 
 def test_initialize_echoes_a_supported_protocol_version(server) -> None:

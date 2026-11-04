@@ -389,7 +389,7 @@ def test_status_endpoint_says_why_the_targets_are_empty(server_with_state, conte
 def test_status_endpoint_has_a_null_state_error_when_there_is_no_file(server_with_state) -> None:
     status, body = _get(server_with_state(None), "/api/status")
     assert status == 200
-    assert body == {"targets": {}, "stale_seconds": None, "state_error": None}
+    assert body == {"targets": {}, "stale_seconds": None, "state_error": None, "warnings": []}
 
 
 @pytest.mark.parametrize("path", ["/", "/partial/targets"])

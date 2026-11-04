@@ -435,6 +435,8 @@ What the manifests hold, and `tests/test_k8s_manifests.py` checks:
   check is older than `LIVENESS_MAX_AGE_S` (900 s) and no round started in that
   time either: the loop touches `/tmp/round-started` before each round, so a fresh
   pod that inherits an old `state.json` is not killed during its first round.
+  An existing stale marker also fails the probe when state is missing, unreadable
+  or has no usable timestamp. With no marker configured, startup behavior is unchanged.
 - **No Secret in the repository.** The pod reads an optional one made from `.env`.
 
 Kubernetes restarts what dies and replaces what disappears, which is the job
@@ -493,7 +495,7 @@ a channel exists. Create the Secret before relying on it.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1410-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1477-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -514,7 +516,7 @@ a channel exists. Create the Secret before relying on it.
 
 We do not ship what we cannot prove works.
 
-1410 automated tests cover every component in isolation: target loading (including
+1477 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
@@ -981,11 +983,17 @@ reading the list for display does not need it.
 range or not a number, port 0, a missing host or a host that cannot be encoded is
 refused by the editor, the API, `targetctl validate` and the YAML loader alike.
 Valid IPv6 literals and explicit ports pass. A URL with a user or password before
-the host, or with a query parameter named like a credential (`token`, `key`,
-`api_key`, `sig`, `password`, anything ending in `_token`, `_key` or `_secret`),
+the host, or with a query, path `;params` or fragment parameter named like a credential (`token`, `key`,
+`api_key`, `sig`, `password`, `jwt`, `session`, `bearer`, anything ending in `_token`, `_key` or `_secret`),
 is refused too: the URL is the target's identity, so it is written to the state
 and the history, exported in the CSV, logged, returned by the API and the MCP
-server, and sent in the text of every Discord and Slack alert. A URL listed twice in `targets.yaml`
+server, and sent in the text of every Discord and Slack alert. Percent-encoded
+parameter names are decoded; `jwt`, `session` and `bearer` also match components
+separated by `_` or `-`. `?key=` remains refused even for a public value: its name
+cannot distinguish a public identifier from an API key. Use a different parameter
+name or a credential-free health endpoint. Rejected-URL logs retain the file,
+host and parameter names but remove userinfo and parameter values.
+A URL listed twice in `targets.yaml`
 fails the load and names the URL: both copies would share one state record, and
 two failures in one round would confirm an outage the hysteresis exists to
 double-check.
@@ -1036,9 +1044,22 @@ period, including pages not currently displayed. Columns include UTC timestamp,
 URL, recorded status, HTTP outcome, DNS/RTT/TLS/TTFB/backend milliseconds, detail,
 and finding codes. Empty measurements remain empty. The CSV has a UTF-8 BOM for
 Excel and protects text cells from spreadsheet formula interpretation. Reads use
-SQLite read-only mode, and large exports spool to temporary storage rather than
-building an unbounded in-memory response. Existing `/api/history` aggregates and
-the NDJSON export script remain available.
+SQLite read-only mode. CSV responses use HTTP chunked transfer with bounded
+buffering, without spooling the complete response. Raw samples are read per
+target in batches of 500 through the existing `(url, checked_at)` index and
+merged newest first, avoiding a global temporary sort or an index migration.
+Each batch is read to the end before any of it is sent, so a slow or stalled
+download never holds the read lock that would block the monitor's next history
+write. Buffering grows with the number of distinct targets, not the number of
+observations. Daily summaries are aggregated one target at a time, which keeps
+SQLite's temporary sorts to a few MB each (200 targets x 30 days fits the 64 MiB
+`/tmp` of the Kubernetes pod), and are streamed from memory: one row per target
+and day. Initial read errors return HTTP 500; a later read
+failure closes an incomplete chunked download, which clients must discard.
+`X-Vigil-Warning` carries comma-separated warning codes (`state_unreadable`,
+`history_uninitialised`, `history_unreadable`) without adding rows to the CSV.
+`/api/history` and `/api/status` include `state_error` and `warnings` explaining
+unusable state and history. The NDJSON export script remains available.
 
 Choose **Daily summary** on the history page to compare each target by UTC day.
 It uses the same date/target filters and shows recorded UP/Slow/DOWN/other counts,
@@ -1154,7 +1175,7 @@ is the kind of bug where both sides pass their own tests.
 
 ---
 
-## Asking the monitor from an MCP client (v0.3)
+## Asking the monitor from an MCP client (v0.4)
 
 `mcp_server.py` speaks the Model Context Protocol over stdio, so an assistant or
 an IDE that supports MCP can ask the monitor what it knows instead of someone
@@ -1163,7 +1184,7 @@ pasting the dashboard into a chat. Three tools, all read-only:
 | tool | answers | same numbers as |
 |---|---|---|
 | `get_status` | status, last check, last error and diagnostics per target, `stale_seconds`, and `alerting` / `warnings`: which channels are configured, whether a heartbeat watches the monitor, and `state_unreadable` when the targets are empty because `state.json` could not be used | `/api/status`, and the monitor's own per-round warnings |
-| `get_history` | uptime % and p50/p95 TTFB per target over `1d`, `7d` or `30d`, with `history_uninitialised` in `warnings` when the database has no tables yet | `/api/history` |
+| `get_history` | uptime % and p50/p95 TTFB per target over `1d`, `7d` or `30d`, with `history_uninitialised` when `probe_results` is absent, or `history_unreadable` and its reason when the database cannot be read, even with zero targets | `/api/history` |
 | `get_trend` | p95 of the last 7 days against the 7 before: ok, degrading, improving, or why not comparable; `warnings` as in `get_history` | `--report` |
 
 Register it in the client's MCP configuration as a command. With the stack running
@@ -1212,8 +1233,12 @@ What it does not do, by design:
   them. Target URLs are not secrets by construction: a URL carrying a
   credential is refused when the list is saved or loaded.
 - **An empty answer says why it is empty.** A `state.json` that exists and cannot
-  be used, and a history database with no tables, answer with a warning code,
-  not with the same empty map a new install gives.
+  be used (including invalid UTF-8), or a history database without the expected
+  table, answers with a warning code. A corrupt or locked history database also
+  reports `history_unreadable` with the reason when there are no targets to query.
+  The monitor warns and starts from empty state on invalid UTF-8 or broken JSON;
+  its next completed round probes targets and rewrites healthy state. The dashboard
+  and refreshed fragment display an escaped warning until that recovery.
 - **It answers JSON-RPC 2.0 only.** A request without `"jsonrpc": "2.0"`, with a
   null or non-scalar `id`, or with `params` or `arguments` that are not objects
   is refused with the protocol's error code before any default is applied.
@@ -1222,7 +1247,7 @@ What it does not do, by design:
   the words the monitor's log uses for the same condition, and a test runs a
   real round to check that the two agree.
 
-It is `0.3.0` in `serverInfo`: the contract above holds, and the tool set grows
+It is `0.4.0` in `serverInfo`: the contract above holds, and the tool set grows
 with the monitor — a change that adds state an MCP client cannot see is not
 finished until the server reports it. 1.0 comes when the set is complete.
 

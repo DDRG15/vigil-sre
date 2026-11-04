@@ -46,7 +46,6 @@ import logging
 import os
 import sqlite3
 import sys
-from contextlib import closing
 from pathlib import Path
 from typing import IO, Any, Callable
 
@@ -60,7 +59,7 @@ from notifiers import ALL_NOTIFIERS
 logger = logging.getLogger("sre.mcp")
 
 SERVER_NAME   : str = "vigil-sre"
-SERVER_VERSION: str = "0.3.0"     # 0.x until the owner calls it finished; 1.0.0 then
+SERVER_VERSION: str = "0.4.0"     # 0.x until the owner calls it finished; 1.0.0 then
 
 #: Newest first. An unknown version from the client is answered with the first.
 PROTOCOL_VERSIONS: tuple[str, ...] = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -89,7 +88,7 @@ TOOLS: list[dict] = [
             "channel means nobody would hear about the next outage. A "
             "state_unreadable warning means targets is empty because the "
             "monitor's state file could not be used, not because nothing is "
-            "monitored."
+            "monitored. This includes invalid UTF-8 as well as broken JSON."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
@@ -99,8 +98,9 @@ TOOLS: list[dict] = [
             "Uptime percentage and p50/p95 time to first byte per target over a "
             "window of 1d, 7d or 30d (default 7d), from the stored probe history. "
             "The same numbers the dashboard API and --report give. warnings "
-            "holds history_uninitialised when the database has no tables yet, "
-            "so empty numbers are not read as a quiet window."
+            "holds history_uninitialised when probe_results is absent, or "
+            "history_unreadable with the reason when the database cannot be read, "
+            "including when there are no targets. Empty numbers are not a quiet window."
         ),
         "inputSchema": {
             "type": "object",
@@ -116,7 +116,8 @@ TOOLS: list[dict] = [
             f"{TREND_WINDOW_DAYS} before, per target: ok, degrading, improving, or "
             "why it could not be compared (too few samples, or windows whose "
             "response rates differ). The same verdict --report prints. "
-            "warnings as in get_history."
+            "warnings as in get_history: history_uninitialised or history_unreadable "
+            "with the read failure reason, even with no targets."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
@@ -230,24 +231,7 @@ class Server:
         return api.read_state(self.state_path)
 
     def _history_warnings(self) -> list[dict]:
-        """A database file with no tables answers every query with "no
-        samples", which is also the honest answer for a valid database and a
-        quiet window. Said apart, because only one of them is fine."""
-        try:
-            with closing(sqlite3.connect(
-                f"file:{self.history_path.as_posix()}?mode=ro", uri=True, timeout=5,
-            )) as conn:
-                tables = {row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'")}
-        except sqlite3.Error:
-            return []   # the query that follows reports it, as before
-        if "probe_results" in tables:
-            return []
-        return [{"code": "history_uninitialised", "message": (
-            "The history database has no tables — the monitor has not "
-            "recorded a round into it yet, or the file is not the monitor's. "
-            "Every number below is empty for that reason, not because the "
-            "window was quiet.")}]
+        return api.history_warnings(self.history_path)
 
     def _require_history(self) -> None:
         # Checked here, not left to sqlite: with mode=ro a missing file is an

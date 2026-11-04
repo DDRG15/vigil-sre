@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import csv
 import html
+import heapq
+import itertools
 import io
 import sqlite3
 from contextlib import closing
@@ -61,27 +63,57 @@ def _where(f):
     return sql, params
 
 
+#: Rows fetched per target per read. Each batch is read to the end, which ends
+#: SQLite's read transaction before a single row is handed to the caller.
+SAMPLE_BATCH_ROWS = 500
+
+_SAMPLE_SQL = """SELECT p.checked_at,p.url,p.status,p.http_status,p.dns_ms,p.rtt_ms,
+    p.tls_ms,p.ttfb_ms,p.server_processing_ms,p.error,
+    (SELECT group_concat(code, ', ') FROM probe_findings WHERE probe_id=p.id),p.id
+    FROM probe_results p WHERE p.url = ? AND p.checked_at >= ? AND {bound}
+    ORDER BY p.checked_at DESC,p.id DESC LIMIT ?"""
+
+
+def _target_samples(c: sqlite3.Connection, url: str, since: str, until: str):
+    """One target's samples, newest first, in short keyset-paged reads."""
+    sql = _SAMPLE_SQL.format(bound="p.checked_at < ?")
+    params: tuple = (url, since, until, SAMPLE_BATCH_ROWS)
+    while True:
+        rows = c.execute(sql, params).fetchall()
+        yield from rows
+        if len(rows) < SAMPLE_BATCH_ROWS:
+            return
+        last_at, last_id = rows[-1][0], rows[-1][-1]
+        sql = _SAMPLE_SQL.format(
+            bound="(p.checked_at < ? OR (p.checked_at = ? AND p.id < ?))")
+        params = (url, since, last_at, last_at, last_id, SAMPLE_BATCH_ROWS)
+
+
 def samples(db: Path, f: dict, *, paginate: bool = True):
-    """Yield raw samples with bounded buffering; no writes or new database files."""
+    """Yield raw samples with bounded buffering; no writes or new database files.
+
+    The database uses SQLite's rollback journal, where an open read blocks the
+    monitor's next commit. A statement kept open while a CSV streams to a slow
+    or stalled client would hold that read for as long as the client takes, and
+    every round in between loses its history write ("database is locked").
+    So no statement stays open across a yield: each target is read in batches
+    that are fetched completely, and the batches are merged newest first.
+    A global ORDER BY would need a disk sort on /tmp; the per-target index
+    (url, checked_at) plus the rowid tie-breaker gives each stream its order.
+    """
     if not db.exists():
         return
-    where,params = _where(f)
-    sql = '''SELECT p.checked_at,p.url,p.status,p.http_status,p.dns_ms,p.rtt_ms,
-        p.tls_ms,p.ttfb_ms,p.server_processing_ms,p.error,
-        (SELECT group_concat(code, ', ') FROM probe_findings WHERE probe_id=p.id)
-        FROM probe_results p WHERE ''' + where + ' ORDER BY p.checked_at DESC,p.id DESC'
-    if paginate:
-        sql += ' LIMIT ? OFFSET ?'
-        params += [PAGE_SIZE,(f['page']-1)*PAGE_SIZE]
     with closing(_connect_read_only(db)) as c:
         try:
-            cursor = c.execute(sql,params)
-            while True:
-                rows = cursor.fetchmany(250)
-                if not rows:
-                    return
-                for row in rows:
-                    yield dict(zip(COLUMNS,row))
+            urls = [f['target']] if f['target'] else [row[0] for row in c.execute(
+                'SELECT DISTINCT url FROM probe_results').fetchall()]
+            streams = [_target_samples(c, url, f['since'], f['until']) for url in urls]
+            rows = heapq.merge(*streams, key=lambda row: (row[0], row[-1]), reverse=True)
+            if paginate:
+                offset = (f['page']-1)*PAGE_SIZE
+                rows = itertools.islice(rows, offset, offset+PAGE_SIZE)
+            for row in rows:
+                yield dict(zip(COLUMNS,row))
         except sqlite3.OperationalError as exc:
             if _is_missing_schema(exc):
                 return
@@ -106,11 +138,12 @@ def daily_summaries(db: Path, f: dict, *, paginate: bool = True):
 
     Gaps use the preceding selected observation of the same target, including
     across midnight. They say nothing about time outside the observed span.
-    SQLite sorts/aggregates the raw rows; Python buffers only one result batch.
+    SQLite aggregates one target at a time; Python holds one summary row per
+    target and day, which it orders and pages.
     """
     if not db.exists():
         return
-    where, params = _where(f)
+    where, _ = _where({**f, 'target': 'per-target'})
     sql = '''WITH selected AS (
         SELECT p.id,p.checked_at,p.url,p.status,p.ttfb_ms
         FROM probe_results p WHERE ''' + where + '''
@@ -137,20 +170,32 @@ def daily_summaries(db: Path, f: dict, *, paginate: bool = True):
         coalesce(l.ttfb_samples,0),l.p50,l.p95,
         min(checked_at),max(checked_at),round(max(gap_s),3)
     FROM timed t LEFT JOIN percentiles l ON t.day_utc=l.day_utc AND t.url=l.url
-    GROUP BY t.day_utc,t.url ORDER BY t.day_utc DESC,t.url'''
-    if paginate:
-        sql += ' LIMIT ? OFFSET ?'
-        params += [PAGE_SIZE, (f['page']-1)*PAGE_SIZE]
+    GROUP BY t.day_utc,t.url'''
+    # One target per query. Over every target at once the window functions
+    # sort the whole retention window in SQLite's temporary storage: 200
+    # targets x 30 days filled the 64 MiB /tmp of the Kubernetes pod and the
+    # export answered 500. Per target the sorts are a few MB. The summaries
+    # (one row per target and day) are fetched completely before the first
+    # yield, so no statement holds the read lock that blocks the monitor's
+    # commits while a CSV client downloads, and ordered here.
     with closing(_connect_read_only(db)) as con:
         try:
-            cursor = con.execute(sql, params)
-            while rows := cursor.fetchmany(250):
-                for row in rows:
-                    yield dict(zip(DAILY_COLUMNS, row))
+            urls = [f['target']] if f['target'] else [row[0] for row in con.execute(
+                'SELECT DISTINCT url FROM probe_results').fetchall()]
+            rows = []
+            for url in urls:
+                rows.extend(con.execute(sql, (f['since'], f['until'], url)).fetchall())
         except sqlite3.OperationalError as exc:
             if _is_missing_schema(exc):
                 return
             raise
+    rows.sort(key=lambda row: row[1])                 # url ascending ...
+    rows.sort(key=lambda row: row[0], reverse=True)   # ... within day descending
+    if paginate:
+        offset = (f['page']-1)*PAGE_SIZE
+        rows = rows[offset:offset+PAGE_SIZE]
+    for row in rows:
+        yield dict(zip(DAILY_COLUMNS, row))
 
 
 def daily_summary_count(db: Path, f: dict) -> int:
