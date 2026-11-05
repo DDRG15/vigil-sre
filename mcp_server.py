@@ -59,7 +59,7 @@ from notifiers import ALL_NOTIFIERS
 logger = logging.getLogger("sre.mcp")
 
 SERVER_NAME   : str = "vigil-sre"
-SERVER_VERSION: str = "0.4.0"     # 0.x until the owner calls it finished; 1.0.0 then
+SERVER_VERSION: str = "0.4.0"     # 0.x while the tool set grows; 1.0.0 once it is complete
 
 #: Newest first. An unknown version from the client is answered with the first.
 PROTOCOL_VERSIONS: tuple[str, ...] = ("2025-06-18", "2025-03-26", "2024-11-05")
