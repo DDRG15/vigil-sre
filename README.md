@@ -495,7 +495,7 @@ a channel exists. Create the Secret before relying on it.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1477-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1478-test suite: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -516,7 +516,7 @@ a channel exists. Create the Secret before relying on it.
 
 We do not ship what we cannot prove works.
 
-1477 automated tests cover every component in isolation: target loading (including
+1478 automated tests cover every component in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —

@@ -93,6 +93,43 @@ def test_the_batched_export_returns_every_row_once_newest_first(tmp_path, monkey
     assert Counter(r["url"] for r in got) == Counter(r[1] for r in rows)
 
 
+def test_each_export_batch_starts_where_the_last_one_ended(tmp_path, monkeypatch):
+    # The continuation read must bound the index from above. A bound the
+    # index cannot use (checked_at < ? OR (checked_at = ? AND id < ?)) still
+    # returns the right rows, but every batch re-walks the rows already sent:
+    # quadratic in a target's row count.
+    import history_browser
+    monkeypatch.setattr(history_browser, "SAMPLE_BATCH_ROWS", 5)
+    db = tmp_path / "history.db"
+    _seed(db, targets=1, per_target=12, step_s=60)
+    # Plans are read with the same bound parameters the export uses: with
+    # literals inlined, SQLite derives the upper bound from the OR form too.
+    statements = []
+    real_connect = history_browser._connect_read_only
+
+    class Recording:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            statements.append((sql, params))
+            return self._conn.execute(sql, params)
+
+        def close(self):
+            self._conn.close()
+
+    monkeypatch.setattr(history_browser, "_connect_read_only",
+                        lambda path: Recording(real_connect(path)))
+    f = {"target": None, "since": "2000-01-01T00:00:00Z", "until": "2999-01-01T00:00:00Z", "page": 1}
+    assert len(list(history_browser.samples(db, f, paginate=False))) == 12
+    batches = [(sql, params) for sql, params in statements if "LIMIT" in sql]
+    assert len(batches) == 3
+    with sqlite3.connect(db) as c:
+        for sql, params in batches[1:]:
+            plan = " ".join(row[-1] for row in c.execute("EXPLAIN QUERY PLAN " + sql, params))
+            assert "checked_at<?" in plan, plan
+
+
 def test_daily_summaries_order_days_newest_first_and_urls_ascending(tmp_path):
     import history_browser
     db = tmp_path / "history.db"

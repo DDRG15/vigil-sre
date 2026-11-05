@@ -83,10 +83,13 @@ def _target_samples(c: sqlite3.Connection, url: str, since: str, until: str):
         yield from rows
         if len(rows) < SAMPLE_BATCH_ROWS:
             return
+        # A row-value bound gives the index an upper limit, so each batch
+        # starts where the previous one ended. The equivalent OR form only
+        # bounds the index from below, and every batch re-walked the rows
+        # already sent: quadratic in a target's row count.
         last_at, last_id = rows[-1][0], rows[-1][-1]
-        sql = _SAMPLE_SQL.format(
-            bound="(p.checked_at < ? OR (p.checked_at = ? AND p.id < ?))")
-        params = (url, since, last_at, last_at, last_id, SAMPLE_BATCH_ROWS)
+        sql = _SAMPLE_SQL.format(bound="(p.checked_at, p.id) < (?, ?)")
+        params = (url, since, last_at, last_id, SAMPLE_BATCH_ROWS)
 
 
 def samples(db: Path, f: dict, *, paginate: bool = True):
