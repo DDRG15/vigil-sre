@@ -36,6 +36,10 @@ Two processes, and neither imports the other. The monitor runs one round and exi
 compose starts the next one 60 seconds later. The API is the only process that
 writes the target list.
 
+The diagram below is the short version. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+maps every module, store and workflow, including CI, deployment and the Grafana
+analysis path.
+
 ```mermaid
 flowchart LR
     seed["targets.yaml<br/>(seed)"]
@@ -499,6 +503,7 @@ a channel exists. Create the Secret before relying on it.
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
+├── docs/                ARCHITECTURE.md — every module, store and workflow, as Mermaid diagrams
 ├── .github/             CI: pytest, then docker build + run a real health-check cycle;
 │                        data-collection: hourly probes for 14 days, rows to a data branch
 ├── .env                 Secret store — never committed
