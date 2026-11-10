@@ -1,4 +1,4 @@
-# SRE Health Checker
+# Vigil-SRE — HTTP health checker
 
 [![CI](https://github.com/DDRG15/vigil-sre/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DDRG15/vigil-sre/actions/workflows/ci.yml)
 
@@ -480,7 +480,7 @@ a channel exists. Create the Secret before relying on it.
 ├── targetctl.py         The target list from a terminal: list / add / remove / validate,
 │                        through the same API the dashboard editor uses
 ├── mcp_server.py        Read-only MCP server over stdio: status, history and trend for
-│                        an MCP client, from the same functions as the API (v0)
+│                        an MCP client, from the same functions as the API (v0.4)
 ├── targets.yaml         URL configuration — the hand-edited seed
 ├── targets.yaml.example Documented template with every per-target field
 ├── collection-targets.yaml The fixed list the 14-day data collection probes
@@ -499,7 +499,7 @@ a channel exists. Create the Secret before relying on it.
 ├── requirements.txt     Three direct dependencies, nothing extraneous
 ├── requirements-dev.txt Development dependencies — test runner and mocking layer
 ├── pytest.ini           Test runner configuration
-├── tests/               1478-test suite: probes, state, alerts, diagnostics, history,
+├── tests/               1,478 tests: probes, state, alerts, diagnostics, history,
 │                        dashboard, target store, editor seed, reminders, trend,
 │                        maintenance, incomplete rounds, deployment, Grafana dashboards,
 │                        the terminal command
@@ -521,7 +521,8 @@ a channel exists. Create the Secret before relying on it.
 
 We do not ship what we cannot prove works.
 
-1478 automated tests cover every component in isolation: target loading (including
+1,478 automated tests (1,477 pass and 1 is skipped in CI) cover every component
+in isolation: target loading (including
 `${VAR_NAME}` secret resolution), state transitions, probe logic, retry backoff
 intervals, per-channel payload construction and delivery, the complete
 orchestration pipeline —
